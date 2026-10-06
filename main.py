@@ -4,7 +4,9 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
 import os, json, asyncpg
-from datetime import date
+from datetime import date, datetime, timedelta
+import urllib.request
+import urllib.parse
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -40,6 +42,37 @@ def parse_date(v):
         return date.fromisoformat(str(v)[:10])
     except Exception:
         return None
+
+
+def geocode(address):
+    """Адрес → координаты через Nominatim (OSM)."""
+    if not address:
+        return None, None
+    try:
+        url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode({
+            "q": address, "format": "json", "limit": 1
+        })
+        req = urllib.request.Request(url, headers={"User-Agent": "tpk-tracking/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read())
+        if data:
+            return float(data[0]["lat"]), float(data[0]["lon"])
+    except Exception as e:
+        print(f"geocode error: {e}")
+    return None, None
+
+
+def calc_route(lat1, lng1, lat2, lng2):
+    """Расчёт расстояния через OSRM. Возвращает км или None."""
+    try:
+        url = f"http://router.project-osrm.org/route/v1/driving/{lng1},{lat1};{lng2},{lat2}?overview=false"
+        with urllib.request.urlopen(url, timeout=15) as r:
+            data = json.loads(r.read())
+        if data.get("routes"):
+            return round(data["routes"][0]["distance"] / 1000)
+    except Exception as e:
+        print(f"route error: {e}")
+    return None
 
 
 @app.on_event("startup")
@@ -102,8 +135,6 @@ async def startup():
                 except Exception as e:
                     print(f"Ошибка вставки {order_id}: {e}")
             print(f"Загружено {loaded} заказов в базу")
-        else:
-            print("shipments.json НЕ НАЙДЕН в рабочей директории")
 
 
 @app.on_event("shutdown")
@@ -124,7 +155,26 @@ async def track_order(order_id: str):
         row = await conn.fetchrow("SELECT * FROM shipments WHERE order_id = $1", order_id)
     if not row:
         raise HTTPException(404, f"Заказ {order_id} не найден")
-    return dict(row)
+
+    data = dict(row)
+
+    # Если есть позиция и адрес — считаем ETA
+    if data.get("current_lat") and data.get("address"):
+        dest_lat, dest_lng = geocode(data["address"])
+        if dest_lat and dest_lng:
+            km = calc_route(float(data["current_lat"]), float(data["current_lng"]), dest_lat, dest_lng)
+            if km:
+                data["remaining_km"] = km
+                days = km / 450.0
+                data["eta_days"] = round(days, 1)
+                data["eta_date"] = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
+                # сохраним в БД
+                async with pool.acquire() as conn2:
+                    await conn2.execute("""
+                        UPDATE shipments SET remaining_km = $1, eta_date = $2 WHERE order_id = $3
+                    """, km, parse_date((datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")), order_id)
+
+    return data
 
 
 @app.get("/api/admin/shipments")
@@ -166,30 +216,95 @@ async def user_portal():
     return """
     <!DOCTYPE html>
     <html>
-    <head><title>Отслеживание заказа</title></head>
-    <body style="font-family: Arial; padding: 40px; background: #f0f2f5;">
-        <div style="max-width: 700px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px;">
+    <head>
+        <title>Отслеживание заказа</title>
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <style>
+            body { font-family: Arial; padding: 40px; background: #f0f2f5; margin: 0; }
+            .card { max-width: 900px; margin: 0 auto; background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            input { padding:12px; width:70%; border:1px solid #ccc; border-radius:4px; font-size:16px; }
+            button { padding:12px 24px; background:#007bff; color:white; border:none; border-radius:4px; cursor:pointer; font-size:16px; }
+            button:hover { background:#0056b3; }
+            #result { margin-top:20px; }
+            #map { height: 500px; margin-top: 20px; border-radius: 8px; display:none; }
+            .info-row { margin: 8px 0; font-size: 15px; }
+            .info-row b { display:inline-block; min-width:180px; color: #555; }
+            .status-badge { display:inline-block; padding:4px 12px; border-radius:12px; font-size:13px; font-weight:bold; }
+            .status-в-пути { background:#d4edda; color:#155724; }
+            .status-завершено { background:#e2e3e5; color:#383d41; }
+            .status-планируется { background:#fff3cd; color:#856404; }
+        </style>
+    </head>
+    <body>
+        <div class="card">
             <h1>📍 Отслеживание заказа</h1>
-            <input id="orderInput" placeholder="Введите номер заказа" style="padding:10px; width:70%; border:1px solid #ccc; border-radius:4px;"/>
-            <button onclick="track()" style="padding:10px 20px; background:#007bff; color:white; border:none; border-radius:4px; cursor:pointer;">Найти</button>
-            <div id="result" style="margin-top:20px;"></div>
+            <input id="orderInput" placeholder="Введите номер заказа" onkeypress="if(event.key==='Enter') track()"/>
+            <button onclick="track()">Найти</button>
+            <div id="result"></div>
+            <div id="map"></div>
         </div>
+
         <script>
+        let map = null;
+        let marker = null;
+
         async function track() {
             const order = document.getElementById('orderInput').value.trim();
-            const res = await fetch(`/api/track/${order}`);
-            const data = await res.json();
-            if (!res.ok) {
-                document.getElementById('result').innerHTML = `<p style="color:red">${data.detail}</p>`;
-                return;
+            if (!order) return;
+
+            document.getElementById('result').innerHTML = '<p>Поиск...</p>';
+            document.getElementById('map').style.display = 'none';
+
+            try {
+                const res = await fetch(`/api/track/${encodeURIComponent(order)}`);
+                const data = await res.json();
+
+                if (!res.ok) {
+                    document.getElementById('result').innerHTML = `<p style="color:red">${data.detail}</p>`;
+                    return;
+                }
+
+                let html = `<h2>📦 ${data.order_id}</h2>`;
+                html += `<div class="info-row"><b>Направление:</b> ${data.direction || '—'}</div>`;
+                html += `<div class="info-row"><b>Адрес доставки:</b> ${data.address || '—'}</div>`;
+                html += `<div class="info-row"><b>Перевозчик:</b> ${data.carrier || '—'}</div>`;
+                html += `<div class="info-row"><b>Машина:</b> ${data.vehicle || '—'}</div>`;
+                html += `<div class="info-row"><b>Статус:</b> <span class="status-badge status-${(data.status||'').replace(' ','-')}">${data.status || '—'}</span></div>`;
+
+                if (data.remaining_km) {
+                    html += `<div class="info-row"><b>Осталось:</b> ${data.remaining_km} км</div>`;
+                }
+                if (data.eta_date) {
+                    html += `<div class="info-row"><b>Расчётный срок:</b> ${data.eta_date}</div>`;
+                }
+                if (data.plan_arrival) {
+                    html += `<div class="info-row"><b>Плановая дата:</b> ${data.plan_arrival}</div>`;
+                }
+                if (data.last_position_update) {
+                    html += `<div class="info-row"><b>Обновлено:</b> ${new Date(data.last_position_update).toLocaleString('ru-RU')}</div>`;
+                }
+                document.getElementById('result').innerHTML = html;
+
+                if (data.current_lat && data.current_lng) {
+                    const lat = parseFloat(data.current_lat);
+                    const lng = parseFloat(data.current_lng);
+                    document.getElementById('map').style.display = 'block';
+
+                    if (map) map.remove();
+                    map = L.map('map').setView([lat, lng], 8);
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                        attribution: '© OpenStreetMap'
+                    }).addTo(map);
+
+                    marker = L.marker([lat, lng]).addTo(map);
+                    marker.bindPopup(`<b>${data.order_id}</b><br>${data.vehicle || ''}`).openPopup();
+                } else {
+                    document.getElementById('result').innerHTML += '<p style="color:orange">⚠️ Координаты пока не получены. Парсер обновит их в течение часа.</p>';
+                }
+            } catch (e) {
+                document.getElementById('result').innerHTML = `<p style="color:red">Ошибка: ${e.message}</p>`;
             }
-            document.getElementById('result').innerHTML = `
-                <h2>📦 ${data.order_id}</h2>
-                <p><b>Адрес:</b> ${data.address || '—'}</p>
-                <p><b>Перевозчик:</b> ${data.carrier || '—'}</p>
-                <p><b>Машина:</b> ${data.vehicle || '—'}</p>
-                <p><b>Статус:</b> ${data.status}</p>
-            `;
         }
         </script>
     </body>
@@ -202,27 +317,30 @@ async def admin_panel(user=Depends(check_admin)):
     return """
     <!DOCTYPE html>
     <html>
-    <head><title>Админ-панель</title>
-    <style>
-        body { font-family: Arial; padding: 20px; background: #f0f2f5; }
-        table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; }
-        th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
-        th { background: #333; color: white; position: sticky; top: 0; }
-        tr:hover { background: #f0f8ff; }
-        .в-пути { color: green; font-weight: bold; }
-        .завершено { color: gray; }
-        .планируется { color: orange; }
-        button { padding:6px 12px; margin:2px; cursor:pointer; }
-        .btn-add { background:#28a745; color:white; border:none; border-radius:4px; font-size:14px; padding:10px 20px; margin-bottom:10px; }
-        .btn-edit { background:#ffc107; border:none; border-radius:4px; }
-        .btn-del { background:#dc3545; color:white; border:none; border-radius:4px; }
-        #filter { padding:8px; width:300px; margin-bottom:10px; }
-        #modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
-        #modalContent { background:white; max-width:600px; margin:80px auto; padding:30px; border-radius:8px; }
-        #modalContent label { display:block; margin-top:10px; font-weight:bold; }
-        #modalContent input, #modalContent select { width:100%; padding:8px; box-sizing:border-box; }
-        .modal-buttons { margin-top:20px; text-align:right; }
-    </style>
+    <head>
+        <title>Админ-панель</title>
+        <style>
+            body { font-family: Arial; padding: 20px; background: #f0f2f5; }
+            table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; }
+            th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
+            th { background: #333; color: white; position: sticky; top: 0; }
+            tr:hover { background: #f0f8ff; }
+            .в-пути { color: green; font-weight: bold; }
+            .завершено { color: gray; }
+            .планируется { color: orange; }
+            button { padding:6px 12px; margin:2px; cursor:pointer; }
+            .btn-add { background:#28a745; color:white; border:none; border-radius:4px; font-size:14px; padding:10px 20px; margin-bottom:10px; }
+            .btn-edit { background:#ffc107; border:none; border-radius:4px; }
+            .btn-del { background:#dc3545; color:white; border:none; border-radius:4px; }
+            #filter { padding:8px; width:300px; margin-bottom:10px; }
+            #modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
+            #modalContent { background:white; max-width:600px; margin:80px auto; padding:30px; border-radius:8px; max-height:80vh; overflow-y:auto; }
+            #modalContent label { display:block; margin-top:10px; font-weight:bold; }
+            #modalContent input, #modalContent select { width:100%; padding:8px; box-sizing:border-box; }
+            .modal-buttons { margin-top:20px; text-align:right; }
+            .gps-yes { color: green; font-weight:bold; }
+            .gps-no { color: #ccc; }
+        </style>
     </head>
     <body>
         <h1>🚚 Админ-панель — Отгрузки</h1>
@@ -233,7 +351,7 @@ async def admin_panel(user=Depends(check_admin)):
             <thead>
                 <tr>
                     <th>Заказ</th><th>Адрес</th><th>Перевозчик</th>
-                    <th>Машина</th><th>Статус</th><th>Действия</th>
+                    <th>Машина</th><th>Статус</th><th>Позиция</th><th>Действия</th>
                 </tr>
             </thead>
             <tbody></tbody>
@@ -282,8 +400,9 @@ async def admin_panel(user=Depends(check_admin)):
             const res = await fetch('/api/admin/shipments');
             allData = await res.json();
             const active = allData.filter(s => s.status === 'в пути').length;
+            const withGps = allData.filter(s => s.current_lat).length;
             document.getElementById('stats').innerHTML =
-                `<p>Всего: <b>${allData.length}</b> | В пути: <b style="color:green">${active}</b></p>`;
+                `<p>Всего: <b>${allData.length}</b> | В пути: <b style="color:green">${active}</b> | С координатами: <b style="color:blue">${withGps}</b></p>`;
             renderTable();
         }
 
@@ -300,6 +419,7 @@ async def admin_panel(user=Depends(check_admin)):
                     <td>${s.carrier || ''}</td>
                     <td>${s.vehicle || ''}</td>
                     <td class="${(s.status||'').replace(' ','-')}">${s.status || ''}</td>
+                    <td>${s.current_lat ? '<span class="gps-yes">📍 ' + Number(s.current_lat).toFixed(2) + ', ' + Number(s.current_lng).toFixed(2) + '</span>' : '<span class="gps-no">—</span>'}</td>
                     <td>
                         <button class="btn-edit" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
                         <button class="btn-del" onclick="del('${s.order_id}')">🗑</button>
