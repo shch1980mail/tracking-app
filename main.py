@@ -4,7 +4,7 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
 import os, json, asyncpg
-from datetime import datetime, date
+from datetime import date
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -34,7 +34,6 @@ class Shipment(BaseModel):
 
 
 def parse_date(v):
-    """Превращает '2026-07-07' в datetime.date. None при пустом/некорректном."""
     if not v:
         return None
     try:
@@ -71,7 +70,6 @@ async def startup():
             )
         """)
 
-        # ПРИНУДИТЕЛЬНАЯ ЗАГРУЗКА из shipments.json при каждом старте
         if os.path.exists("shipments.json"):
             with open("shipments.json", "r", encoding="utf-8") as f:
                 seed = json.load(f)
