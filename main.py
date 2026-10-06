@@ -1,10 +1,10 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
 import os, json, asyncpg
-from datetime import datetime
+from datetime import datetime, date
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -33,6 +33,16 @@ class Shipment(BaseModel):
     status: Optional[str] = "планируется"
 
 
+def parse_date(v):
+    """Превращает '2026-07-07' в datetime.date. None при пустом/некорректном."""
+    if not v:
+        return None
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except Exception:
+        return None
+
+
 @app.on_event("startup")
 async def startup():
     global pool
@@ -40,7 +50,7 @@ async def startup():
     async with pool.acquire() as conn:
         await conn.execute("""
             CREATE TABLE IF NOT EXISTS shipments (
-                order_id VARCHAR(30) PRIMARY KEY,
+                order_id VARCHAR(50) PRIMARY KEY,
                 direction VARCHAR(100),
                 address TEXT,
                 weight DECIMAL,
@@ -86,7 +96,8 @@ async def startup():
                             status=EXCLUDED.status,
                             updated_at=NOW()
                     """, s.get("order_id"), s.get("direction"), s.get("address"),
-                        s.get("weight"), s.get("ship_date"), s.get("plan_arrival"),
+                        s.get("weight"), parse_date(s.get("ship_date")),
+                        parse_date(s.get("plan_arrival")),
                         s.get("carrier"), s.get("vehicle"), s.get("driver"),
                         s.get("gps_link"), s.get("status"))
                     loaded += 1
@@ -139,8 +150,9 @@ async def admin_create(s: Shipment, user=Depends(check_admin)):
                 vehicle=EXCLUDED.vehicle, driver=EXCLUDED.driver,
                 gps_link=EXCLUDED.gps_link, status=EXCLUDED.status,
                 updated_at=NOW()
-        """, s.order_id, s.direction, s.address, s.weight, s.ship_date,
-            s.plan_arrival, s.carrier, s.vehicle, s.driver, s.gps_link, s.status)
+        """, s.order_id, s.direction, s.address, s.weight,
+            parse_date(s.ship_date), parse_date(s.plan_arrival),
+            s.carrier, s.vehicle, s.driver, s.gps_link, s.status)
     return {"ok": True}
 
 
