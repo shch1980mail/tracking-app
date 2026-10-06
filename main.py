@@ -7,6 +7,7 @@ import os, json, asyncpg
 from datetime import date, datetime, timedelta
 import urllib.request
 import urllib.parse
+import httpx
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -14,11 +15,13 @@ security = HTTPBasic()
 DATABASE_URL = os.environ.get("DATABASE_URL")
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable must be set")
 
 pool = None
+last_trigger = None  # антифлуд — не чаще одного триггера в 2 минуты
 
 
 class Shipment(BaseModel):
@@ -45,7 +48,6 @@ def parse_date(v):
 
 
 def geocode(address):
-    """Адрес → координаты через Nominatim (OSM)."""
     if not address:
         return None, None
     try:
@@ -63,7 +65,6 @@ def geocode(address):
 
 
 def calc_route(lat1, lng1, lat2, lng2):
-    """Расчёт расстояния через OSRM. Возвращает км или None."""
     try:
         url = f"http://router.project-osrm.org/route/v1/driving/{lng1},{lat1};{lng2},{lat2}?overview=false"
         with urllib.request.urlopen(url, timeout=15) as r:
@@ -73,6 +74,41 @@ def calc_route(lat1, lng1, lat2, lng2):
     except Exception as e:
         print(f"route error: {e}")
     return None
+
+
+async def trigger_parser():
+    """Запускает GitHub Actions workflow GPS Parser вручную. Антифлуд: не чаще 2 мин."""
+    global last_trigger
+    if not GITHUB_TOKEN:
+        print("GITHUB_TOKEN не задан, триггер пропущен")
+        return False
+
+    now = datetime.now()
+    if last_trigger and (now - last_trigger).total_seconds() < 120:
+        print("Триггер пропущен (антифлуд)")
+        return False
+
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.github.com/repos/shch1980mail/tracking-app/actions/workflows/parser.yml/dispatches",
+                headers={
+                    "Authorization": f"Bearer {GITHUB_TOKEN}",
+                    "Accept": "application/vnd.github+json",
+                    "X-GitHub-Api-Version": "2022-11-28"
+                },
+                json={"ref": "main"},
+                timeout=10
+            )
+            if resp.status_code in (204, 200):
+                last_trigger = now
+                print(f"Парсер запущен в {now}")
+                return True
+            else:
+                print(f"Ошибка триггера: {resp.status_code} {resp.text[:200]}")
+    except Exception as e:
+        print(f"trigger error: {e}")
+    return False
 
 
 @app.on_event("startup")
@@ -158,7 +194,18 @@ async def track_order(order_id: str):
 
     data = dict(row)
 
-    # Если есть позиция и адрес — считаем ETA
+    # Проверяем свежесть координат
+    is_stale = True
+    if data.get("last_position_update"):
+        age = (datetime.now() - data["last_position_update"]).total_seconds()
+        is_stale = age > 3600  # старше 1 часа
+
+    # Если координат нет или они устарели — триггерим парсер в фоне
+    if data.get("gps_link") and data.get("status") == "в пути" and is_stale:
+        print(f"Координаты устарели для {order_id}, запускаю парсер")
+        await trigger_parser()
+
+    # Считаем ETA
     if data.get("current_lat") and data.get("address"):
         dest_lat, dest_lng = geocode(data["address"])
         if dest_lat and dest_lng:
@@ -168,13 +215,19 @@ async def track_order(order_id: str):
                 days = km / 450.0
                 data["eta_days"] = round(days, 1)
                 data["eta_date"] = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
-                # сохраним в БД
                 async with pool.acquire() as conn2:
                     await conn2.execute("""
                         UPDATE shipments SET remaining_km = $1, eta_date = $2 WHERE order_id = $3
                     """, km, parse_date((datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")), order_id)
 
     return data
+
+
+@app.post("/api/admin/refresh/{order_id}")
+async def admin_refresh(order_id: str, user=Depends(check_admin)):
+    """Ручной запуск парсера из админки."""
+    ok = await trigger_parser()
+    return {"ok": ok, "message": "Парсер запущен" if ok else "Не удалось запустить (антифлуд или нет токена)"}
 
 
 @app.get("/api/admin/shipments")
@@ -234,6 +287,7 @@ async def user_portal():
             .status-в-пути { background:#d4edda; color:#155724; }
             .status-завершено { background:#e2e3e5; color:#383d41; }
             .status-планируется { background:#fff3cd; color:#856404; }
+            .updating { color: #856404; background: #fff3cd; padding: 8px 12px; border-radius: 6px; margin-top: 10px; }
         </style>
     </head>
     <body>
@@ -247,7 +301,7 @@ async def user_portal():
 
         <script>
         let map = null;
-        let marker = null;
+        let refreshTimer = null;
 
         async function track() {
             const order = document.getElementById('orderInput').value.trim();
@@ -255,6 +309,7 @@ async def user_portal():
 
             document.getElementById('result').innerHTML = '<p>Поиск...</p>';
             document.getElementById('map').style.display = 'none';
+            if (refreshTimer) { clearTimeout(refreshTimer); refreshTimer = null; }
 
             try {
                 const res = await fetch(`/api/track/${encodeURIComponent(order)}`);
@@ -271,19 +326,10 @@ async def user_portal():
                 html += `<div class="info-row"><b>Перевозчик:</b> ${data.carrier || '—'}</div>`;
                 html += `<div class="info-row"><b>Машина:</b> ${data.vehicle || '—'}</div>`;
                 html += `<div class="info-row"><b>Статус:</b> <span class="status-badge status-${(data.status||'').replace(' ','-')}">${data.status || '—'}</span></div>`;
-
-                if (data.remaining_km) {
-                    html += `<div class="info-row"><b>Осталось:</b> ${data.remaining_km} км</div>`;
-                }
-                if (data.eta_date) {
-                    html += `<div class="info-row"><b>Расчётный срок:</b> ${data.eta_date}</div>`;
-                }
-                if (data.plan_arrival) {
-                    html += `<div class="info-row"><b>Плановая дата:</b> ${data.plan_arrival}</div>`;
-                }
-                if (data.last_position_update) {
-                    html += `<div class="info-row"><b>Обновлено:</b> ${new Date(data.last_position_update).toLocaleString('ru-RU')}</div>`;
-                }
+                if (data.remaining_km) html += `<div class="info-row"><b>Осталось:</b> ${data.remaining_km} км</div>`;
+                if (data.eta_date) html += `<div class="info-row"><b>Расчётный срок:</b> ${data.eta_date}</div>`;
+                if (data.plan_arrival) html += `<div class="info-row"><b>Плановая дата:</b> ${data.plan_arrival}</div>`;
+                if (data.last_position_update) html += `<div class="info-row"><b>Обновлено:</b> ${new Date(data.last_position_update).toLocaleString('ru-RU')}</div>`;
                 document.getElementById('result').innerHTML = html;
 
                 if (data.current_lat && data.current_lng) {
@@ -296,11 +342,16 @@ async def user_portal():
                     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
                         attribution: '© OpenStreetMap'
                     }).addTo(map);
-
-                    marker = L.marker([lat, lng]).addTo(map);
-                    marker.bindPopup(`<b>${data.order_id}</b><br>${data.vehicle || ''}`).openPopup();
+                    L.marker([lat, lng]).addTo(map)
+                        .bindPopup(`<b>${data.order_id}</b><br>${data.vehicle || ''}`).openPopup();
+                } else if (data.status === 'в пути' && data.gps_link) {
+                    // Координат нет, но есть GPS-ссылка — показываем, что парсер запущен
+                    document.getElementById('result').innerHTML += 
+                        '<div class="updating">⏳ Получаем актуальные координаты. Пожалуйста, подождите 1–2 минуты.</div>';
+                    // Автоматически перезапросим через 90 секунд
+                    refreshTimer = setTimeout(track, 90000);
                 } else {
-                    document.getElementById('result').innerHTML += '<p style="color:orange">⚠️ Координаты пока не получены. Парсер обновит их в течение часа.</p>';
+                    document.getElementById('result').innerHTML += '<p style="color:orange">⚠️ Координаты пока не получены.</p>';
                 }
             } catch (e) {
                 document.getElementById('result').innerHTML = `<p style="color:red">Ошибка: ${e.message}</p>`;
@@ -332,6 +383,7 @@ async def admin_panel(user=Depends(check_admin)):
             .btn-add { background:#28a745; color:white; border:none; border-radius:4px; font-size:14px; padding:10px 20px; margin-bottom:10px; }
             .btn-edit { background:#ffc107; border:none; border-radius:4px; }
             .btn-del { background:#dc3545; color:white; border:none; border-radius:4px; }
+            .btn-refresh { background:#17a2b8; color:white; border:none; border-radius:4px; }
             #filter { padding:8px; width:300px; margin-bottom:10px; }
             #modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
             #modalContent { background:white; max-width:600px; margin:80px auto; padding:30px; border-radius:8px; max-height:80vh; overflow-y:auto; }
@@ -340,12 +392,14 @@ async def admin_panel(user=Depends(check_admin)):
             .modal-buttons { margin-top:20px; text-align:right; }
             .gps-yes { color: green; font-weight:bold; }
             .gps-no { color: #ccc; }
+            #toast { display:none; position:fixed; bottom:30px; right:30px; background:#333; color:white; padding:15px 25px; border-radius:8px; z-index:9999; }
         </style>
     </head>
     <body>
         <h1>🚚 Админ-панель — Отгрузки</h1>
         <div id="stats"></div>
         <button class="btn-add" onclick="openAdd()">➕ Добавить заказ</button>
+        <button class="btn-refresh" onclick="refreshAll()">🔄 Обновить позиции</button>
         <input id="filter" placeholder="Фильтр по номеру или адресу..." oninput="renderTable()"/>
         <table id="shipments">
             <thead>
@@ -356,6 +410,8 @@ async def admin_panel(user=Depends(check_admin)):
             </thead>
             <tbody></tbody>
         </table>
+
+        <div id="toast"></div>
 
         <div id="modal">
             <div id="modalContent">
@@ -368,7 +424,7 @@ async def admin_panel(user=Depends(check_admin)):
                 <input id="f_address"/>
                 <label>Вес</label>
                 <input id="f_weight" type="number"/>
-                <label>Дата отгрузки (ГГГГ-ММ-ДД)</label>
+                <label>Дата отгрузки</label>
                 <input id="f_ship_date"/>
                 <label>Дата прибытия (план)</label>
                 <input id="f_plan_arrival"/>
@@ -395,6 +451,13 @@ async def admin_panel(user=Depends(check_admin)):
 
         <script>
         let allData = [];
+
+        function showToast(msg) {
+            const t = document.getElementById('toast');
+            t.innerText = msg;
+            t.style.display = 'block';
+            setTimeout(() => t.style.display = 'none', 4000);
+        }
 
         async function load() {
             const res = await fetch('/api/admin/shipments');
@@ -426,6 +489,14 @@ async def admin_panel(user=Depends(check_admin)):
                     </td>
                 </tr>
             `).join('');
+        }
+
+        async function refreshAll() {
+            showToast('Запускаю парсер...');
+            const res = await fetch('/api/admin/refresh/all', {method: 'POST'});
+            const data = await res.json();
+            showToast(data.message || 'Готово');
+            setTimeout(load, 120000);
         }
 
         function openAdd() {
@@ -473,7 +544,7 @@ async def admin_panel(user=Depends(check_admin)):
                 headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify(payload)
             });
-            if (res.ok) { closeModal(); load(); }
+            if (res.ok) { closeModal(); load(); showToast('Сохранено'); }
             else { alert('Ошибка сохранения'); }
         }
 
