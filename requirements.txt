@@ -1,5 +1,4 @@
 fastapi
 uvicorn
 asyncpg
-playwright
-requests
+httpx
