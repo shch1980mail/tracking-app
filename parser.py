@@ -11,8 +11,35 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 _current_sid = None
 
 
+async def save_position(conn, order_id, lat, lng):
+    """Сохраняет позицию. При первом появлении фиксирует ship_lat/ship_lng."""
+    row = await conn.fetchrow(
+        "SELECT ship_lat FROM shipments WHERE order_id = $1", order_id
+    )
+    if row and row["ship_lat"] is None:
+        # Первый раз видим машину — фиксируем стартовую точку
+        await conn.execute("""
+            UPDATE shipments
+            SET ship_lat = $1, ship_lng = $2,
+                current_lat = $1, current_lng = $2,
+                first_seen_at = NOW(),
+                last_position_update = NOW(),
+                updated_at = NOW()
+            WHERE order_id = $3
+        """, lat, lng, order_id)
+    else:
+        # Уже видели — обновляем только текущую позицию
+        await conn.execute("""
+            UPDATE shipments
+            SET current_lat = $1, current_lng = $2,
+                last_position_update = NOW(),
+                updated_at = NOW()
+            WHERE order_id = $3
+        """, lat, lng, order_id)
+
+
 async def get_sid_from_maps_baltgps(gps_link: str):
-    """maps.baltgps.ru — старый метод через перехват sid."""
+    """maps.baltgps.ru — перехват sid через Playwright."""
     captured = {"sid": None}
 
     async with async_playwright() as p:
@@ -65,7 +92,6 @@ async def get_coords_from_gs_baltgps(gps_link: str):
             print("  Жду 25 секунд, пока карта прогрузится...")
             await page.wait_for_timeout(25000)
 
-            # Ищем паттерн N<число>, E<число> в HTML
             html = await page.content()
             m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
 
@@ -74,7 +100,6 @@ async def get_coords_from_gs_baltgps(gps_link: str):
                 coords["lng"] = float(m[-1][1])
                 print(f"  Найдено из HTML: {coords['lat']}, {coords['lng']}")
             else:
-                # Если в HTML нет — кликаем по карте, чтобы координаты появились
                 print("  Координаты в HTML не найдены, кликаю по карте...")
                 await page.mouse.click(900, 400)
                 await page.wait_for_timeout(3000)
@@ -86,7 +111,7 @@ async def get_coords_from_gs_baltgps(gps_link: str):
                     coords["lng"] = float(m[-1][1])
                     print(f"  Найдено после клика: {coords['lat']}, {coords['lng']}")
                 else:
-                    print(f"  ❌ Координаты не найдены")
+                    print(f"  Координаты не найдены")
         except Exception as e:
             print(f"  Ошибка Playwright: {e}")
         finally:
@@ -143,18 +168,14 @@ def get_position_by_sid(sid: str, unit_id: int, base_url: str = "https://maps.ba
 
 async def process_order(conn, order_id: str, gps_link: str):
     """Определяет тип ссылки и обрабатывает соответственно."""
+    global _current_sid
 
     # === Тип 1: gs.baltgps.ru (новый интерфейс) ===
     if "gs.baltgps.ru" in gps_link:
         print(f"  {order_id}: тип gs.baltgps.ru (через HTML)")
         lat, lng = await get_coords_from_gs_baltgps(gps_link)
         if lat and lng:
-            await conn.execute("""
-                UPDATE shipments
-                SET current_lat = $1, current_lng = $2,
-                    last_position_update = NOW(), updated_at = NOW()
-                WHERE order_id = $3
-            """, lat, lng, order_id)
+            await save_position(conn, order_id, lat, lng)
             print(f"  {order_id}: {lat}, {lng} ✅")
             return True
         print(f"  {order_id}: координаты не получены ❌")
@@ -170,7 +191,6 @@ async def process_order(conn, order_id: str, gps_link: str):
             print(f"  {order_id}: не удалось получить список машин")
             return False
 
-        global _current_sid
         print(f"  Получаю новый sid через Playwright...")
         _current_sid = await get_sid_from_maps_baltgps(gps_link)
 
@@ -182,12 +202,7 @@ async def process_order(conn, order_id: str, gps_link: str):
         lat, lng, status = get_position_by_sid(_current_sid, unit_id)
 
         if lat and lng:
-            await conn.execute("""
-                UPDATE shipments
-                SET current_lat = $1, current_lng = $2,
-                    last_position_update = NOW(), updated_at = NOW()
-                WHERE order_id = $3
-            """, lat, lng, order_id)
+            await save_position(conn, order_id, lat, lng)
             print(f"  {order_id}: {lat}, {lng} ✅")
             return True
 
@@ -195,7 +210,7 @@ async def process_order(conn, order_id: str, gps_link: str):
         return False
 
     # === Тип 3: неизвестный сервис ===
-    print(f"  {order_id}: неизвестный GPS-сервис, пропускаю")
+    print(f"  {order_id}: неизвестный GPS-сервис ({gps_link[:60]}), пропускаю")
     return False
 
 
