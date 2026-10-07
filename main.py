@@ -21,7 +21,7 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL environment variable must be set")
 
 pool = None
-last_trigger = None  # антифлуд — не чаще одного триггера в 2 минуты
+last_trigger = None
 
 
 class Shipment(BaseModel):
@@ -76,8 +76,32 @@ def calc_route(lat1, lng1, lat2, lng2):
     return None
 
 
+def calc_eta(current_lat, current_lng, dest_lat, dest_lng,
+             ship_lat, ship_lng, ship_date):
+    """Реалистичная ETA: учитывает пройденный путь и фактическую скорость."""
+    remaining = calc_route(current_lat, current_lng, dest_lat, dest_lng)
+    if not remaining:
+        return None, None, None, None
+
+    speed = 500.0  # км/день по умолчанию
+
+    if ship_lat and ship_lng and ship_date:
+        passed = calc_route(ship_lat, ship_lng, current_lat, current_lng)
+        days_in_transit = (datetime.now() - ship_date).total_seconds() / 86400
+
+        if passed and passed >= 50 and days_in_transit >= 0.5:
+            real_speed = passed / days_in_transit
+            # Ограничиваем коридор [250; 800] км/день
+            speed = max(250, min(800, real_speed))
+            print(f"ETA: пройдено {passed} км за {days_in_transit:.1f} дн → скорость {real_speed:.0f} км/день")
+
+    eta_days = remaining / speed
+    eta_date = datetime.now() + timedelta(days=eta_days)
+    return remaining, round(eta_days, 1), eta_date.strftime("%d.%m.%Y"), round(speed)
+
+
 async def trigger_parser():
-    """Запускает GitHub Actions workflow GPS Parser вручную. Антифлуд: не чаще 2 мин."""
+    """Запускает GitHub Actions workflow GPS Parser вручную."""
     global last_trigger
     if not GITHUB_TOKEN:
         print("GITHUB_TOKEN не задан, триггер пропущен")
@@ -131,14 +155,31 @@ async def startup():
                 status VARCHAR(30) DEFAULT 'планируется',
                 current_lat DECIMAL(10,6),
                 current_lng DECIMAL(10,6),
+                ship_lat DECIMAL(10,6),
+                ship_lng DECIMAL(10,6),
+                first_seen_at TIMESTAMP,
                 last_position_update TIMESTAMP,
                 remaining_km INTEGER,
                 eta_date DATE,
+                actual_speed DECIMAL(6,2),
                 created_at TIMESTAMP DEFAULT NOW(),
                 updated_at TIMESTAMP DEFAULT NOW()
             )
         """)
 
+        # Дополнительные ALTER для совместимости с уже существующей таблицей
+        for stmt in [
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ship_lat DECIMAL(10,6)",
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ship_lng DECIMAL(10,6)",
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP",
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS actual_speed DECIMAL(6,2)",
+        ]:
+            try:
+                await conn.execute(stmt)
+            except Exception as e:
+                print(f"ALTER: {e}")
+
+        # Загрузка seed-данных из shipments.json
         if os.path.exists("shipments.json"):
             with open("shipments.json", "r", encoding="utf-8") as f:
                 seed = json.load(f)
@@ -194,40 +235,49 @@ async def track_order(order_id: str):
 
     data = dict(row)
 
-    # Проверяем свежесть координат
+    # Свежесть координат
     is_stale = True
     if data.get("last_position_update"):
         age = (datetime.now() - data["last_position_update"]).total_seconds()
-        is_stale = age > 3600  # старше 1 часа
+        is_stale = age > 3600
 
-    # Если координат нет или они устарели — триггерим парсер в фоне
     if data.get("gps_link") and data.get("status") == "в пути" and is_stale:
-        print(f"Координаты устарели для {order_id}, запускаю парсер")
         await trigger_parser()
 
-    # Считаем ETA
+    # Расчёт ETA по реалистичной формуле
     if data.get("current_lat") and data.get("address"):
         dest_lat, dest_lng = geocode(data["address"])
         if dest_lat and dest_lng:
-            km = calc_route(float(data["current_lat"]), float(data["current_lng"]), dest_lat, dest_lng)
-            if km:
-                data["remaining_km"] = km
-                days = km / 450.0
-                data["eta_days"] = round(days, 1)
-                data["eta_date"] = (datetime.now() + timedelta(days=days)).strftime("%d.%m.%Y")
+            remaining, eta_days, eta_date, speed = calc_eta(
+                float(data["current_lat"]),
+                float(data["current_lng"]),
+                dest_lat, dest_lng,
+                float(data["ship_lat"]) if data.get("ship_lat") else None,
+                float(data["ship_lng"]) if data.get("ship_lng") else None,
+                data.get("ship_date"),
+            )
+            if remaining:
+                data["remaining_km"] = remaining
+                data["eta_days"] = eta_days
+                data["eta_date"] = eta_date
+                data["actual_speed"] = speed
+
                 async with pool.acquire() as conn2:
                     await conn2.execute("""
-                        UPDATE shipments SET remaining_km = $1, eta_date = $2 WHERE order_id = $3
-                    """, km, parse_date((datetime.now() + timedelta(days=days)).strftime("%Y-%m-%d")), order_id)
+                        UPDATE shipments
+                        SET remaining_km = $1, eta_date = $2, actual_speed = $3
+                        WHERE order_id = $4
+                    """, remaining,
+                        parse_date(datetime.strptime(eta_date, "%d.%m.%Y").strftime("%Y-%m-%d")),
+                        speed, order_id)
 
     return data
 
 
-@app.post("/api/admin/refresh/{order_id}")
-async def admin_refresh(order_id: str, user=Depends(check_admin)):
-    """Ручной запуск парсера из админки."""
+@app.post("/api/admin/refresh/all")
+async def admin_refresh_all(user=Depends(check_admin)):
     ok = await trigger_parser()
-    return {"ok": ok, "message": "Парсер запущен" if ok else "Не удалось запустить (антифлуд или нет токена)"}
+    return {"ok": ok, "message": "Парсер запущен" if ok else "Не удалось (антифлуд или нет токена)"}
 
 
 @app.get("/api/admin/shipments")
@@ -314,7 +364,6 @@ async def user_portal():
             try {
                 const res = await fetch(`/api/track/${encodeURIComponent(order)}`);
                 const data = await res.json();
-
                 if (!res.ok) {
                     document.getElementById('result').innerHTML = `<p style="color:red">${data.detail}</p>`;
                     return;
@@ -327,6 +376,7 @@ async def user_portal():
                 html += `<div class="info-row"><b>Машина:</b> ${data.vehicle || '—'}</div>`;
                 html += `<div class="info-row"><b>Статус:</b> <span class="status-badge status-${(data.status||'').replace(' ','-')}">${data.status || '—'}</span></div>`;
                 if (data.remaining_km) html += `<div class="info-row"><b>Осталось:</b> ${data.remaining_km} км</div>`;
+                if (data.actual_speed) html += `<div class="info-row"><b>Скорость:</b> ${data.actual_speed} км/день</div>`;
                 if (data.eta_date) html += `<div class="info-row"><b>Расчётный срок:</b> ${data.eta_date}</div>`;
                 if (data.plan_arrival) html += `<div class="info-row"><b>Плановая дата:</b> ${data.plan_arrival}</div>`;
                 if (data.last_position_update) html += `<div class="info-row"><b>Обновлено:</b> ${new Date(data.last_position_update).toLocaleString('ru-RU')}</div>`;
@@ -336,22 +386,14 @@ async def user_portal():
                     const lat = parseFloat(data.current_lat);
                     const lng = parseFloat(data.current_lng);
                     document.getElementById('map').style.display = 'block';
-
                     if (map) map.remove();
                     map = L.map('map').setView([lat, lng], 8);
-                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                        attribution: '© OpenStreetMap'
-                    }).addTo(map);
-                    L.marker([lat, lng]).addTo(map)
-                        .bindPopup(`<b>${data.order_id}</b><br>${data.vehicle || ''}`).openPopup();
+                    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { attribution: '© OpenStreetMap' }).addTo(map);
+                    L.marker([lat, lng]).addTo(map).bindPopup(`<b>${data.order_id}</b><br>${data.vehicle || ''}`).openPopup();
                 } else if (data.status === 'в пути' && data.gps_link) {
-                    // Координат нет, но есть GPS-ссылка — показываем, что парсер запущен
                     document.getElementById('result').innerHTML += 
                         '<div class="updating">⏳ Получаем актуальные координаты. Пожалуйста, подождите 1–2 минуты.</div>';
-                    // Автоматически перезапросим через 90 секунд
                     refreshTimer = setTimeout(track, 90000);
-                } else {
-                    document.getElementById('result').innerHTML += '<p style="color:orange">⚠️ Координаты пока не получены.</p>';
                 }
             } catch (e) {
                 document.getElementById('result').innerHTML = `<p style="color:red">Ошибка: ${e.message}</p>`;
@@ -405,7 +447,7 @@ async def admin_panel(user=Depends(check_admin)):
             <thead>
                 <tr>
                     <th>Заказ</th><th>Адрес</th><th>Перевозчик</th>
-                    <th>Машина</th><th>Статус</th><th>Позиция</th><th>Действия</th>
+                    <th>Машина</th><th>Статус</th><th>Позиция</th><th>Скорость</th><th>Действия</th>
                 </tr>
             </thead>
             <tbody></tbody>
@@ -483,6 +525,7 @@ async def admin_panel(user=Depends(check_admin)):
                     <td>${s.vehicle || ''}</td>
                     <td class="${(s.status||'').replace(' ','-')}">${s.status || ''}</td>
                     <td>${s.current_lat ? '<span class="gps-yes">📍 ' + Number(s.current_lat).toFixed(2) + ', ' + Number(s.current_lng).toFixed(2) + '</span>' : '<span class="gps-no">—</span>'}</td>
+                    <td>${s.actual_speed ? Math.round(s.actual_speed) + ' км/д' : '—'}</td>
                     <td>
                         <button class="btn-edit" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
                         <button class="btn-del" onclick="del('${s.order_id}')">🗑</button>
