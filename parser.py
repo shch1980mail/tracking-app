@@ -8,14 +8,12 @@ from playwright.async_api import async_playwright
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 
-# Глобальный sid — переиспользуется между заказами
 _current_sid = None
 
 
-async def get_sid_from_browser(gps_link: str):
-    """Открывает GPS-ссылку в Playwright и перехватывает sid откуда угодно."""
+async def get_sid_from_maps_baltgps(gps_link: str):
+    """maps.baltgps.ru — старый метод через перехват sid."""
     captured = {"sid": None}
-    seen_urls = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
@@ -23,25 +21,19 @@ async def get_sid_from_browser(gps_link: str):
         page = await context.new_page()
 
         def extract_sid(url):
-            """Ищет sid=... в любом месте URL."""
             if "sid=" not in url:
                 return None
             m = re.search(r"[?&]sid=([a-f0-9]{20,})", url)
             return m.group(1) if m else None
 
         async def on_request(request):
-            url = request.url
-            if "wialon" in url or "ajax" in url:
-                if len(seen_urls) < 30:
-                    seen_urls.append(f"REQ: {url[:180]}")
-            sid = extract_sid(url)
+            sid = extract_sid(request.url)
             if sid and not captured["sid"]:
                 captured["sid"] = sid
-                print(f"  Перехвачен sid из запроса: {sid[:16]}...")
+                print(f"  Перехвачен sid: {sid[:16]}...")
 
         async def on_response(response):
-            url = response.url
-            sid = extract_sid(url)
+            sid = extract_sid(response.url)
             if sid and not captured["sid"]:
                 captured["sid"] = sid
                 print(f"  Перехвачен sid из ответа: {sid[:16]}...")
@@ -51,37 +43,63 @@ async def get_sid_from_browser(gps_link: str):
 
         try:
             await page.goto(gps_link, timeout=60000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(15000)
+            await page.wait_for_timeout(12000)
         except Exception as e:
             print(f"  Playwright ошибка: {e}")
-
-        # Дополнительно: пробуем достать sid из cookie
-        if not captured["sid"]:
-            try:
-                cookies = await context.cookies()
-                for c in cookies:
-                    if "sid" in c["name"].lower():
-                        captured["sid"] = c["value"]
-                        print(f"  Перехвачен sid из cookie: {c['value'][:16]}...")
-                        break
-            except Exception as e:
-                print(f"  Ошибка чтения cookies: {e}")
-
-        await browser.close()
-
-    if not captured["sid"]:
-        print(f"  sid НЕ найден. Увиденные URL (первые 20):")
-        for u in seen_urls[:20]:
-            print(f"    {u}")
+        finally:
+            await browser.close()
 
     return captured["sid"]
 
 
-def get_units_from_token(token: str):
-    """Через token/login получает список ID машин."""
+async def get_coords_from_gs_baltgps(gps_link: str):
+    """gs.baltgps.ru — координаты из HTML после клика по карте."""
+    coords = {"lat": None, "lng": None}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        page = await browser.new_page()
+
+        try:
+            await page.goto(gps_link, timeout=90000, wait_until="domcontentloaded")
+            print("  Жду 25 секунд, пока карта прогрузится...")
+            await page.wait_for_timeout(25000)
+
+            # Ищем паттерн N<число>, E<число> в HTML
+            html = await page.content()
+            m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
+
+            if m:
+                coords["lat"] = float(m[-1][0])
+                coords["lng"] = float(m[-1][1])
+                print(f"  Найдено из HTML: {coords['lat']}, {coords['lng']}")
+            else:
+                # Если в HTML нет — кликаем по карте, чтобы координаты появились
+                print("  Координаты в HTML не найдены, кликаю по карте...")
+                await page.mouse.click(900, 400)
+                await page.wait_for_timeout(3000)
+
+                html = await page.content()
+                m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
+                if m:
+                    coords["lat"] = float(m[-1][0])
+                    coords["lng"] = float(m[-1][1])
+                    print(f"  Найдено после клика: {coords['lat']}, {coords['lng']}")
+                else:
+                    print(f"  ❌ Координаты не найдены")
+        except Exception as e:
+            print(f"  Ошибка Playwright: {e}")
+        finally:
+            await browser.close()
+
+    return coords["lat"], coords["lng"]
+
+
+def get_units_from_token(token: str, base_url: str = "https://maps.baltgps.ru"):
+    """token/login — для maps.baltgps.ru."""
     try:
         r = requests.get(
-            "https://maps.baltgps.ru/wialon/ajax.html",
+            f"{base_url}/wialon/ajax.html",
             params={
                 "svc": "token/login",
                 "params": json.dumps({"token": token})
@@ -97,11 +115,11 @@ def get_units_from_token(token: str):
     return [], None, None
 
 
-def get_position_by_sid(sid: str, unit_id: int):
-    """Быстрый запрос координат через requests."""
+def get_position_by_sid(sid: str, unit_id: int, base_url: str = "https://maps.baltgps.ru"):
+    """core/search_item — для maps.baltgps.ru."""
     try:
         r = requests.get(
-            "https://maps.baltgps.ru/wialon/ajax.html",
+            f"{base_url}/wialon/ajax.html",
             params={
                 "svc": "core/search_item",
                 "params": json.dumps({"id": unit_id, "flags": 1025}),
@@ -123,58 +141,61 @@ def get_position_by_sid(sid: str, unit_id: int):
     return None, None, "unknown"
 
 
-async def ensure_sid(gps_link: str):
-    """Гарантирует наличие рабочего sid. Если нет — получает через Playwright."""
-    global _current_sid
-
-    if _current_sid:
-        token = gps_link.split("?t=")[-1]
-        units, _, _ = get_units_from_token(token)
-        if units:
-            lat, lng, status = get_position_by_sid(_current_sid, units[0])
-            if status == "ok":
-                return _current_sid
-            print(f"  sid протух ({status}), получаю новый через Playwright")
-
-    print(f"  Получаю новый sid через Playwright...")
-    _current_sid = await get_sid_from_browser(gps_link)
-    return _current_sid
-
-
 async def process_order(conn, order_id: str, gps_link: str):
-    """Обрабатывает один заказ: получает координаты и пишет в БД."""
-    token = gps_link.split("?t=")[-1]
-    units, eid, host = get_units_from_token(token)
+    """Определяет тип ссылки и обрабатывает соответственно."""
 
-    if not units:
-        print(f"  {order_id}: не удалось получить список машин")
+    # === Тип 1: gs.baltgps.ru (новый интерфейс) ===
+    if "gs.baltgps.ru" in gps_link:
+        print(f"  {order_id}: тип gs.baltgps.ru (через HTML)")
+        lat, lng = await get_coords_from_gs_baltgps(gps_link)
+        if lat and lng:
+            await conn.execute("""
+                UPDATE shipments
+                SET current_lat = $1, current_lng = $2,
+                    last_position_update = NOW(), updated_at = NOW()
+                WHERE order_id = $3
+            """, lat, lng, order_id)
+            print(f"  {order_id}: {lat}, {lng} ✅")
+            return True
+        print(f"  {order_id}: координаты не получены ❌")
         return False
 
-    sid = await ensure_sid(gps_link)
-    if not sid:
-        print(f"  {order_id}: не удалось получить sid")
-        return False
+    # === Тип 2: maps.baltgps.ru (старый интерфейс) ===
+    if "maps.baltgps.ru" in gps_link:
+        print(f"  {order_id}: тип maps.baltgps.ru (через API)")
+        token = gps_link.split("?t=")[-1]
+        units, eid, host = get_units_from_token(token)
 
-    unit_id = units[0]
-    lat, lng, status = get_position_by_sid(sid, unit_id)
+        if not units:
+            print(f"  {order_id}: не удалось получить список машин")
+            return False
 
-    if status == "sid_expired":
         global _current_sid
-        _current_sid = None
-        sid = await ensure_sid(gps_link)
-        lat, lng, status = get_position_by_sid(sid, unit_id) if sid else (None, None, "no_sid")
+        print(f"  Получаю новый sid через Playwright...")
+        _current_sid = await get_sid_from_maps_baltgps(gps_link)
 
-    if lat and lng:
-        await conn.execute("""
-            UPDATE shipments
-            SET current_lat = $1, current_lng = $2,
-                last_position_update = NOW(), updated_at = NOW()
-            WHERE order_id = $3
-        """, lat, lng, order_id)
-        print(f"  {order_id}: {lat}, {lng}")
-        return True
+        if not _current_sid:
+            print(f"  {order_id}: не удалось получить sid")
+            return False
 
-    print(f"  {order_id}: координаты не получены ({status})")
+        unit_id = units[0]
+        lat, lng, status = get_position_by_sid(_current_sid, unit_id)
+
+        if lat and lng:
+            await conn.execute("""
+                UPDATE shipments
+                SET current_lat = $1, current_lng = $2,
+                    last_position_update = NOW(), updated_at = NOW()
+                WHERE order_id = $3
+            """, lat, lng, order_id)
+            print(f"  {order_id}: {lat}, {lng} ✅")
+            return True
+
+        print(f"  {order_id}: координаты не получены ({status})")
+        return False
+
+    # === Тип 3: неизвестный сервис ===
+    print(f"  {order_id}: неизвестный GPS-сервис, пропускаю")
     return False
 
 
@@ -184,7 +205,7 @@ async def main():
         SELECT order_id, gps_link FROM shipments
         WHERE status = 'в пути' AND gps_link IS NOT NULL AND gps_link != ''
     """)
-    print(f"Найдено {len(rows)} активных заказов")
+    print(f"Найдено {len(rows)} активных заказов\n")
 
     updated = 0
     for row in rows:
