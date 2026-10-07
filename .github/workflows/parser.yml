@@ -2,8 +2,8 @@ name: GPS Parser
 
 on:
   schedule:
-    - cron: '0 * * * *'   # каждый час
-  workflow_dispatch:       # и вручную
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
 jobs:
   parse:
@@ -17,7 +17,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install -r requirements.txt
+          pip install -r requirements-parser.txt
           playwright install chromium
           playwright install-deps
 
