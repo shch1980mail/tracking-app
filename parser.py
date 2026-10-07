@@ -13,29 +13,66 @@ _current_sid = None
 
 
 async def get_sid_from_browser(gps_link: str):
-    """Открывает GPS-ссылку в Playwright и перехватывает sid из запроса."""
+    """Открывает GPS-ссылку в Playwright и перехватывает sid откуда угодно."""
     captured = {"sid": None}
+    seen_urls = []
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
+        context = await browser.new_context()
+        page = await context.new_page()
+
+        def extract_sid(url):
+            """Ищет sid=... в любом месте URL."""
+            if "sid=" not in url:
+                return None
+            m = re.search(r"[?&]sid=([a-f0-9]{20,})", url)
+            return m.group(1) if m else None
 
         async def on_request(request):
             url = request.url
-            if "wialon/ajax.html" in url and "sid=" in url:
-                m = re.search(r"sid=([a-f0-9]+)", url)
-                if m and not captured["sid"]:
-                    captured["sid"] = m.group(1)
-                    print(f"  Перехвачен sid: {captured['sid'][:16]}...")
+            if "wialon" in url or "ajax" in url:
+                if len(seen_urls) < 30:
+                    seen_urls.append(f"REQ: {url[:180]}")
+            sid = extract_sid(url)
+            if sid and not captured["sid"]:
+                captured["sid"] = sid
+                print(f"  Перехвачен sid из запроса: {sid[:16]}...")
+
+        async def on_response(response):
+            url = response.url
+            sid = extract_sid(url)
+            if sid and not captured["sid"]:
+                captured["sid"] = sid
+                print(f"  Перехвачен sid из ответа: {sid[:16]}...")
 
         page.on("request", on_request)
+        page.on("response", on_response)
+
         try:
-            await page.goto(gps_link, timeout=45000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(8000)
+            await page.goto(gps_link, timeout=60000, wait_until="domcontentloaded")
+            await page.wait_for_timeout(15000)
         except Exception as e:
             print(f"  Playwright ошибка: {e}")
-        finally:
-            await browser.close()
+
+        # Дополнительно: пробуем достать sid из cookie
+        if not captured["sid"]:
+            try:
+                cookies = await context.cookies()
+                for c in cookies:
+                    if "sid" in c["name"].lower():
+                        captured["sid"] = c["value"]
+                        print(f"  Перехвачен sid из cookie: {c['value'][:16]}...")
+                        break
+            except Exception as e:
+                print(f"  Ошибка чтения cookies: {e}")
+
+        await browser.close()
+
+    if not captured["sid"]:
+        print(f"  sid НЕ найден. Увиденные URL (первые 20):")
+        for u in seen_urls[:20]:
+            print(f"    {u}")
 
     return captured["sid"]
 
@@ -91,7 +128,6 @@ async def ensure_sid(gps_link: str):
     global _current_sid
 
     if _current_sid:
-        # Проверим, работает ли
         token = gps_link.split("?t=")[-1]
         units, _, _ = get_units_from_token(token)
         if units:
@@ -119,12 +155,10 @@ async def process_order(conn, order_id: str, gps_link: str):
         print(f"  {order_id}: не удалось получить sid")
         return False
 
-    # Берём первую машину из списка
     unit_id = units[0]
     lat, lng, status = get_position_by_sid(sid, unit_id)
 
     if status == "sid_expired":
-        # Сбросить sid и попробовать ещё раз
         global _current_sid
         _current_sid = None
         sid = await ensure_sid(gps_link)
