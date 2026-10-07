@@ -78,16 +78,29 @@ def calc_route(lat1, lng1, lat2, lng2):
 
 def calc_eta(current_lat, current_lng, dest_lat, dest_lng,
              ship_lat, ship_lng, ship_date):
+    """Реалистичная ETA: учитывает пройденный путь и фактическую скорость."""
     remaining = calc_route(current_lat, current_lng, dest_lat, dest_lng)
     if not remaining:
         return None, None, None, None
-    speed = 500.0
+
+    speed = 500.0  # км/день по умолчанию
+
     if ship_lat and ship_lng and ship_date:
         passed = calc_route(ship_lat, ship_lng, current_lat, current_lng)
-        days_in_transit = (datetime.now() - ship_date).total_seconds() / 86400
+
+        # Преобразуем ship_date в datetime, если пришёл date
+        if isinstance(ship_date, date) and not isinstance(ship_date, datetime):
+            ship_dt = datetime.combine(ship_date, datetime.min.time())
+        else:
+            ship_dt = ship_date
+
+        days_in_transit = (datetime.now() - ship_dt).total_seconds() / 86400
+
         if passed and passed >= 50 and days_in_transit >= 0.5:
             real_speed = passed / days_in_transit
             speed = max(250, min(800, real_speed))
+            print(f"ETA: пройдено {passed} км за {days_in_transit:.1f} дн → скорость {real_speed:.0f} км/день")
+
     eta_days = remaining / speed
     eta_date = datetime.now() + timedelta(days=eta_days)
     return remaining, round(eta_days, 1), eta_date.strftime("%d.%m.%Y"), round(speed)
@@ -680,7 +693,7 @@ async def admin_panel(user=Depends(check_admin)):
             else { alert('Ошибка сохранения'); }
         }
 
-        async def del(order_id) {
+        async function del(order_id) {
             if (!confirm('Удалить заказ ' + order_id + '?')) return;
             await fetch('/api/admin/shipments/' + order_id, {method: 'DELETE'});
             load();
