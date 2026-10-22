@@ -10,7 +10,7 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 _current_sid = None
 
 async def mark_as_done(conn, order_id):
-    """Помечает заказ как завершённый, если ссылка сгорела или машина приехала."""
+    """Помечает заказ как завершённый, если ссылка сгорела."""
     print(f"  {order_id}: ссылка невалидна, помечаю как 'завершено'")
     await conn.execute("""
         UPDATE shipments
@@ -120,7 +120,7 @@ async def process_order(conn, order_id: str, gps_link: str):
         token = gps_link.split("?t=")[-1]
         units, _, _ = get_units_from_token(token)
         if not units:
-            await mark_as_done(conn, order_id) # Ссылка сгорела
+            await mark_as_done(conn, order_id)  # Ссылка сгорела
             return False
 
         _current_sid = await get_sid_from_maps_baltgps(gps_link)
