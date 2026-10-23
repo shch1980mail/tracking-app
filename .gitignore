@@ -1,10 +1,19 @@
-__pycache__/
-*.py[cod]
-.venv/
-venv/
+.git
+.gitignore
+__pycache__
+*.pyc
+.pytest_cache
+.mypy_cache
+.venv
+venv
 .env
-.pytest_cache/
-.mypy_cache/
 *.log
 data/
-.DS_Store
+tests/
+README.md
+
+# На случай, если старые файлы остались в рабочей копии
+main.py
+parser.py
+data.py
+shipments*.json
