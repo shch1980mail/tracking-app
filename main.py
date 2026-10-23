@@ -133,6 +133,7 @@ async def startup():
             try: await conn.execute(stmt)
             except: pass
 
+        # Инициализация настроек вкладок (все включены по умолчанию)
         existing = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'tabs'")
         if not existing:
             await conn.execute("INSERT INTO app_settings (key, value) VALUES ('tabs', $1)", 
@@ -165,6 +166,7 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
+# ============ API НАСТРОЕК ВКЛАДОК ============
 @app.get("/api/settings/tabs")
 async def get_tab_settings():
     async with pool.acquire() as conn:
@@ -180,32 +182,20 @@ async def set_tab_settings(settings: TabSettings, user=Depends(check_admin)):
     return {"ok": True}
 
 
+# ============ ОСНОВНЫЕ API ============
 @app.get("/api/shipments")
-async def list_shipments(status: Optional[str] = None, search: Optional[str] = None):
+async def list_shipments(status: Optional[str] = None):
     async with pool.acquire() as conn:
-        base_query = "SELECT * FROM shipments"
-        conditions = []
-        params = []
-        
         if status == "in_transit":
-            conditions.append("status IN ('в пути', 'планируется')")
+            rows = await conn.fetch("SELECT * FROM shipments WHERE status IN ('в пути', 'планируется') ORDER BY plan_arrival ASC NULLS LAST")
         elif status == "delivered":
-            conditions.append("status IN ('завершено', 'выгружено')")
+            rows = await conn.fetch("SELECT * FROM shipments WHERE status IN ('завершено', 'выгружено') ORDER BY plan_arrival DESC NULLS LAST")
         elif status == "no_status":
-            conditions.append("(status = '' OR status IS NULL)")
+            rows = await conn.fetch("SELECT * FROM shipments WHERE status = '' OR status IS NULL ORDER BY order_id DESC")
         elif status == "with_gps":
-            conditions.append("gps_link IS NOT NULL AND gps_link != ''")
-        
-        if search:
-            conditions.append("(order_id ILIKE $1 OR address ILIKE $1 OR vehicle ILIKE $1)")
-            params.append(f"%{search}%")
-        
-        if conditions:
-            base_query += " WHERE " + " AND ".join(conditions)
-        
-        base_query += " ORDER BY plan_arrival ASC NULLS LAST"
-        
-        rows = await conn.fetch(base_query, *params)
+            rows = await conn.fetch("SELECT * FROM shipments WHERE gps_link IS NOT NULL AND gps_link != '' ORDER BY status, order_id DESC")
+        else:
+            rows = await conn.fetch("SELECT * FROM shipments ORDER BY order_id DESC")
     return [dict(r) for r in rows]
 
 
@@ -271,6 +261,7 @@ async def admin_delete(order_id: str, user=Depends(check_admin)):
     return {"ok": True}
 
 
+# ============ ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС (СТАРАЯ ВЕРСИЯ + СКРЫТИЕ ВКЛАДОК) ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -290,11 +281,6 @@ async def user_portal():
     .header h1 { font-size: 28px; display: flex; align-items: center; gap: 8px; }
     .theme-toggle { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 18px; transition: all 0.2s; color: var(--text); }
     .theme-toggle:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
-    .search-box { position: relative; max-width: 1100px; margin: 0 auto 16px; }
-    .search-box input { width: 100%; padding: 14px 20px 14px 48px; font-size: 16px; border: 2px solid var(--border); border-radius: 12px; background: var(--card); color: var(--text); transition: all 0.2s; outline: none; }
-    .search-box input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px rgba(0,123,255,0.15); }
-    .search-box::before { content: '🔍'; position: absolute; left: 16px; top: 50%; transform: translateY(-50%); font-size: 18px; pointer-events: none; }
-    .search-hint { max-width: 1100px; margin: 0 auto 16px; font-size: 13px; color: var(--text-sec); }
     .tabs { max-width: 1100px; margin: 0 auto 24px; display: flex; gap: 8px; flex-wrap: wrap; background: var(--card); padding: 8px; border-radius: 12px; box-shadow: var(--shadow); }
     .tab { flex: 1; min-width: 140px; padding: 12px 20px; border: none; background: transparent; color: var(--text-sec); font-size: 14px; font-weight: 600; cursor: pointer; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 6px; }
     .tab:hover { background: rgba(0,123,255,0.08); color: var(--primary); }
@@ -334,7 +320,6 @@ async def user_portal():
     .toast { position: fixed; bottom: 30px; right: 30px; background: var(--card); color: var(--text); padding: 16px 24px; border-radius: 12px; box-shadow: var(--shadow-hover); z-index: 2000; display: none; animation: slideIn 0.3s; border-left: 4px solid var(--primary); }
     .toast.show { display: block; }
     @keyframes slideIn { from { transform: translateX(400px); } to { transform: translateX(0); } }
-    mark { background: #ffe066; color: #000; padding: 0 2px; border-radius: 3px; }
     @media (max-width: 640px) { body { padding: 16px; } .tab { min-width: 100%; } .orders-grid { grid-template-columns: 1fr; } }
 </style>
 </head>
@@ -343,11 +328,6 @@ async def user_portal():
         <h1>📍 ТПК — Отслеживание</h1>
         <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">🌙</span></button>
     </div>
-
-    <div class="search-box">
-        <input id="searchInput" placeholder="Введите номер заказа или его последние 4 цифры..." oninput="debounceSearch()" autocomplete="off">
-    </div>
-    <div class="search-hint" id="searchHint">💡 Введите, например, <b>1587</b>, чтобы найти ТПК00001587</div>
 
     <div class="tabs" id="tabsContainer">
         <button class="tab active" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути <span class="count" id="count-in_transit">0</span></button>
@@ -362,7 +342,7 @@ async def user_portal():
     <div class="toast" id="toast"></div>
 
     <script>
-    let currentTab = 'in_transit'; let map = null; let searchTimeout = null; let tabSettings = {};
+    let currentTab = 'in_transit'; let map = null;
 
     function toggleTheme() {
         const html = document.documentElement; const isDark = html.getAttribute('data-theme') === 'dark';
@@ -370,19 +350,15 @@ async def user_portal():
     }
     const savedTheme = localStorage.getItem('theme') || 'light'; document.documentElement.setAttribute('data-theme', savedTheme); document.getElementById('themeIcon').textContent = savedTheme === 'dark' ? '☀️' : '🌙';
 
-    function debounceSearch() {
-        clearTimeout(searchTimeout);
-        searchTimeout = setTimeout(() => loadOrders(), 300);
-    }
-
+    // Загрузка настроек вкладок из админки
     async function updateTabsVisibility() {
         try {
             const res = await fetch('/api/settings/tabs');
-            tabSettings = await res.json();
+            const s = await res.json();
             document.querySelectorAll('.tab').forEach(tab => {
                 const key = tab.dataset.status;
                 const settingKey = 'show_' + key;
-                if (tabSettings[settingKey] === false) {
+                if (s[settingKey] === false) {
                     tab.classList.add('hidden');
                 } else {
                     tab.classList.remove('hidden');
@@ -402,57 +378,28 @@ async def user_portal():
 
     async function loadOrders() {
         const grid = document.getElementById('ordersGrid');
-        const search = document.getElementById('searchInput').value.trim();
         grid.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
-        
         try {
-            const url = `/api/shipments?status=${currentTab}${search ? '&search=' + encodeURIComponent(search) : ''}`;
+            const url = `/api/shipments?status=${currentTab}`;
             const res = await fetch(url); 
-            if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const orders = await res.json();
             
-            if (search) {
-                document.getElementById('searchHint').innerHTML = `🔍 Найдено по запросу «${search}»: <b>${orders.length}</b>`;
-            } else {
-                document.getElementById('searchHint').innerHTML = `💡 Введите, например, <b>1587</b>, чтобы найти ТПК00001587`;
-            }
-            
-            if (orders.length === 0) {
-                grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">${search ? '🔍' : '📭'}</div><h2>${search ? 'Ничего не найдено' : 'Нет заказов'}</h2><p>${search ? 'Попробуйте другой запрос' : getEmptyMsg(currentTab)}</p></div>`;
-            } else {
-                grid.innerHTML = orders.map(o => renderCard(o, search)).join('');
-            }
-        } catch (e) {
-            console.error("Ошибка загрузки списка заказов:", e);
-            grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">❌</div><h2>Ошибка загрузки</h2><p>${e.message}</p></div>`;
-        }
-
-        try {
-            const [allRes, delRes, noStatusRes, gpsRes] = await Promise.all([
-                fetch('/api/shipments?status=in_transit'),
-                fetch('/api/shipments?status=delivered'),
-                fetch('/api/shipments?status=no_status'),
-                fetch('/api/shipments?status=with_gps')
-            ]);
-            const allCounts = await allRes.json();
-            const delCounts = await delRes.json();
-            const noStatusCounts = await noStatusRes.json();
-            const gpsCounts = await gpsRes.json();
-            
+            // Обновляем счётчики
+            const allCounts = await (await fetch('/api/shipments?status=in_transit')).json();
+            const delCounts = await (await fetch('/api/shipments?status=delivered')).json();
+            const noStatusCounts = await (await fetch('/api/shipments?status=no_status')).json();
+            const gpsCounts = await (await fetch('/api/shipments?status=with_gps')).json();
             document.getElementById('count-in_transit').textContent = allCounts.length;
             document.getElementById('count-delivered').textContent = delCounts.length;
             document.getElementById('count-no_status').textContent = noStatusCounts.length;
             document.getElementById('count-with_gps').textContent = gpsCounts.length;
-        } catch (e) {
-            console.error("Ошибка обновления счётчиков:", e);
-        }
-    }
-
-    function highlight(text, query) {
-        if (!query || !text) return text || '';
-        const safeQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const regex = new RegExp('(' + safeQuery + ')', 'gi');
-        return text.replace(regex, '<mark>$1</mark>');
+            
+            if (orders.length === 0) {
+                grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">📭</div><h2>Нет заказов</h2><p>${getEmptyMsg(currentTab)}</p></div>`;
+                return;
+            }
+            grid.innerHTML = orders.map(o => renderCard(o)).join('');
+        } catch (e) { grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">❌</div><h2>Ошибка загрузки</h2></div>`; }
     }
 
     function getEmptyMsg(tab) {
@@ -462,7 +409,7 @@ async def user_portal():
         return 'Нет заказов с GPS-ссылками';
     }
 
-    function renderCard(o, query) {
+    function renderCard(o) {
         let statusBadge = '';
         if (o.status === 'в пути' || o.status === 'планируется') statusBadge = '<span class="order-status in-transit">В пути</span>';
         else if (o.status === 'завершено' || o.status === 'выгружено') statusBadge = '<span class="order-status delivered">Выгружено</span>';
@@ -470,10 +417,9 @@ async def user_portal():
         
         const comment = o.comment ? `<div class="order-row"><strong>Примечание:</strong> ${o.comment.substring(0, 80)}${o.comment.length > 80 ? '...' : ''}</div>` : '';
         const arrival = o.plan_arrival ? `<div class="order-row"><strong>Прибытие:</strong> ${o.plan_arrival}</div>` : '';
-        const highlightedId = highlight(o.order_id, query);
         
         return `<div class="order-card ${o.status === 'завершено' || o.status === 'выгружено' ? 'delivered' : (!o.status ? 'no-status' : '')}" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
-            <h3><span class="order-id">${highlightedId}</span>${statusBadge}</h3>
+            <h3><span class="order-id">${o.order_id}</span>${statusBadge}</h3>
             <div class="order-row"><strong>Адрес:</strong> ${o.address || '—'}</div>
             <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier || '—'}</div>
             <div class="order-row"><strong>Машина:</strong> ${o.vehicle || '—'}</div>
@@ -513,6 +459,7 @@ async def user_portal():
 """
 
 
+# ============ АДМИН-ПАНЕЛЬ (С НАСТРОЙКАМИ ВКЛАДОК) ============
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(user=Depends(check_admin)):
     return """
