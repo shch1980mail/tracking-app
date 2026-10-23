@@ -1,6 +1,8 @@
 FROM python:3.12-slim
 
-ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 WORKDIR /app
 
@@ -13,8 +15,15 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt \
  && playwright install --with-deps chromium
 
-COPY . .
+# Копируем только нужные каталоги — старые main.py/parser.py в образ не попадут
+COPY app ./app
+COPY migrations ./migrations
+COPY static ./static
+COPY scripts ./scripts
 
 EXPOSE 8000
-HEALTHCHECK --interval=30s --timeout=5s CMD curl -f http://localhost:8000/health || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
+    CMD curl -f http://localhost:8000/health || exit 1
+
+# Явный модуль — uvicorn не будет искать main.py в корне
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
