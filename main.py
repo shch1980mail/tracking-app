@@ -5,9 +5,13 @@ import json
 import re
 import requests
 from playwright.async_api import async_playwright
+from fastapi import FastAPI, Query
+from fastapi.responses import HTMLResponse, JSONResponse
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _current_sid = None
+
+app = FastAPI(title="Tracking App")
 
 
 async def mark_as_done(conn, order_id):
@@ -24,6 +28,7 @@ async def save_position(conn, order_id, lat, lng):
     """Сохраняет позицию. При первом появлении фиксирует ship_lat/ship_lng."""
     row = await conn.fetchrow("SELECT ship_lat FROM shipments WHERE order_id = $1", order_id)
     if row and row["ship_lat"] is None:
+        # Первый раз видим машину — фиксируем стартовую точку
         await conn.execute("""
             UPDATE shipments
             SET ship_lat = $1, ship_lng = $2,
@@ -34,6 +39,7 @@ async def save_position(conn, order_id, lat, lng):
             WHERE order_id = $3
         """, lat, lng, order_id)
     else:
+        # Уже видели — обновляем только текущую позицию
         await conn.execute("""
             UPDATE shipments
             SET current_lat = $1, current_lng = $2,
@@ -288,6 +294,214 @@ async def main():
             print(f"  {row['order_id']}: ошибка {e}")
     await conn.close()
     print(f"\nОбновлено: {updated} из {len(rows)}")
+
+
+# ============================================================
+# ДОБАВЛЕНО: ВЕБ-ИНТЕРФЕЙС И API ПОИСКА
+# ============================================================
+
+HTML_PAGE = """
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Отслеживание отправлений</title>
+    <style>
+        * { box-sizing: border-box; }
+        body {
+            font-family: -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+            background: #f5f6f8;
+            margin: 0;
+            padding: 32px 16px;
+            color: #1f2933;
+        }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { font-size: 20px; margin: 0 0 8px; }
+        .hint { font-size: 13px; color: #6b7280; margin: 0 0 16px; }
+
+        .search-wrap { position: relative; margin-bottom: 16px; }
+        .search-wrap .icon {
+            position: absolute;
+            left: 14px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 18px;
+            height: 18px;
+            color: #6b7280;
+            pointer-events: none;
+        }
+        .search-wrap input {
+            width: 100%;
+            padding: 12px 14px 12px 42px;
+            font-size: 15px;
+            border: 1px solid #d1d5db;
+            border-radius: 10px;
+            background: #fff;
+            outline: none;
+            transition: border-color .15s, box-shadow .15s;
+        }
+        .search-wrap input:focus {
+            border-color: #2563eb;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, .15);
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: #fff;
+            border-radius: 10px;
+            overflow: hidden;
+            box-shadow: 0 1px 3px rgba(0,0,0,.06);
+        }
+        th, td {
+            text-align: left;
+            padding: 12px 14px;
+            font-size: 14px;
+            border-bottom: 1px solid #eef0f3;
+        }
+        th {
+            background: #f9fafb;
+            font-weight: 600;
+            color: #4b5563;
+        }
+        tr:last-child td { border-bottom: none; }
+
+        .status {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 999px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        .status.in-transit { background: #e0f2fe; color: #0369a1; }
+        .status.delivered  { background: #dcfce7; color: #15803d; }
+        .status.pending    { background: #fef3c7; color: #b45309; }
+
+        .empty {
+            padding: 24px;
+            text-align: center;
+            color: #6b7280;
+            background: #fff;
+            border-radius: 10px;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+<div class="container">
+    <h1>Отслеживание отправлений</h1>
+    <p class="hint">Введите минимум 4 цифры из номера отслеживания (например, 1806).</p>
+
+    <div class="search-wrap">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="11" cy="11" r="7"></circle>
+            <line x1="20" y1="20" x2="16.65" y2="16.65"></line>
+        </svg>
+        <input id="search" type="text" placeholder="Поиск по последним 4 цифрам..." autocomplete="off">
+    </div>
+
+    <table id="table">
+        <thead>
+            <tr>
+                <th>Номер</th>
+                <th>Направление</th>
+                <th>Адрес</th>
+                <th>Статус</th>
+            </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+    </table>
+    <div id="empty" class="empty">Ничего не найдено</div>
+</div>
+
+<script>
+    const input = document.getElementById('search');
+    const tbody = document.getElementById('tbody');
+    const empty = document.getElementById('empty');
+    const table = document.getElementById('table');
+
+    let timer = null;
+
+    function statusClass(status) {
+        if (status === 'в пути' || status === 'планируется') return 'in-transit';
+        if (status === 'завершено') return 'delivered';
+        return 'pending';
+    }
+
+    async function load(q) {
+        const digits = (q.match(/\\d/g) || []).length;
+        if (digits < 4) {
+            tbody.innerHTML = '';
+            table.style.display = 'none';
+            empty.style.display = 'block';
+            empty.textContent = 'Введите минимум 4 цифры для поиска';
+            return;
+        }
+
+        const res = await fetch('/api/shipments?q=' + encodeURIComponent(q));
+        const data = await res.json();
+
+        if (!data.length) {
+            tbody.innerHTML = '';
+            table.style.display = 'none';
+            empty.style.display = 'block';
+            empty.textContent = 'Ничего не найдено';
+            return;
+        }
+
+        table.style.display = 'table';
+        empty.style.display = 'none';
+        tbody.innerHTML = data.map(item => `
+            <tr>
+                <td>${item.order_id ?? ''}</td>
+                <td>${item.direction ?? ''}</td>
+                <td>${item.address ?? ''}</td>
+                <td><span class="status ${statusClass(item.status)}">${item.status ?? ''}</span></td>
+            </tr>
+        `).join('');
+    }
+
+    input.addEventListener('input', () => {
+        clearTimeout(timer);
+        timer = setTimeout(() => load(input.value.trim()), 200);
+    });
+
+    table.style.display = 'none';
+    empty.style.display = 'block';
+    empty.textContent = 'Введите минимум 4 цифры для поиска';
+</script>
+</body>
+</html>
+"""
+
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    return HTML_PAGE
+
+
+@app.get("/api/shipments")
+async def api_shipments(q: str = Query("", description="Строка поиска (минимум 4 цифры)")):
+    digits = re.sub(r"\D", "", q)
+    if len(digits) < 4:
+        return JSONResponse(content=[])
+
+    suffix = digits[-4:]
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    try:
+        rows = await conn.fetch("""
+            SELECT order_id, direction, address, status
+            FROM shipments
+            WHERE order_id LIKE $1
+            ORDER BY ship_date DESC
+            LIMIT 50
+        """, f"%{suffix}%")
+    finally:
+        await conn.close()
+
+    return JSONResponse(content=[dict(r) for r in rows])
 
 
 if __name__ == "__main__":
