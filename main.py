@@ -350,7 +350,6 @@ async def user_portal():
     <div class="search-hint" id="searchHint">💡 Введите, например, <b>1587</b>, чтобы найти ТПК00001587</div>
 
     <div class="tabs" id="tabsContainer">
-        <!-- Вкладки по умолчанию, чтобы не было пустоты до загрузки настроек -->
         <button class="tab active" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути <span class="count" id="count-in_transit">0</span></button>
         <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Выгружено <span class="count" id="count-delivered">0</span></button>
         <button class="tab" data-status="no_status" onclick="setTab('no_status')">⚠️ Без статуса <span class="count" id="count-no_status">0</span></button>
@@ -376,7 +375,6 @@ async def user_portal():
         searchTimeout = setTimeout(() => loadOrders(), 300);
     }
 
-    // Обновляем вкладки, если настройки поменялись (чтобы скрыть ненужные)
     async function updateTabsVisibility() {
         try {
             const res = await fetch('/api/settings/tabs');
@@ -390,29 +388,28 @@ async def user_portal():
                     tab.classList.remove('hidden');
                 }
             });
-        } catch(e) {}
+        } catch(e) {
+            console.error("Ошибка загрузки настроек вкладок:", e);
+        }
     }
 
     function setTab(status) {
-        currentTab = status; document.querySelectorAll('.tab').forEach(t => t.classList.remove('active')); document.querySelector(`.tab[data-status="${status}"]`)?.classList.add('active'); loadOrders();
+        currentTab = status; 
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active')); 
+        document.querySelector(`.tab[data-status="${status}"]`)?.classList.add('active'); 
+        loadOrders();
     }
 
     async function loadOrders() {
         const grid = document.getElementById('ordersGrid');
         const search = document.getElementById('searchInput').value.trim();
         grid.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
+        
         try {
             const url = `/api/shipments?status=${currentTab}${search ? '&search=' + encodeURIComponent(search) : ''}`;
-            const res = await fetch(url); const orders = await res.json();
-            
-            const allCounts = await (await fetch('/api/shipments?status=in_transit')).json();
-            const delCounts = await (await fetch('/api/shipments?status=delivered')).json();
-            const noStatusCounts = await (await fetch('/api/shipments?status=no_status')).json();
-            const gpsCounts = await (await fetch('/api/shipments?status=with_gps')).json();
-            document.getElementById('count-in_transit').textContent = allCounts.length;
-            document.getElementById('count-delivered').textContent = delCounts.length;
-            document.getElementById('count-no_status').textContent = noStatusCounts.length;
-            document.getElementById('count-with_gps').textContent = gpsCounts.length;
+            const res = await fetch(url); 
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const orders = await res.json();
             
             if (search) {
                 document.getElementById('searchHint').innerHTML = `🔍 Найдено по запросу «${search}»: <b>${orders.length}</b>`;
@@ -422,10 +419,34 @@ async def user_portal():
             
             if (orders.length === 0) {
                 grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">${search ? '🔍' : '📭'}</div><h2>${search ? 'Ничего не найдено' : 'Нет заказов'}</h2><p>${search ? 'Попробуйте другой запрос' : getEmptyMsg(currentTab)}</p></div>`;
-                return;
+            } else {
+                grid.innerHTML = orders.map(o => renderCard(o, search)).join('');
             }
-            grid.innerHTML = orders.map(o => renderCard(o, search)).join('');
-        } catch (e) { grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">❌</div><h2>Ошибка загрузки</h2></div>`; }
+        } catch (e) {
+            console.error("Ошибка загрузки списка заказов:", e);
+            grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">❌</div><h2>Ошибка загрузки</h2><p>${e.message}</p></div>`;
+        }
+
+        // Асинхронно обновляем счётчики (не блокируя список)
+        try {
+            const [allRes, delRes, noStatusRes, gpsRes] = await Promise.all([
+                fetch('/api/shipments?status=in_transit'),
+                fetch('/api/shipments?status=delivered'),
+                fetch('/api/shipments?status=no_status'),
+                fetch('/api/shipments?status=with_gps')
+            ]);
+            const allCounts = await allRes.json();
+            const delCounts = await delRes.json();
+            const noStatusCounts = await noStatusRes.json();
+            const gpsCounts = await gpsRes.json();
+            
+            document.getElementById('count-in_transit').textContent = allCounts.length;
+            document.getElementById('count-delivered').textContent = delCounts.length;
+            document.getElementById('count-no_status').textContent = noStatusCounts.length;
+            document.getElementById('count-with_gps').textContent = gpsCounts.length;
+        } catch (e) {
+            console.error("Ошибка обновления счётчиков:", e);
+        }
     }
 
     function highlight(text, query) {
@@ -484,9 +505,7 @@ async def user_portal():
     function closeModal() { document.getElementById('modal').classList.remove('open'); if (map) { map.remove(); map = null; } }
     document.getElementById('modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
     
-    // 1. Инициализация (вкладки уже в HTML)
     loadOrders();
-    // 2. Подтягиваем настройки видимости вкладок
     updateTabsVisibility();
     </script>
 </body>
