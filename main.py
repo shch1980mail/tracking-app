@@ -142,7 +142,8 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
 async def list_shipments(status: Optional[str] = None):
     async with pool.acquire() as conn:
         if status == "in_transit":
-            rows = await conn.fetch("SELECT * FROM shipments WHERE status IN ('в пути', 'планируется') AND gps_link IS NOT NULL AND gps_link != '' ORDER BY plan_arrival ASC NULLS LAST")
+            # Теперь берём ВСЕ заказы в пути/планируется, даже без GPS
+            rows = await conn.fetch("SELECT * FROM shipments WHERE status IN ('в пути', 'планируется') ORDER BY plan_arrival ASC NULLS LAST")
         elif status == "delivered":
             rows = await conn.fetch("SELECT * FROM shipments WHERE status IN ('завершено', 'выгружено') ORDER BY plan_arrival DESC NULLS LAST")
         elif status == "no_status":
