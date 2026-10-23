@@ -427,7 +427,6 @@ async def user_portal():
             grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">❌</div><h2>Ошибка загрузки</h2><p>${e.message}</p></div>`;
         }
 
-        // Асинхронно обновляем счётчики (не блокируя список)
         try {
             const [allRes, delRes, noStatusRes, gpsRes] = await Promise.all([
                 fetch('/api/shipments?status=in_transit'),
@@ -451,7 +450,8 @@ async def user_portal():
 
     function highlight(text, query) {
         if (!query || !text) return text || '';
-        const regex = new RegExp(`(${query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')})`, 'gi');
+        const safeQuery = query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const regex = new RegExp('(' + safeQuery + ')', 'gi');
         return text.replace(regex, '<mark>$1</mark>');
     }
 
