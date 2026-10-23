@@ -1,8 +1,8 @@
-from fastapi import FastAPI, HTTPException, Depends, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional
 import os, json, asyncpg
 from datetime import date, datetime, timedelta
 import urllib.request
@@ -133,7 +133,6 @@ async def startup():
             try: await conn.execute(stmt)
             except: pass
 
-        # Инициализация настроек: все вкладки включены по умолчанию
         existing = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'tabs'")
         if not existing:
             await conn.execute("INSERT INTO app_settings (key, value) VALUES ('tabs', $1)", 
@@ -350,7 +349,13 @@ async def user_portal():
     </div>
     <div class="search-hint" id="searchHint">💡 Введите, например, <b>1587</b>, чтобы найти ТПК00001587</div>
 
-    <div class="tabs" id="tabsContainer"></div>
+    <div class="tabs" id="tabsContainer">
+        <!-- Вкладки по умолчанию, чтобы не было пустоты до загрузки настроек -->
+        <button class="tab active" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути <span class="count" id="count-in_transit">0</span></button>
+        <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Выгружено <span class="count" id="count-delivered">0</span></button>
+        <button class="tab" data-status="no_status" onclick="setTab('no_status')">⚠️ Без статуса <span class="count" id="count-no_status">0</span></button>
+        <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 Все с GPS <span class="count" id="count-with_gps">0</span></button>
+    </div>
 
     <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
 
@@ -358,7 +363,7 @@ async def user_portal():
     <div class="toast" id="toast"></div>
 
     <script>
-    let currentTab = 'in_transit'; let map = null; let searchTimeout = null; let tabSettings = {}; let allOrders = [];
+    let currentTab = 'in_transit'; let map = null; let searchTimeout = null; let tabSettings = {};
 
     function toggleTheme() {
         const html = document.documentElement; const isDark = html.getAttribute('data-theme') === 'dark';
@@ -371,41 +376,26 @@ async def user_portal():
         searchTimeout = setTimeout(() => loadOrders(), 300);
     }
 
-    async function loadTabSettings() {
+    // Обновляем вкладки, если настройки поменялись (чтобы скрыть ненужные)
+    async function updateTabsVisibility() {
         try {
             const res = await fetch('/api/settings/tabs');
             tabSettings = await res.json();
-            renderTabs();
-        } catch(e) {
-            renderTabs();
-        }
-    }
-
-    function renderTabs() {
-        const tabs = [
-            { key: 'in_transit', label: '🚚 В пути', setting: 'show_in_transit' },
-            { key: 'delivered', label: '✅ Выгружено', setting: 'show_delivered' },
-            { key: 'no_status', label: '⚠️ Без статуса', setting: 'show_no_status' },
-            { key: 'with_gps', label: '📍 Все с GPS', setting: 'show_with_gps' }
-        ];
-        const container = document.getElementById('tabsContainer');
-        let html = '';
-        let firstVisible = null;
-        for (const t of tabs) {
-            const isVisible = tabSettings[t.setting] !== false;
-            if (isVisible && !firstVisible) firstVisible = t.key;
-            html += `<button class="tab ${t.key === currentTab ? 'active' : ''} ${isVisible ? '' : 'hidden'}" data-status="${t.key}" onclick="setTab('${t.key}')">${t.label} <span class="count" id="count-${t.key}">0</span></button>`;
-        }
-        container.innerHTML = html;
-        if (!tabSettings['show_' + currentTab.replace('in_transit', 'in_transit').replace('with_gps', 'with_gps')]) {
-            if (firstVisible && firstVisible !== currentTab) { currentTab = firstVisible; loadOrders(); }
-        }
+            document.querySelectorAll('.tab').forEach(tab => {
+                const key = tab.dataset.status;
+                const settingKey = 'show_' + key;
+                if (tabSettings[settingKey] === false) {
+                    tab.classList.add('hidden');
+                } else {
+                    tab.classList.remove('hidden');
+                }
+            });
+        } catch(e) {}
     }
 
     function setTab(status) {
         currentTab = status; document.querySelectorAll('.tab').forEach(t => t.classList.remove('active')); document.querySelector(`.tab[data-status="${status}"]`)?.classList.add('active'); loadOrders();
     }
-    function showToast(msg) { const t = document.getElementById('toast'); t.textContent = msg; t.classList.add('show'); setTimeout(() => t.classList.remove('show'), 3000); }
 
     async function loadOrders() {
         const grid = document.getElementById('ordersGrid');
@@ -415,7 +405,6 @@ async def user_portal():
             const url = `/api/shipments?status=${currentTab}${search ? '&search=' + encodeURIComponent(search) : ''}`;
             const res = await fetch(url); const orders = await res.json();
             
-            // Обновляем счётчики
             const allCounts = await (await fetch('/api/shipments?status=in_transit')).json();
             const delCounts = await (await fetch('/api/shipments?status=delivered')).json();
             const noStatusCounts = await (await fetch('/api/shipments?status=no_status')).json();
@@ -495,8 +484,10 @@ async def user_portal():
     function closeModal() { document.getElementById('modal').classList.remove('open'); if (map) { map.remove(); map = null; } }
     document.getElementById('modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
     
-    loadTabSettings();
+    // 1. Инициализация (вкладки уже в HTML)
     loadOrders();
+    // 2. Подтягиваем настройки видимости вкладок
+    updateTabsVisibility();
     </script>
 </body>
 </html>
