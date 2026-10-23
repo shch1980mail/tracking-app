@@ -48,6 +48,7 @@ async def save_position(conn, order_id, lat, lng):
 async def get_sid_from_maps_baltgps(gps_link: str):
     """maps.baltgps.ru — перехват sid через Playwright."""
     captured = {"sid": None}
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context()
@@ -88,9 +89,11 @@ async def get_sid_from_maps_baltgps(gps_link: str):
 async def get_coords_from_gs_baltgps(gps_link: str):
     """gs.baltgps.ru — координаты из HTML после клика по карте."""
     coords = {"lat": None, "lng": None}
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
+
         try:
             await page.goto(gps_link, timeout=90000, wait_until="domcontentloaded")
             print("  Жду 25 секунд, пока карта прогрузится...")
@@ -120,15 +123,18 @@ async def get_coords_from_gs_baltgps(gps_link: str):
             print(f"  Ошибка Playwright (gs): {e}")
         finally:
             await browser.close()
+
     return coords["lat"], coords["lng"]
 
 
 async def get_coords_from_axenta(gps_link: str):
     """axenta.cloud — координаты из JSON или HTML."""
     coords = {"lat": None, "lng": None}
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
+
         try:
             await page.goto(gps_link, timeout=90000, wait_until="domcontentloaded")
             print("  Axenta: жду 25 секунд...")
@@ -136,12 +142,14 @@ async def get_coords_from_axenta(gps_link: str):
 
             html = await page.content()
             m = re.findall(r'"lat"\s*:\s*(\d+\.\d+).*?"lng"\s*:\s*(\d+\.\d+)', html)
+
             if m:
                 coords["lat"], coords["lng"] = float(m[0][0]), float(m[0][1])
                 print(f"  Axenta (из JSON): {coords['lat']}, {coords['lng']}")
             else:
                 await page.mouse.click(900, 400)
                 await page.wait_for_timeout(3000)
+
                 html = await page.content()
                 m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
                 if m:
@@ -153,13 +161,21 @@ async def get_coords_from_axenta(gps_link: str):
             print(f"  Ошибка Playwright (axenta): {e}")
         finally:
             await browser.close()
+
     return coords["lat"], coords["lng"]
 
 
 def get_units_from_token(token: str, base_url: str = "https://maps.baltgps.ru"):
     """token/login — для maps.baltgps.ru."""
     try:
-        r = requests.get(f"{base_url}/wialon/ajax.html", params={"svc": "token/login", "params": json.dumps({"token": token})}, timeout=15)
+        r = requests.get(
+            f"{base_url}/wialon/ajax.html",
+            params={
+                "svc": "token/login",
+                "params": json.dumps({"token": token})
+            },
+            timeout=15
+        )
         data = r.json()
         if "token" in data:
             return json.loads(data["token"]).get("items", []), data.get("eid"), data.get("host")
@@ -171,12 +187,22 @@ def get_units_from_token(token: str, base_url: str = "https://maps.baltgps.ru"):
 def get_position_by_sid(sid: str, unit_id: int, base_url: str = "https://maps.baltgps.ru"):
     """core/search_item — для maps.baltgps.ru."""
     try:
-        r = requests.get(f"{base_url}/wialon/ajax.html", params={"svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid}, timeout=10)
+        r = requests.get(
+            f"{base_url}/wialon/ajax.html",
+            params={
+                "svc": "core/search_item",
+                "params": json.dumps({"id": unit_id, "flags": 1025}),
+                "sid": sid
+            },
+            timeout=10
+        )
         data = r.json()
-        if "error" in data: return None, None, "sid_expired"
+        if "error" in data:
+            return None, None, "sid_expired"
         item = data.get("item", {})
         pos = item.get("pos")
-        if pos and "x" in pos and "y" in pos: return pos["y"], pos["x"], "ok"
+        if pos and "x" in pos and "y" in pos:
+            return pos["y"], pos["x"], "ok"
     except Exception as e:
         print(f"  search_item ошибка: {e}")
     return None, None, "unknown"
