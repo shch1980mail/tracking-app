@@ -42,8 +42,8 @@ class Shipment(BaseModel):
 class TabSettings(BaseModel):
     show_in_transit: bool = True
     show_delivered: bool = True
-    show_no_status: bool = False
-    show_with_gps: bool = False
+    show_no_status: bool = True
+    show_with_gps: bool = True
 
 
 def parse_date(v):
@@ -133,11 +133,11 @@ async def startup():
             try: await conn.execute(stmt)
             except: pass
 
-        # Инициализация настроек вкладок
+        # Инициализация настроек: все вкладки включены по умолчанию
         existing = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'tabs'")
         if not existing:
             await conn.execute("INSERT INTO app_settings (key, value) VALUES ('tabs', $1)", 
-                json.dumps({"show_in_transit": True, "show_delivered": True, "show_no_status": False, "show_with_gps": False}))
+                json.dumps({"show_in_transit": True, "show_delivered": True, "show_no_status": True, "show_with_gps": True}))
 
         if os.path.exists("shipments.json"):
             with open("shipments.json", "r", encoding="utf-8") as f: seed = json.load(f)
@@ -166,12 +166,11 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     return credentials.username
 
 
-# ============ ОБЩИЕ API ============
 @app.get("/api/settings/tabs")
 async def get_tab_settings():
     async with pool.acquire() as conn:
         row = await conn.fetchrow("SELECT value FROM app_settings WHERE key = 'tabs'")
-    return json.loads(row["value"]) if row else {"show_in_transit": True, "show_delivered": True, "show_no_status": False, "show_with_gps": False}
+    return json.loads(row["value"]) if row else {"show_in_transit": True, "show_delivered": True, "show_no_status": True, "show_with_gps": True}
 
 
 @app.post("/api/admin/settings/tabs")
@@ -273,7 +272,6 @@ async def admin_delete(order_id: str, user=Depends(check_admin)):
     return {"ok": True}
 
 
-# ============ ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -352,9 +350,7 @@ async def user_portal():
     </div>
     <div class="search-hint" id="searchHint">💡 Введите, например, <b>1587</b>, чтобы найти ТПК00001587</div>
 
-    <div class="tabs" id="tabsContainer">
-        <!-- Вкладки будут отрисованы динамически -->
-    </div>
+    <div class="tabs" id="tabsContainer"></div>
 
     <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
 
@@ -507,7 +503,6 @@ async def user_portal():
 """
 
 
-# ============ АДМИН-ПАНЕЛЬ ============
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(user=Depends(check_admin)):
     return """
@@ -550,7 +545,6 @@ async def admin_panel(user=Depends(check_admin)):
     <body>
         <h1>🚚 Админ-панель — Отгрузки</h1>
 
-        <!-- Настройки вкладок для пользователей -->
         <div class="settings-panel">
             <h3>⚙️ Настройки вкладок для пользователей</h3>
             <p style="color:#666;font-size:13px;margin-bottom:12px;">Отметьте вкладки, которые будут видны посетителям главной страницы:</p>
