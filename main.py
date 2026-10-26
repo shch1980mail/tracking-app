@@ -1,583 +1,619 @@
-import asyncio
-import asyncpg
-import os
-import json
-import re
-import requests
-from playwright.async_api import async_playwright
-from fastapi import FastAPI, Query
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.responses import HTMLResponse
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from pydantic import BaseModel
+from typing import Optional
+import os, json, asyncpg
+from datetime import date, datetime, timedelta
+import urllib.request
+import urllib.parse
+import httpx
+
+app = FastAPI(title="ТПК Отслеживание")
+security = HTTPBasic()
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-app = FastAPI(title="Tracking App")
+ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
-# ============================================================
-# БАЗА ДАННЫХ И ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ   
-# ============================================================
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable must be set")
 
-async def mark_as_done(conn, order_id):
-    await conn.execute("""
-        UPDATE shipments
-        SET status = 'завершено', current_lat = NULL, current_lng = NULL
-        WHERE order_id = $1
-    """, order_id)
+pool = None
+last_trigger = None
 
-async def save_position(conn, order_id, lat, lng):
-    row = await conn.fetchrow("SELECT ship_lat FROM shipments WHERE order_id = $1", order_id)
-    if row and row["ship_lat"] is None:
-        await conn.execute("""
-            UPDATE shipments
-            SET ship_lat = $1, ship_lng = $2, current_lat = $1, current_lng = $2,
-                first_seen_at = NOW(), last_position_update = NOW(), updated_at = NOW()
-            WHERE order_id = $3
-        """, lat, lng, order_id)
-    else:
-        await conn.execute("""
-            UPDATE shipments
-            SET current_lat = $1, current_lng = $2, last_position_update = NOW(), updated_at = NOW()
-            WHERE order_id = $3
-        """, lat, lng, order_id)
 
-# ============================================================
-# ПАРСЕРЫ GPS
-# ============================================================
+class Shipment(BaseModel):
+    order_id: str
+    direction: Optional[str] = None
+    address: Optional[str] = None
+    weight: Optional[float] = None
+    ship_date: Optional[str] = None
+    plan_arrival: Optional[str] = None
+    carrier: Optional[str] = None
+    vehicle: Optional[str] = None
+    driver: Optional[str] = None
+    gps_link: Optional[str] = None
+    comment: Optional[str] = None
+    status: Optional[str] = None
 
-async def get_sid_from_maps_baltgps(gps_link: str):
-    captured = {"sid": None}
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context()
-        page = await context.new_page()
 
-        def extract_sid(url):
-            if "sid=" not in url: return None
-            m = re.search(r"[?&]sid=([a-f0-9]{20,})", url)
-            return m.group(1) if m else None
+class TabSettings(BaseModel):
+    show_in_transit: bool = True
+    show_delivered: bool = True
+    show_no_status: bool = True
+    show_with_gps: bool = True
 
-        async def on_request(request):
-            sid = extract_sid(request.url)
-            if sid and not captured["sid"]:
-                captured["sid"] = sid
 
-        async def on_response(response):
-            sid = extract_sid(response.url)
-            if sid and not captured["sid"]:
-                captured["sid"] = sid
+def parse_date(v):
+    if not v: return None
+    try: return date.fromisoformat(str(v)[:10])
+    except: return None
 
-        page.on("request", on_request)
-        page.on("response", on_response)
 
-        try:
-            await page.goto(gps_link, timeout=60000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(10000)
-        except Exception as e:
-            print(f"Playwright error: {e}")
-        finally:
-            await browser.close()
-    return captured["sid"]
-
-async def get_coords_from_gs_baltgps(gps_link: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            await page.goto(gps_link, timeout=90000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(20000)
-            html = await page.content()
-            m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
-            if m:
-                return float(m[-1][0]), float(m[-1][1])
-            else:
-                await page.mouse.click(900, 400)
-                await page.wait_for_timeout(3000)
-                html = await page.content()
-                m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
-                if m:
-                    return float(m[-1][0]), float(m[-1][1])
-        except Exception as e:
-            print(f"Playwright error (gs): {e}")
-        finally:
-            await browser.close()
-    return None, None
-
-async def get_coords_from_axenta(gps_link: str):
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page()
-        try:
-            await page.goto(gps_link, timeout=90000, wait_until="domcontentloaded")
-            await page.wait_for_timeout(20000)
-            html = await page.content()
-            m = re.findall(r'"lat"\s*:\s*(\d+\.\d+).*?"lng"\s*:\s*(\d+\.\d+)', html)
-            if m:
-                return float(m[0][0]), float(m[0][1])
-        except Exception as e:
-            print(f"Playwright error (axenta): {e}")
-        finally:
-            await browser.close()
-    return None, None
-
-def get_units_from_token(token: str):
+def geocode(address):
+    if not address: return None, None
     try:
-        r = requests.get(
-            "https://maps.baltgps.ru/wialon/ajax.html",
-            params={"svc": "token/login", "params": json.dumps({"token": token})},
-            timeout=15
-        )
-        data = r.json()
-        if "token" in data:
-            return json.loads(data["token"]).get("items", [])
-    except Exception as e:
-        print(f"token/login error: {e}")
-    return []
-
-def get_position_by_sid(sid: str, unit_id: int):
-    try:
-        r = requests.get(
-            "https://maps.baltgps.ru/wialon/ajax.html",
-            params={"svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid},
-            timeout=10
-        )
-        data = r.json()
-        if "error" in data: return None, None
-        item = data.get("item", {})
-        pos = item.get("pos")
-        if pos and "x" in pos and "y" in pos:
-            return pos["y"], pos["x"]
-    except Exception as e:
-        print(f"search_item error: {e}")
+        url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode({"q": address, "format": "json", "limit": 1})
+        req = urllib.request.Request(url, headers={"User-Agent": "tpk-tracking/1.0"})
+        with urllib.request.urlopen(req, timeout=10) as r: data = json.loads(r.read())
+        if data: return float(data[0]["lat"]), float(data[0]["lon"])
+    except: pass
     return None, None
 
-async def process_order(conn, order_id: str, gps_link: str):
-    if not gps_link or not gps_link.startswith("http"): return False
 
-    if "axenta.cloud" in gps_link:
-        lat, lng = await get_coords_from_axenta(gps_link)
-        if lat and lng:
-            await save_position(conn, order_id, lat, lng)
-            return True
-        await mark_as_done(conn, order_id)
-        return False
+def calc_route(lat1, lng1, lat2, lng2):
+    try:
+        url = f"http://router.project-osrm.org/route/v1/driving/{lng1},{lat1};{lng2},{lat2}?overview=false"
+        with urllib.request.urlopen(url, timeout=15) as r: data = json.loads(r.read())
+        if data.get("routes"): return round(data["routes"][0]["distance"] / 1000)
+    except: pass
+    return None
 
-    if "gs.baltgps.ru" in gps_link:
-        lat, lng = await get_coords_from_gs_baltgps(gps_link)
-        if lat and lng:
-            await save_position(conn, order_id, lat, lng)
-            return True
-        await mark_as_done(conn, order_id)
-        return False
 
-    if "maps.baltgps.ru" in gps_link:
-        token = gps_link.split("?t=")[-1]
-        units = get_units_from_token(token)
-        if not units:
-            await mark_as_done(conn, order_id)
-            return False
+def calc_eta(current_lat, current_lng, dest_lat, dest_lng, ship_lat, ship_lng, ship_date):
+    remaining = calc_route(current_lat, current_lng, dest_lat, dest_lng)
+    if not remaining: return None, None, None, None
+    speed = 500.0
+    if ship_lat and ship_lng and ship_date:
+        passed = calc_route(ship_lat, ship_lng, current_lat, current_lng)
+        ship_dt = datetime.combine(ship_date, datetime.min.time()) if isinstance(ship_date, date) and not isinstance(ship_date, datetime) else ship_date
+        days_in_transit = (datetime.now() - ship_dt).total_seconds() / 86400
+        if passed and passed >= 50 and days_in_transit >= 0.5:
+            speed = max(250, min(800, passed / days_in_transit))
+    eta_days = remaining / speed
+    return remaining, round(eta_days, 1), (datetime.now() + timedelta(days=eta_days)).strftime("%d.%m.%Y"), round(speed)
 
-        sid = await get_sid_from_maps_baltgps(gps_link)
-        if not sid:
-            await mark_as_done(conn, order_id)
-            return False
 
-        lat, lng = get_position_by_sid(sid, units[0])
-        if lat and lng:
-            await save_position(conn, order_id, lat, lng)
-            return True
-        await mark_as_done(conn, order_id)
-        return False
+async def trigger_parser():
+    global last_trigger
+    if not GITHUB_TOKEN: return False
+    now = datetime.now()
+    if last_trigger and (now - last_trigger).total_seconds() < 120: return False
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post("https://api.github.com/repos/shch1980mail/tracking-app/actions/workflows/parser.yml/dispatches",
+                headers={"Authorization": f"Bearer {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"},
+                json={"ref": "main"}, timeout=10)
+            if resp.status_code in (204, 200): last_trigger = now; return True
+    except: pass
     return False
 
-async def background_parser():
-    while True:
-        try:
-            conn = await asyncpg.connect(DATABASE_URL)
-            rows = await conn.fetch("""
-                SELECT order_id, gps_link FROM shipments
-                WHERE status IN ('в пути', 'планируется') 
-                  AND gps_link IS NOT NULL AND gps_link != ''
-            """)
-            print(f"Найдено {len(rows)} активных заказов")
-            for row in rows:
-                try:
-                    await process_order(conn, row["order_id"], row["gps_link"])
-                except Exception as e:
-                    print(f"Error {row['order_id']}: {e}")
-            await conn.close()
-        except Exception as e:
-            print(f"DB Error: {e}")
-        await asyncio.sleep(300) # Каждые 5 минут
 
 @app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(background_parser())
+async def startup():
+    global pool
+    pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS shipments (
+                order_id VARCHAR(100) PRIMARY KEY, direction VARCHAR(100), address TEXT, weight DECIMAL,
+                ship_date DATE, plan_arrival DATE, carrier VARCHAR(150), vehicle VARCHAR(150), driver TEXT, 
+                gps_link TEXT, comment TEXT, status VARCHAR(30) DEFAULT '',
+                current_lat DECIMAL(10,6), current_lng DECIMAL(10,6), ship_lat DECIMAL(10,6), ship_lng DECIMAL(10,6),
+                first_seen_at TIMESTAMP, last_position_update TIMESTAMP, remaining_km INTEGER, eta_date DATE,
+                actual_speed DECIMAL(6,2), created_at TIMESTAMP DEFAULT NOW(), updated_at TIMESTAMP DEFAULT NOW()
+            )
+        """)
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key VARCHAR(50) PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        for stmt in [
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ship_lat DECIMAL(10,6)",
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS ship_lng DECIMAL(10,6)",
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMP",
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS actual_speed DECIMAL(6,2)",
+            "ALTER TABLE shipments ADD COLUMN IF NOT EXISTS comment TEXT",
+            "ALTER TABLE shipments ALTER COLUMN order_id TYPE VARCHAR(100)"
+        ]:
+            try: await conn.execute(stmt)
+            except: pass
 
-# ============================================================
-# ВЕБ-ИНТЕРФЕЙС (НОВЫЙ ДИЗАЙН С ТЕХНОЛОГИЧНЫМ БАННЕРОМ)
-# ============================================================
+        # Инициализация настроек вкладок (все включены по умолчанию)
+        existing = await conn.fetchval("SELECT value FROM app_settings WHERE key = 'tabs'")
+        if not existing:
+            await conn.execute("INSERT INTO app_settings (key, value) VALUES ('tabs', $1)", 
+                json.dumps({"show_in_transit": True, "show_delivered": True, "show_no_status": True, "show_with_gps": True}))
 
-HTML_PAGE = """
+        if os.path.exists("shipments.json"):
+            with open("shipments.json", "r", encoding="utf-8") as f: seed = json.load(f)
+            print(f"Начинаю загрузку {len(seed)} заказов...")
+            loaded = 0
+            for order_id, s in seed.items():
+                try:
+                    await conn.execute("""
+                        INSERT INTO shipments (order_id, direction, address, weight, ship_date, plan_arrival, carrier, vehicle, driver, gps_link, comment, status)
+                        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                        ON CONFLICT (order_id) DO UPDATE SET direction=EXCLUDED.direction, address=EXCLUDED.address, weight=EXCLUDED.weight, ship_date=EXCLUDED.ship_date, plan_arrival=EXCLUDED.plan_arrival, carrier=EXCLUDED.carrier, vehicle=EXCLUDED.vehicle, driver=EXCLUDED.driver, gps_link=EXCLUDED.gps_link, comment=EXCLUDED.comment, status=EXCLUDED.status, updated_at=NOW()
+                    """, s.get("order_id"), s.get("direction"), s.get("address"), s.get("weight"), parse_date(s.get("ship_date")), parse_date(s.get("plan_arrival")), s.get("carrier"), s.get("vehicle"), s.get("driver"), s.get("gps_link"), s.get("comment"), s.get("status", ""))
+                    loaded += 1
+                except Exception as e: print(f"Ошибка вставки {order_id}: {e}")
+            print(f"Загружено {loaded} заказов.")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    if pool: await pool.close()
+
+
+def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
+        raise HTTPException(401, "Неверный логин/пароль")
+    return credentials.username
+
+
+# ============ API НАСТРОЕК ВКЛАДОК ============
+@app.get("/api/settings/tabs")
+async def get_tab_settings():
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT value FROM app_settings WHERE key = 'tabs'")
+    return json.loads(row["value"]) if row else {"show_in_transit": True, "show_delivered": True, "show_no_status": True, "show_with_gps": True}
+
+
+@app.post("/api/admin/settings/tabs")
+async def set_tab_settings(settings: TabSettings, user=Depends(check_admin)):
+    async with pool.acquire() as conn:
+        await conn.execute("INSERT INTO app_settings (key, value) VALUES ('tabs', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+            json.dumps(settings.model_dump()))
+    return {"ok": True}
+
+
+# ============ ОСНОВНЫЕ API ============
+@app.get("/api/shipments")
+async def list_shipments(status: Optional[str] = None):
+    async with pool.acquire() as conn:
+        if status == "in_transit":
+            rows = await conn.fetch("SELECT * FROM shipments WHERE status IN ('в пути', 'планируется') ORDER BY plan_arrival ASC NULLS LAST")
+        elif status == "delivered":
+            rows = await conn.fetch("SELECT * FROM shipments WHERE status IN ('завершено', 'выгружено') ORDER BY plan_arrival DESC NULLS LAST")
+        elif status == "no_status":
+            rows = await conn.fetch("SELECT * FROM shipments WHERE status = '' OR status IS NULL ORDER BY order_id DESC")
+        elif status == "with_gps":
+            rows = await conn.fetch("SELECT * FROM shipments WHERE gps_link IS NOT NULL AND gps_link != '' ORDER BY status, order_id DESC")
+        else:
+            rows = await conn.fetch("SELECT * FROM shipments ORDER BY order_id DESC")
+    return [dict(r) for r in rows]
+
+
+@app.get("/api/track/{order_id}")
+async def track_order(order_id: str):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT * FROM shipments WHERE order_id = $1", order_id)
+    if not row: raise HTTPException(404, f"Заказ {order_id} не найден")
+    data = dict(row)
+    is_stale = True
+    if data.get("last_position_update"):
+        is_stale = (datetime.now() - data["last_position_update"]).total_seconds() > 3600
+    if data.get("gps_link") and data.get("status") in ("в пути", "планируется") and is_stale:
+        await trigger_parser()
+    if data.get("current_lat") and data.get("address"):
+        dest_lat, dest_lng = geocode(data["address"])
+        if dest_lat and dest_lng:
+            remaining, eta_days, eta_date, speed = calc_eta(
+                float(data["current_lat"]), float(data["current_lng"]),
+                dest_lat, dest_lng,
+                float(data["ship_lat"]) if data.get("ship_lat") else None,
+                float(data["ship_lng"]) if data.get("ship_lng") else None,
+                data.get("ship_date")
+            )
+            if remaining:
+                data.update({"remaining_km": remaining, "eta_days": eta_days, "eta_date": eta_date, "actual_speed": speed})
+                async with pool.acquire() as conn2:
+                    await conn2.execute("UPDATE shipments SET remaining_km = $1, eta_date = $2, actual_speed = $3 WHERE order_id = $4",
+                        remaining, parse_date(datetime.strptime(eta_date, "%d.%m.%Y").strftime("%Y-%m-%d")), speed, order_id)
+    return data
+
+
+@app.post("/api/admin/refresh/all")
+async def admin_refresh_all(user=Depends(check_admin)):
+    return {"ok": await trigger_parser(), "message": "Парсер запущен"}
+
+
+@app.get("/api/admin/shipments")
+async def admin_list(user=Depends(check_admin)):
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT * FROM shipments ORDER BY order_id DESC")
+    return [dict(r) for r in rows]
+
+
+@app.post("/api/admin/shipments")
+async def admin_create(s: Shipment, user=Depends(check_admin)):
+    async with pool.acquire() as conn:
+        clear_coords = s.status in ("завершено", "выгружено")
+        await conn.execute("""
+            INSERT INTO shipments (order_id, direction, address, weight, ship_date, plan_arrival, carrier, vehicle, driver, gps_link, comment, status)
+            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+            ON CONFLICT (order_id) DO UPDATE SET direction=EXCLUDED.direction, address=EXCLUDED.address, weight=EXCLUDED.weight, ship_date=EXCLUDED.ship_date, plan_arrival=EXCLUDED.plan_arrival, carrier=EXCLUDED.carrier, vehicle=EXCLUDED.vehicle, driver=EXCLUDED.driver, gps_link=EXCLUDED.gps_link, comment=EXCLUDED.comment, status=EXCLUDED.status, updated_at=NOW()
+        """, s.order_id, s.direction, s.address, s.weight, parse_date(s.ship_date), parse_date(s.plan_arrival), s.carrier, s.vehicle, s.driver, s.gps_link, s.comment, s.status or "")
+        if clear_coords:
+            await conn.execute("UPDATE shipments SET current_lat = NULL, current_lng = NULL, last_position_update = NULL, remaining_km = NULL, eta_date = NULL, actual_speed = NULL WHERE order_id = $1", s.order_id)
+    return {"ok": True}
+
+
+@app.delete("/api/admin/shipments/{order_id}")
+async def admin_delete(order_id: str, user=Depends(check_admin)):
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM shipments WHERE order_id = $1", order_id)
+    return {"ok": True}
+
+
+# ============ ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС (СТАРАЯ ВЕРСИЯ + СКРЫТИЕ ВКЛАДОК) ============
+@app.get("/", response_class=HTMLResponse)
+async def user_portal():
+    return """
 <!DOCTYPE html>
 <html lang="ru">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ТПК — Отслеживание</title>
-    <style>
-        :root {
-            --bg: #f3f4f6; --card: #ffffff; --text: #1f2937; --text-muted: #6b7280;
-            --primary: #2563eb; --primary-light: #eff6ff; --border: #e5e7eb;
-            --success: #10b981; --success-bg: #d1fae5;
-            --warning: #f59e0b; --warning-bg: #fef3c7;
-        }
-        [data-theme="dark"] {
-            --bg: #111827; --card: #1f2937; --text: #f9fafb; --text-muted: #9ca3af;
-            --primary: #3b82f6; --primary-light: #1e3a8a; --border: #374151;
-            --success: #34d399; --success-bg: #064e3b;
-            --warning: #fbbf24; --warning-bg: #78350f;
-        }
-        * { box-sizing: border-box; }
-        body {
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: var(--bg); color: var(--text); margin: 0; padding: 0;
-            transition: background 0.3s, color 0.3s;
-        }
-        
-        /* --- Технологичный баннер (карта маршрутов) --- */
-        .hero {
-            position: relative;
-            background-color: #0f172a;
-            background-image: 
-                radial-gradient(circle at 15% 50%, rgba(59, 130, 246, 0.15) 0%, transparent 50%),
-                radial-gradient(circle at 85% 30%, rgba(16, 185, 129, 0.15) 0%, transparent 50%),
-                linear-gradient(rgba(255,255,255,0.03) 1px, transparent 1px),
-                linear-gradient(90deg, rgba(255,255,255,0.03) 1px, transparent 1px);
-            background-size: 100% 100%, 100% 100%, 30px 30px, 30px 30px;
-            padding: 50px 24px;
-            color: white;
-            margin-bottom: 24px;
-            overflow: hidden;
-            border-bottom: 2px solid var(--primary);
-        }
-        /* Анимированная линия маршрута на фоне */
-        .hero::after {
-            content: '';
-            position: absolute;
-            top: 50%; left: -100%;
-            width: 200%; height: 2px;
-            background: linear-gradient(90deg, transparent, var(--primary), transparent);
-            animation: scan 4s linear infinite;
-            opacity: 0.5;
-        }
-        @keyframes scan {
-            0% { transform: translateX(0); }
-            100% { transform: translateX(100%); }
-        }
-        .hero-content {
-            position: relative;
-            z-index: 2;
-            max-width: 1400px;
-            margin: 0 auto;
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-        }
-        .hero h1 { font-size: 28px; margin: 0; display: flex; align-items: center; gap: 12px; font-weight: 700; text-shadow: 0 2px 4px rgba(0,0,0,0.5); }
-        .hero p { margin: 8px 0 0 0; color: #94a3b8; font-size: 15px; }
-
-        .container { max-width: 1400px; margin: 0 auto; padding: 0 24px 40px 24px; }
-        
-        .theme-toggle { 
-            background: rgba(255,255,255,0.1); color: white; border: 1px solid rgba(255,255,255,0.2); 
-            font-size: 20px; cursor: pointer; padding: 8px 12px; border-radius: 8px; backdrop-filter: blur(4px);
-            transition: background 0.2s;
-        }
-        .theme-toggle:hover { background: rgba(255,255,255,0.2); }
-
-        /* --- Табы --- */
-        .tabs { display: flex; gap: 12px; margin-bottom: 24px; background: var(--card); padding: 8px; border-radius: 12px; border: 1px solid var(--border); }
-        .tab { flex: 1; text-align: center; padding: 12px; border-radius: 8px; cursor: pointer; font-weight: 500; color: var(--text-muted); transition: all 0.2s; }
-        .tab.active { background: var(--primary); color: white; }
-        .tab .count { background: rgba(0,0,0,0.1); padding: 2px 8px; border-radius: 99px; font-size: 12px; margin-left: 8px; }
-        .tab.active .count { background: rgba(255,255,255,0.2); }
-
-        /* --- Панель поиска --- */
-        .controls { display: flex; gap: 16px; margin-bottom: 24px; }
-        .search-wrap { position: relative; flex: 1; }
-        .search-wrap input { width: 100%; padding: 14px 20px 14px 48px; font-size: 16px; border: 1px solid var(--border); border-radius: 12px; background: var(--card); color: var(--text); outline: none; box-shadow: 0 1px 2px rgba(0,0,0,0.05); transition: border-color 0.2s; }
-        .search-wrap input:focus { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
-        .search-icon { position: absolute; left: 16px; top: 50%; transform: translateY(-50%); color: var(--text-muted); pointer-events: none; }
-        .sort-wrap select { height: 100%; padding: 0 16px; font-size: 14px; border: 1px solid var(--border); border-radius: 12px; background: var(--card); color: var(--text); outline: none; cursor: pointer; }
-
-        /* --- Карточки --- */
-        .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
-        .card {
-            background: var(--card); border-radius: 12px; padding: 20px;
-            border: 1px solid var(--border); border-left: 4px solid var(--primary);
-            cursor: pointer; transition: transform 0.1s, box-shadow 0.1s; position: relative;
-        }
-        .card:hover { transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.05); }
-        .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 16px; }
-        .card-title { font-size: 18px; font-weight: 700; color: var(--primary); }
-        
-        .status-badge { padding: 4px 10px; border-radius: 99px; font-size: 12px; font-weight: 600; text-transform: uppercase; }
-        .status-badge.transit { background: var(--success-bg); color: var(--success); }
-        .status-badge.pending { background: var(--warning-bg); color: var(--warning); }
-        
-        .card-row { display: flex; margin-bottom: 8px; font-size: 14px; }
-        .card-label { width: 110px; color: var(--text-muted); flex-shrink: 0; }
-        .card-value { font-weight: 500; word-break: break-word; }
-
-        /* --- Модальное окно и карта --- */
-        .modal-overlay { position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.5); display: none; justify-content: center; align-items: center; z-index: 1000; opacity: 0; transition: opacity 0.2s; }
-        .modal-overlay.active { display: flex; opacity: 1; }
-        .modal-content { background: var(--card); width: 100%; max-width: 800px; border-radius: 16px; overflow: hidden; display: flex; flex-direction: column; max-height: 90vh; box-shadow: 0 20px 25px -5px rgba(0,0,0,0.1); }
-        .modal-header { padding: 20px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; }
-        .modal-title { font-size: 20px; font-weight: 700; margin: 0; }
-        .modal-close { background: none; border: none; font-size: 24px; cursor: pointer; color: var(--text-muted); }
-        .modal-body { padding: 20px; overflow-y: auto; }
-        
-        .modal-info-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
-        .info-block { display: flex; flex-direction: column; gap: 4px; }
-        .info-label { font-size: 12px; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.5px; }
-        .info-val { font-size: 15px; font-weight: 500; }
-        
-        #map-container { width: 100%; height: 400px; background: var(--border); border-radius: 12px; overflow: hidden; }
-        .no-map { display: flex; align-items: center; justify-content: center; height: 100%; color: var(--text-muted); font-size: 14px; }
-        .empty { text-align: center; padding: 40px; color: var(--text-muted); grid-column: 1 / -1; }
-    </style>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ТПК — Отслеживание заказов</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+    :root { --bg: #f0f2f5; --card: #fff; --text: #1a1a1a; --text-sec: #6c757d; --border: #e0e0e0; --primary: #007bff; --success: #28a745; --warn: #ffc107; --danger: #dc3545; --shadow: 0 2px 12px rgba(0,0,0,0.08); --shadow-hover: 0 4px 20px rgba(0,0,0,0.12); }
+    [data-theme="dark"] { --bg: #1a1a1a; --card: #2d2d2d; --text: #e8e8e8; --text-sec: #a0a0a0; --border: #404040; --primary: #4a9eff; --success: #28a745; --warn: #ffc107; --danger: #dc3545; --shadow: 0 2px 12px rgba(0,0,0,0.3); --shadow-hover: 0 4px 20px rgba(0,0,0,0.4); }
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 24px; transition: background 0.3s, color 0.3s; }
+    .header { max-width: 1100px; margin: 0 auto 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+    .header h1 { font-size: 28px; display: flex; align-items: center; gap: 8px; }
+    .theme-toggle { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; cursor: pointer; font-size: 18px; transition: all 0.2s; color: var(--text); }
+    .theme-toggle:hover { box-shadow: var(--shadow); transform: translateY(-1px); }
+    .tabs { max-width: 1100px; margin: 0 auto 24px; display: flex; gap: 8px; flex-wrap: wrap; background: var(--card); padding: 8px; border-radius: 12px; box-shadow: var(--shadow); }
+    .tab { flex: 1; min-width: 140px; padding: 12px 20px; border: none; background: transparent; color: var(--text-sec); font-size: 14px; font-weight: 600; cursor: pointer; border-radius: 8px; transition: all 0.2s; display: flex; align-items: center; justify-content: center; gap: 6px; }
+    .tab:hover { background: rgba(0,123,255,0.08); color: var(--primary); }
+    .tab.active { background: var(--primary); color: white; box-shadow: 0 2px 8px rgba(0,123,255,0.3); }
+    .tab.hidden { display: none; }
+    .count { background: rgba(0,0,0,0.1); padding: 2px 8px; border-radius: 10px; font-size: 12px; }
+    .tab.active .count { background: rgba(255,255,255,0.25); }
+    .container { max-width: 1100px; margin: 0 auto; }
+    .orders-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+    .order-card { background: var(--card); border-radius: 12px; padding: 20px; box-shadow: var(--shadow); transition: all 0.3s; cursor: pointer; border-left: 4px solid var(--primary); animation: fadeIn 0.3s ease; }
+    .order-card:hover { box-shadow: var(--shadow-hover); transform: translateY(-2px); }
+    .order-card.delivered { border-left-color: var(--success); }
+    .order-card.no-status { border-left-color: var(--warn); }
+    .order-card h3 { font-size: 16px; margin-bottom: 12px; display: flex; justify-content: space-between; align-items: center; }
+    .order-id { color: var(--primary); font-weight: 700; }
+    .order-row { font-size: 13px; margin: 6px 0; display: flex; gap: 8px; color: var(--text-sec); }
+    .order-row strong { color: var(--text); min-width: 80px; }
+    .order-status { display: inline-block; padding: 4px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; text-transform: uppercase; }
+    .order-status.in-transit { background: #d4edda; color: #155724; }
+    .order-status.delivered { background: #d1ecf1; color: #0c5460; }
+    .order-status.no-status { background: #fff3cd; color: #856404; }
+    .empty-state { text-align: center; padding: 80px 20px; color: var(--text-sec); }
+    .empty-state-icon { font-size: 64px; margin-bottom: 16px; opacity: 0.6; }
+    .skeleton { background: linear-gradient(90deg, var(--border) 25%, rgba(255,255,255,0.1) 50%, var(--border) 75%); background-size: 200% 100%; animation: shimmer 1.5s infinite; border-radius: 8px; height: 140px; }
+    @keyframes shimmer { 0% { background-position: -200% 0; } 100% { background-position: 200% 0; } }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+    #modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; padding: 20px; overflow-y: auto; }
+    #modal.open { display: block; }
+    .modal-content { background: var(--card); max-width: 900px; margin: 40px auto; border-radius: 16px; padding: 28px; position: relative; animation: fadeIn 0.3s; }
+    .modal-close { position: absolute; top: 16px; right: 16px; background: transparent; border: none; font-size: 24px; cursor: pointer; color: var(--text-sec); padding: 8px; border-radius: 8px; }
+    .modal-close:hover { background: var(--bg); }
+    #map { height: 400px; margin-top: 20px; border-radius: 12px; }
+    .modal-info { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 20px; }
+    .modal-info > div { font-size: 14px; }
+    .modal-info strong { display: block; color: var(--text-sec); font-size: 12px; margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+    .modal-info span { color: var(--text); font-size: 15px; }
+    .toast { position: fixed; bottom: 30px; right: 30px; background: var(--card); color: var(--text); padding: 16px 24px; border-radius: 12px; box-shadow: var(--shadow-hover); z-index: 2000; display: none; animation: slideIn 0.3s; border-left: 4px solid var(--primary); }
+    .toast.show { display: block; }
+    @keyframes slideIn { from { transform: translateX(400px); } to { transform: translateX(0); } }
+    @media (max-width: 640px) { body { padding: 16px; } .tab { min-width: 100%; } .orders-grid { grid-template-columns: 1fr; } }
+</style>
 </head>
 <body>
-    <div class="hero">
-        <div class="hero-content">
-            <div>
-                <h1>🛰️ ТПК — Отслеживание</h1>
-                <p>Система спутникового мониторинга и контроля логистики</p>
-            </div>
-            <button class="theme-toggle" onclick="toggleTheme()">🌙</button>
-        </div>
+    <div class="header">
+        <h1>📍 ТПК — Отслеживание</h1>
+        <button class="theme-toggle" onclick="toggleTheme()"><span id="themeIcon">🌙</span></button>
     </div>
 
-    <div class="container">
-        <div class="tabs" id="tabs">
-            <div class="tab active" data-status="в пути">🚚 В пути <span class="count" id="count-transit">0</span></div>
-            <div class="tab" data-status="планируется">📅 Планируется <span class="count" id="count-pending">0</span></div>
-            <div class="tab" data-status="завершено">✅ Завершено <span class="count" id="count-done">0</span></div>
-        </div>
-
-        <div class="controls">
-            <div class="search-wrap">
-                <svg class="search-icon" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                    <circle cx="11" cy="11" r="8"></circle>
-                    <line x1="21" y1="21" x2="16.65" y2="16.65"></line>
-                </svg>
-                <input id="search" type="text" placeholder="Поиск по номеру, адресу или машине..." autocomplete="off">
-            </div>
-            <div class="sort-wrap">
-                <select id="sort">
-                    <option value="arrival">По дате прибытия</option>
-                    <option value="order">По номеру заказа</option>
-                </select>
-            </div>
-        </div>
-
-        <div class="grid" id="grid"></div>
+    <div class="tabs" id="tabsContainer">
+        <button class="tab active" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути <span class="count" id="count-in_transit">0</span></button>
+        <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Выгружено <span class="count" id="count-delivered">0</span></button>
+        <button class="tab" data-status="no_status" onclick="setTab('no_status')">⚠️ Без статуса <span class="count" id="count-no_status">0</span></button>
+        <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 Все с GPS <span class="count" id="count-with_gps">0</span></button>
     </div>
 
-    <!-- Модальное окно -->
-    <div class="modal-overlay" id="modal" onclick="closeModal(event)">
-        <div class="modal-content" onclick="event.stopPropagation()">
-            <div class="modal-header">
-                <h2 class="modal-title" id="modal-title">Заказ</h2>
-                <button class="modal-close" onclick="closeModal()">×</button>
-            </div>
-            <div class="modal-body">
-                <div class="modal-info-grid" id="modal-info"></div>
-                <div id="map-container"></div>
-            </div>
-        </div>
-    </div>
+    <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
 
-<script>
-    let currentStatus = 'в пути';
-    let allData = [];
-    
-    // Тема
-    const isDark = localStorage.getItem('theme') === 'dark';
-    if (isDark) document.documentElement.setAttribute('data-theme', 'dark');
-    document.querySelector('.theme-toggle').innerText = isDark ? '☀️' : '🌙';
+    <div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
+    <div class="toast" id="toast"></div>
+
+    <script>
+    let currentTab = 'in_transit'; let map = null;
 
     function toggleTheme() {
-        const root = document.documentElement;
-        const isDarkNow = root.getAttribute('data-theme') === 'dark';
-        if (isDarkNow) {
-            root.removeAttribute('data-theme');
-            localStorage.setItem('theme', 'light');
-            document.querySelector('.theme-toggle').innerText = '🌙';
-        } else {
-            root.setAttribute('data-theme', 'dark');
-            localStorage.setItem('theme', 'dark');
-            document.querySelector('.theme-toggle').innerText = '☀️';
-        }
+        const html = document.documentElement; const isDark = html.getAttribute('data-theme') === 'dark';
+        html.setAttribute('data-theme', isDark ? 'light' : 'dark'); document.getElementById('themeIcon').textContent = isDark ? '🌙' : '☀️'; localStorage.setItem('theme', isDark ? 'light' : 'dark');
     }
+    const savedTheme = localStorage.getItem('theme') || 'light'; document.documentElement.setAttribute('data-theme', savedTheme); document.getElementById('themeIcon').textContent = savedTheme === 'dark' ? '☀️' : '🌙';
 
-    // Загрузка данных
-    async function loadData() {
+    // Загрузка настроек вкладок из админки
+    async function updateTabsVisibility() {
         try {
-            const res = await fetch('/api/shipments');
-            allData = await res.json();
-            updateCounts();
-            render();
-        } catch (e) {
-            console.error("Ошибка загрузки:", e);
+            const res = await fetch('/api/settings/tabs');
+            const s = await res.json();
+            document.querySelectorAll('.tab').forEach(tab => {
+                const key = tab.dataset.status;
+                const settingKey = 'show_' + key;
+                if (s[settingKey] === false) {
+                    tab.classList.add('hidden');
+                } else {
+                    tab.classList.remove('hidden');
+                }
+            });
+        } catch(e) {
+            console.error("Ошибка загрузки настроек вкладок:", e);
         }
     }
 
-    function updateCounts() {
-        document.getElementById('count-transit').innerText = allData.filter(d => d.status === 'в пути').length;
-        document.getElementById('count-pending').innerText = allData.filter(d => d.status === 'планируется').length;
-        document.getElementById('count-done').innerText = allData.filter(d => d.status === 'завершено').length;
+    function setTab(status) {
+        currentTab = status; 
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active')); 
+        document.querySelector(`.tab[data-status="${status}"]`)?.classList.add('active'); 
+        loadOrders();
     }
 
-    function statusClass(status) {
-        if (status === 'в пути') return 'transit';
-        if (status === 'планируется') return 'pending';
-        return 'done';
-    }
-
-    function render() {
-        const query = document.getElementById('search').value.toLowerCase().trim();
-        const sortBy = document.getElementById('sort').value;
-        const grid = document.getElementById('grid');
-        
-        let filtered = allData;
-        
-        // 1. Фильтр по статусу (табы)
-        if (currentStatus) {
-            filtered = filtered.filter(d => d.status === currentStatus);
-        }
-        
-        // 2. Поиск
-        if (query) {
-            filtered = filtered.filter(d => 
-                (d.order_id && d.order_id.toLowerCase().includes(query)) || 
-                (d.address && d.address.toLowerCase().includes(query)) ||
-                (d.vehicle && d.vehicle.toLowerCase().includes(query))
-            );
-        }
-
-        // 3. Сортировка
-        filtered.sort((a, b) => {
-            if (sortBy === 'arrival') {
-                const dateA = a.plan_arrival ? new Date(a.plan_arrival).getTime() : Infinity;
-                const dateB = b.plan_arrival ? new Date(b.plan_arrival).getTime() : Infinity;
-                return dateA - dateB;
-            } else {
-                return (a.order_id || '').localeCompare(b.order_id || '');
+    async function loadOrders() {
+        const grid = document.getElementById('ordersGrid');
+        grid.innerHTML = '<div class="skeleton"></div><div class="skeleton"></div><div class="skeleton"></div>';
+        try {
+            const url = `/api/shipments?status=${currentTab}`;
+            const res = await fetch(url); 
+            const orders = await res.json();
+            
+            // Обновляем счётчики
+            const allCounts = await (await fetch('/api/shipments?status=in_transit')).json();
+            const delCounts = await (await fetch('/api/shipments?status=delivered')).json();
+            const noStatusCounts = await (await fetch('/api/shipments?status=no_status')).json();
+            const gpsCounts = await (await fetch('/api/shipments?status=with_gps')).json();
+            document.getElementById('count-in_transit').textContent = allCounts.length;
+            document.getElementById('count-delivered').textContent = delCounts.length;
+            document.getElementById('count-no_status').textContent = noStatusCounts.length;
+            document.getElementById('count-with_gps').textContent = gpsCounts.length;
+            
+            if (orders.length === 0) {
+                grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">📭</div><h2>Нет заказов</h2><p>${getEmptyMsg(currentTab)}</p></div>`;
+                return;
             }
-        });
+            grid.innerHTML = orders.map(o => renderCard(o)).join('');
+        } catch (e) { grid.innerHTML = `<div class="empty-state" style="grid-column: 1 / -1;"><div class="empty-state-icon">❌</div><h2>Ошибка загрузки</h2></div>`; }
+    }
 
-        if (!filtered.length) {
-            grid.innerHTML = '<div class="empty">Ничего не найдено</div>';
-            return;
+    function getEmptyMsg(tab) {
+        if (tab === 'in_transit') return 'Все машины уже прибыли или ожидают выезда';
+        if (tab === 'delivered') return 'Пока нет завершённых перевозок';
+        if (tab === 'no_status') return 'Все заказы имеют статус';
+        return 'Нет заказов с GPS-ссылками';
+    }
+
+    function renderCard(o) {
+        let statusBadge = '';
+        if (o.status === 'в пути' || o.status === 'планируется') statusBadge = '<span class="order-status in-transit">В пути</span>';
+        else if (o.status === 'завершено' || o.status === 'выгружено') statusBadge = '<span class="order-status delivered">Выгружено</span>';
+        else statusBadge = '<span class="order-status no-status">Без статуса</span>';
+        
+        const comment = o.comment ? `<div class="order-row"><strong>Примечание:</strong> ${o.comment.substring(0, 80)}${o.comment.length > 80 ? '...' : ''}</div>` : '';
+        const arrival = o.plan_arrival ? `<div class="order-row"><strong>Прибытие:</strong> ${o.plan_arrival}</div>` : '';
+        
+        return `<div class="order-card ${o.status === 'завершено' || o.status === 'выгружено' ? 'delivered' : (!o.status ? 'no-status' : '')}" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+            <h3><span class="order-id">${o.order_id}</span>${statusBadge}</h3>
+            <div class="order-row"><strong>Адрес:</strong> ${o.address || '—'}</div>
+            <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier || '—'}</div>
+            <div class="order-row"><strong>Машина:</strong> ${o.vehicle || '—'}</div>
+            ${arrival} ${comment}
+        </div>`;
+    }
+
+    async function openOrder(o) {
+        document.getElementById('modal').classList.add('open');
+        const content = document.getElementById('modalContent');
+        content.innerHTML = `<h2 style="margin-bottom:16px;">📦 ${o.order_id}</h2><div class="modal-info">
+            <div><strong>Адрес доставки</strong><span>${o.address || '—'}</span></div>
+            <div><strong>Перевозчик</strong><span>${o.carrier || '—'}</span></div>
+            <div><strong>Машина</strong><span>${o.vehicle || '—'}</span></div>
+            <div><strong>Водитель</strong><span>${o.driver || '—'}</span></div>
+            <div><strong>Статус</strong><span>${o.status || 'Без статуса'}</span></div>
+            <div><strong>План. прибытие</strong><span>${o.plan_arrival || '—'}</span></div>
+            ${o.comment ? `<div style="grid-column: 1 / -1;"><strong>Примечание</strong><span>${o.comment}</span></div>` : ''}
+        </div><div id="map"></div>`;
+        if (o.current_lat && o.current_lng) {
+            if (map) map.remove();
+            map = L.map('map').setView([o.current_lat, o.current_lng], 8);
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+            L.marker([o.current_lat, o.current_lng]).addTo(map).bindPopup(`<b>${o.order_id}</b>`).openPopup();
+        } else if (o.gps_link) {
+            content.querySelector('#map').innerHTML = '<div style="text-align:center;padding:80px;color:#888;">⏳ Ожидаем координаты...</div>';
         }
-
-        grid.innerHTML = filtered.map(item => `
-            <div class="card" onclick="openModal('${item.order_id}')">
-                <div class="card-header">
-                    <div class="card-title">${item.order_id}</div>
-                    <div class="status-badge ${statusClass(item.status)}">${item.status}</div>
-                </div>
-                <div class="card-row"><div class="card-label">Адрес:</div><div class="card-value">${item.address || '—'}</div></div>
-                <div class="card-row"><div class="card-label">Перевозчик:</div><div class="card-value">${item.carrier || '—'}</div></div>
-                <div class="card-row"><div class="card-label">Машина:</div><div class="card-value">${item.vehicle || '—'}</div></div>
-                <div class="card-row"><div class="card-label">Прибытие:</div><div class="card-value">${item.plan_arrival || '—'}</div></div>
-                <div class="card-row"><div class="card-label">Примечание:</div><div class="card-value">${item.comment || '—'}</div></div>
-            </div>
-        `).join('');
     }
-
-    document.getElementById('tabs').addEventListener('click', (e) => {
-        const tab = e.target.closest('.tab');
-        if (!tab) return;
-        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-        tab.classList.add('active');
-        currentStatus = tab.dataset.status;
-        render();
-    });
-
-    document.getElementById('search').addEventListener('input', render);
-    document.getElementById('sort').addEventListener('change', render);
-
-    // Модальное окно
-    function openModal(orderId) {
-        const item = allData.find(d => d.order_id === orderId);
-        if (!item) return;
-
-        document.getElementById('modal-title').innerText = item.order_id;
-        document.getElementById('modal-info').innerHTML = `
-            <div class="info-block"><div class="info-label">Адрес доставки</div><div class="info-val">${item.address || '—'}</div></div>
-            <div class="info-block"><div class="info-label">Перевозчик</div><div class="info-val">${item.carrier || '—'}</div></div>
-            <div class="info-block"><div class="info-label">Машина</div><div class="info-val">${item.vehicle || '—'}</div></div>
-            <div class="info-block"><div class="info-label">Водитель</div><div class="info-val">${item.driver || '—'}</div></div>
-            <div class="info-block"><div class="info-label">Статус</div><div class="info-val">${item.status}</div></div>
-            <div class="info-block"><div class="info-label">План. прибытие</div><div class="info-val">${item.plan_arrival || '—'}</div></div>
-            <div class="info-block" style="grid-column: span 2;"><div class="info-label">Примечание</div><div class="info-val">${item.comment || '—'}</div></div>
-        `;
-
-        const mapContainer = document.getElementById('map-container');
-        mapContainer.innerHTML = '';
-
-        if (item.current_lat && item.current_lng) {
-            const lat = item.current_lat;
-            const lng = item.current_lng;
-            const mapUrl = `https://yandex.ru/map-widget/v1/?ll=${lng}%2C${lat}&z=12&pt=${lng}%2C${lat}%2Cpm2rdm`;
-            mapContainer.innerHTML = `<iframe src="${mapUrl}" width="100%" height="100%" frameborder="0" allowfullscreen="true"></iframe>`;
-        } else {
-            mapContainer.innerHTML = '<div class="no-map">Координаты еще не получены (машина в пути или нет GPS-ссылки)</div>';
-        }
-
-        document.getElementById('modal').classList.add('active');
-    }
-
-    function closeModal(e) {
-        if (e && e.target !== e.currentTarget) return;
-        document.getElementById('modal').classList.remove('active');
-    }
-
-    // Инициализация
-    loadData();
-    setInterval(loadData, 60000);
-</script>
+    function closeModal() { document.getElementById('modal').classList.remove('open'); if (map) { map.remove(); map = null; } }
+    document.getElementById('modal').addEventListener('click', e => { if (e.target.id === 'modal') closeModal(); });
+    
+    loadOrders();
+    updateTabsVisibility();
+    </script>
 </body>
 </html>
 """
 
-# ============================================================
-# ЭНДПОИНТЫ API
-# ============================================================
 
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    return HTML_PAGE
+# ============ АДМИН-ПАНЕЛЬ (С НАСТРОЙКАМИ ВКЛАДОК) ============
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_panel(user=Depends(check_admin)):
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Админ-панель</title>
+        <style>
+            body { font-family: Arial; padding: 20px; background: #f0f2f5; }
+            table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; }
+            th, td { border: 1px solid #ddd; padding: 6px; text-align: left; }
+            th { background: #333; color: white; position: sticky; top: 0; }
+            tr:hover { background: #f0f8ff; }
+            .в-пути { color: green; font-weight: bold; }
+            .завершено, .выгружено { color: gray; }
+            .планируется { color: orange; }
+            button { padding:6px 12px; margin:2px; cursor:pointer; }
+            .btn-add { background:#28a745; color:white; border:none; border-radius:4px; font-size:14px; padding:10px 20px; margin-bottom:10px; }
+            .btn-edit { background:#ffc107; border:none; border-radius:4px; }
+            .btn-del { background:#dc3545; color:white; border:none; border-radius:4px; }
+            .btn-refresh { background:#17a2b8; color:white; border:none; border-radius:4px; }
+            .btn-filter { background:#e9ecef; border:1px solid #ccc; border-radius:4px; padding:8px 16px; font-size:14px; cursor:pointer; margin-right:4px; }
+            .btn-filter.active { background:#007bff; color:white; border-color:#007bff; }
+            #filter { padding:8px; width:300px; margin-bottom:10px; }
+            .filters-bar { margin-bottom: 10px; }
+            #modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); }
+            #modalContent { background:white; max-width:600px; margin:80px auto; padding:30px; border-radius:8px; max-height:80vh; overflow-y:auto; }
+            #modalContent label { display:block; margin-top:10px; font-weight:bold; }
+            #modalContent input, #modalContent select { width:100%; padding:8px; box-sizing:border-box; }
+            .modal-buttons { margin-top:20px; text-align:right; }
+            .gps-yes { color: green; font-weight:bold; }
+            .gps-no { color: #ccc; }
+            #toast { display:none; position:fixed; bottom:30px; right:30px; background:#333; color:white; padding:15px 25px; border-radius:8px; z-index:9999; }
+            .settings-panel { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            .settings-panel h3 { margin-bottom: 12px; font-size: 16px; }
+            .settings-panel label { display: flex; align-items: center; gap: 8px; margin: 8px 0; cursor: pointer; font-size: 14px; }
+            .settings-panel input[type=checkbox] { width: auto; cursor: pointer; transform: scale(1.3); }
+        </style>
+    </head>
+    <body>
+        <h1>🚚 Админ-панель — Отгрузки</h1>
 
-@app.get("/api/shipments")
-async def api_shipments():
-    """Возвращает все заказы для отрисовки."""
-    conn = await asyncpg.connect(DATABASE_URL)
-    try:
-        rows = await conn.fetch("""
-            SELECT order_id, direction, address, carrier, vehicle, driver, 
-                   status, plan_arrival::text, comment, current_lat, current_lng 
-            FROM shipments 
-            ORDER BY 
-                CASE status 
-                    WHEN 'в пути' THEN 1 
-                    WHEN 'планируется' THEN 2 
-                    ELSE 3 
-                END,
-                ship_date DESC 
-            LIMIT 200
-        """)
-    finally:
-        await conn.close()
-    return JSONResponse(content=[dict(r) for r in rows])
+        <div class="settings-panel">
+            <h3>⚙️ Настройки вкладок для пользователей</h3>
+            <p style="color:#666;font-size:13px;margin-bottom:12px;">Отметьте вкладки, которые будут видны посетителям главной страницы:</p>
+            <label><input type="checkbox" id="tab_in_transit"/> 🚚 В пути</label>
+            <label><input type="checkbox" id="tab_delivered"/> ✅ Выгружено</label>
+            <label><input type="checkbox" id="tab_no_status"/> ⚠️ Без статуса</label>
+            <label><input type="checkbox" id="tab_with_gps"/> 📍 Все с GPS</label>
+            <button class="btn-add" onclick="saveTabs()" style="margin-top:12px;">💾 Сохранить настройки</button>
+        </div>
+
+        <div id="stats"></div>
+        <div class="filters-bar">
+            <button class="btn-filter active" data-filter="all" onclick="setFilter('all')">Все заказы</button>
+            <button class="btn-filter" data-filter="with-gps" onclick="setFilter('with-gps')">📍 С GPS</button>
+            <button class="btn-filter" data-filter="with-coords" onclick="setFilter('with-coords')">🎯 С координатами</button>
+            <button class="btn-filter" data-filter="in-transit" onclick="setFilter('in-transit')">🚚 В пути</button>
+            <button class="btn-filter" data-filter="in-transit-gps" onclick="setFilter('in-transit-gps')">🔥 В пути + GPS</button>
+        </div>
+        <button class="btn-add" onclick="openAdd()">➕ Добавить</button>
+        <button class="btn-refresh" onclick="refreshAll()">🔄 Обновить позиции</button>
+        <input id="filter" placeholder="Поиск..." oninput="renderTable()"/>
+        <table id="shipments">
+            <thead><tr><th>Заказ</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Позиция</th><th>Скорость</th><th>Действия</th></tr></thead>
+            <tbody></tbody>
+        </table>
+
+        <div id="toast"></div>
+        <div id="modal">
+            <div id="modalContent">
+                <h2 id="modalTitle">Добавить заказ</h2>
+                <label>Номер заказа *</label><input id="f_order_id"/>
+                <label>Направление</label><input id="f_direction"/>
+                <label>Адрес доставки</label><input id="f_address"/>
+                <label>Вес</label><input id="f_weight" type="number"/>
+                <label>Дата отгрузки</label><input id="f_ship_date"/>
+                <label>Дата прибытия</label><input id="f_plan_arrival"/>
+                <label>Перевозчик</label><input id="f_carrier"/>
+                <label>Машина</label><input id="f_vehicle"/>
+                <label>Водитель</label><input id="f_driver"/>
+                <label>GPS-ссылка</label><input id="f_gps_link"/>
+                <label>Примечание</label><input id="f_comment"/>
+                <label>Статус</label>
+                <select id="f_status"><option value="">Без статуса</option><option>планируется</option><option>в пути</option><option>выгружено</option><option>завершено</option></select>
+                <div class="modal-buttons"><button onclick="closeModal()">Отмена</button><button class="btn-add" onclick="saveOrder()">Сохранить</button></div>
+            </div>
+        </div>
+
+        <script>
+        let allData=[], currentFilter='all';
+        function showToast(msg){ const t=document.getElementById('toast'); t.innerText=msg; t.style.display='block'; setTimeout(()=>t.style.display='none',4000); }
+        function setFilter(f){ currentFilter=f; document.querySelectorAll('.btn-filter').forEach(b=>b.classList.toggle('active', b.dataset.filter===f)); renderTable(); }
+
+        async function loadTabSettings() {
+            try {
+                const res = await fetch('/api/settings/tabs');
+                const s = await res.json();
+                document.getElementById('tab_in_transit').checked = s.show_in_transit !== false;
+                document.getElementById('tab_delivered').checked = s.show_delivered !== false;
+                document.getElementById('tab_no_status').checked = s.show_no_status === true;
+                document.getElementById('tab_with_gps').checked = s.show_with_gps === true;
+            } catch(e) {}
+        }
+
+        async function saveTabs() {
+            const payload = {
+                show_in_transit: document.getElementById('tab_in_transit').checked,
+                show_delivered: document.getElementById('tab_delivered').checked,
+                show_no_status: document.getElementById('tab_no_status').checked,
+                show_with_gps: document.getElementById('tab_with_gps').checked
+            };
+            const res = await fetch('/api/admin/settings/tabs', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(payload)});
+            if (res.ok) { showToast('Настройки сохранены'); } else { alert('Ошибка сохранения'); }
+        }
+
+        async function load(){
+            const res = await fetch('/api/admin/shipments'); allData = await res.json();
+            const active = allData.filter(s=>s.status==='в пути').length; const withGps = allData.filter(s=>s.gps_link && s.gps_link.trim()).length;
+            const withCoords = allData.filter(s=>s.current_lat).length; const inTransitGps = allData.filter(s=>s.status==='в пути' && s.gps_link && s.gps_link.trim()).length;
+            document.getElementById('stats').innerHTML = `<p>Всего: <b>${allData.length}</b> | В пути: <b style="color:green">${active}</b> | GPS: <b>${withGps}</b> | Координаты: <b style="color:blue">${withCoords}</b> | В пути+GPS: <b style="color:#dc3545">${inTransitGps}</b></p>`;
+            renderTable();
+        }
+        function applyFilter(data){
+            return data.filter(s=>{
+                if(currentFilter==='with-gps') return s.gps_link && s.gps_link.trim(); if(currentFilter==='with-coords') return s.current_lat;
+                if(currentFilter==='in-transit') return s.status==='в пути'; if(currentFilter==='in-transit-gps') return s.status==='в пути' && s.gps_link && s.gps_link.trim(); return true;
+            });
+        }
+        function renderTable(){
+            const q = document.getElementById('filter').value.toLowerCase(); let filtered = applyFilter(allData).filter(s => (s.order_id||'').toLowerCase().includes(q) || (s.address||'').toLowerCase().includes(q));
+            if (filtered.length===0) { document.querySelector('#shipments tbody').innerHTML = '<tr><td colspan="8" style="text-align:center;color:#888;padding:20px;">Нет заказов</td></tr>'; return; }
+            document.querySelector('#shipments tbody').innerHTML = filtered.map(s=>`
+                <tr><td>${s.order_id}</td><td>${s.address||''}</td><td>${s.carrier||''}</td><td>${s.vehicle||''}</td>
+                <td class="${(s.status||'').replace(' ','-')}">${s.status||'—'}</td>
+                <td>${s.current_lat ? '<span class="gps-yes">📍 '+Number(s.current_lat).toFixed(2)+', '+Number(s.current_lng).toFixed(2)+'</span>' : '<span class="gps-no">—</span>'}</td>
+                <td>${s.actual_speed ? Math.round(s.actual_speed)+' км/д' : '—'}</td>
+                <td><button class="btn-edit" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button><button class="btn-del" onclick="del('${s.order_id}')">🗑</button></td></tr>
+            `).join('');
+        }
+        async function refreshAll(){ showToast('Запускаю парсер...'); const res = await fetch('/api/admin/refresh/all',{method:'POST'}); const data = await res.json(); showToast(data.message||'Готово'); setTimeout(load, 120000); }
+        function openAdd(){ ['order_id','direction','address','weight','ship_date','plan_arrival','carrier','vehicle','driver','gps_link','comment'].forEach(f=>{document.getElementById('f_'+f).value=''; document.getElementById('f_'+f).disabled=false;}); document.getElementById('f_status').value=''; document.getElementById('modalTitle').innerText='Добавить заказ'; document.getElementById('modal').style.display='block'; }
+        function openEdit(s){ ['order_id','direction','address','weight','ship_date','plan_arrival','carrier','vehicle','driver','gps_link','comment'].forEach(f=>{document.getElementById('f_'+f).value=s[f]||'';}); document.getElementById('f_order_id').disabled=true; document.getElementById('f_status').value=s.status||''; document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id; document.getElementById('modal').style.display='block'; }
+        function closeModal(){ document.getElementById('modal').style.display='none'; }
+        async function saveOrder(){
+            const payload = { order_id: document.getElementById('f_order_id').value.trim(), direction: document.getElementById('f_direction').value, address: document.getElementById('f_address').value, weight: parseFloat(document.getElementById('f_weight').value)||null, ship_date: document.getElementById('f_ship_date').value||null, plan_arrival: document.getElementById('f_plan_arrival').value||null, carrier: document.getElementById('f_carrier').value, vehicle: document.getElementById('f_vehicle').value, driver: document.getElementById('f_driver').value, gps_link: document.getElementById('f_gps_link').value, comment: document.getElementById('f_comment').value, status: document.getElementById('f_status').value };
+            if (!payload.order_id) { alert('Укажите номер заказа'); return; }
+            const res = await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+            if (res.ok) { closeModal(); load(); showToast('Сохранено'); } else { alert('Ошибка'); }
+        }
+        async function del(order_id){ if(!confirm('Удалить '+order_id+'?')) return; await fetch('/api/admin/shipments/'+order_id,{method:'DELETE'}); load(); }
+        load();
+        loadTabSettings();
+        </script>
+    </body>
+    </html>
+    """
