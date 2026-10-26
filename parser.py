@@ -263,7 +263,7 @@ async def process_order(conn, order_id: str, gps_link: str):
             await save_position(conn, order_id, lat, lng)
             print(f"  {order_id}: {lat}, {lng} ✅")
             return True
-
+ 
         print(f"  {order_id}: координаты не получены ({status})")
         if status == "sid_expired":
             await mark_as_done(conn, order_id)
