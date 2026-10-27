@@ -27,27 +27,32 @@ class Shipment(BaseModel):
     comment: Optional[str] = None
     status: Optional[str] = None
 
-# === НАДЕЖНАЯ ФУНКЦИЯ ПАРСИНГА GPS ===
+# === ФУНКЦИЯ ПАРСИНГА GPS (С ПРОВЕРКОЙ НА ОШИБКИ) ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
-        return None, None
+        return None, None, "no_link"
     try:
         token = gps_link.split("?t=")[-1]
-        # 1. Авторизация
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
-        }, timeout=(3.05, 5)) # Уменьшили таймаут для скорости
+        }, timeout=(3.05, 5))
         
         data = r.json()
-        if "token" not in data: return None, None
+        
+        # Wialon возвращает ошибку, если токен неверный или просрочен
+        if "error" in data:
+            print(f"❌ Wialon Error: {data['error']}")
+            return None, None, "invalid_token"
+            
+        if "token" not in data: 
+            return None, None, "invalid_token"
         
         unit_info = json.loads(data["token"])
         items = unit_info.get("items", [])
-        if not items: return None, None
+        if not items: return None, None, "no_units"
         unit_id = items[0]
         sid = data.get("eid")
         
-        # 2. Запрос позиции (возвращаемся к search_item, он работал)
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "core/search_item", 
             "params": json.dumps({"id": unit_id, "flags": 1025}), 
@@ -56,20 +61,26 @@ def get_coords_from_baltgps(gps_link: str):
         
         pos = r2.json().get("item", {}).get("pos", {})
         if pos and "x" in pos and "y" in pos:
-            return float(pos["y"]), float(pos["x"])
+            return float(pos["y"]), float(pos["x"]), "ok"
+            
+        return None, None, "no_data"
     except Exception as e:
         print(f"Ошибка GPS: {e}")
-    return None, None
+    return None, None, "error"
 
-# === АСИНХРОННЫЙ ФОНОВЫЙ СБОР КООРДИНАТ ===
 async def fetch_single_order_coords(order_id, o):
-    # Используем run_in_executor, чтобы не блокировать сервер
     loop = asyncio.get_event_loop()
-    lat, lng = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
+    lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
+    
     if lat and lng:
         o["current_lat"] = lat
         o["current_lng"] = lng
-        print(f"✅ GPS получен для {order_id}")
+        o["gps_status"] = "ok"
+    else:
+        # Если ссылка невалидна, помечаем это, чтобы на фронте показывать как "без GPS"
+        o["gps_status"] = status
+        if status in ["invalid_token", "no_link", "error"]:
+            o["gps_link"] = None # Убираем ссылку, чтобы не вводить в заблуждение
 
 async def update_all_coords():
     print("⏳ Начинаю фоновое обновление GPS-координат...")
@@ -78,7 +89,6 @@ async def update_all_coords():
         if o.get("gps_link") and not o.get("current_lat"):
             tasks.append(fetch_single_order_coords(order_id, o))
     
-    # Запускаем ВСЕ запросы параллельно (максимум 10 одновременно)
     semaphore = asyncio.Semaphore(10)
     async def limited_task(task):
         async with semaphore:
@@ -94,7 +104,7 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         print(f"✅ Загружено {len(DB)} заказов")
-        asyncio.create_task(update_all_coords()) # Запускаем в фоне
+        asyncio.create_task(update_all_coords())
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
@@ -109,6 +119,8 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         if status == "no_status" and s != '': continue
+        
+        # Если ищем "с GPS", показываем только тех, у кого есть ссылка И она валидна
         if status == "with_gps" and not o.get("gps_link"): continue
         
         if search:
@@ -117,7 +129,6 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
                 continue
         result.append(o)
     
-    # === ИСПРАВЛЕННАЯ СОРТИРОВКА ===
     def sort_key(x):
         has_link = 1 if x.get("gps_link") else 0
         has_coords = 1 if x.get("current_lat") else 0
@@ -126,16 +137,11 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         arrival = str(x.get("plan_arrival") or "9999-12-31")
         weight = x.get("weight") or 0
 
-        if sort_by == "gps":
-            return (not has_link, not has_coords, order_id)
-        elif sort_by == "order_id":
-            return order_id
-        elif sort_by == "city":
-            return (city == "", city, order_id)
-        elif sort_by == "date":
-            return (arrival == "9999-12-31", arrival, order_id)
-        elif sort_by == "weight":
-            return (weight == 0, -weight, order_id)
+        if sort_by == "gps": return (not has_link, not has_coords, order_id)
+        elif sort_by == "order_id": return order_id
+        elif sort_by == "city": return (city == "", city, order_id)
+        elif sort_by == "date": return (arrival == "9999-12-31", arrival, order_id)
+        elif sort_by == "weight": return (weight == 0, -weight, order_id)
         
         return (not has_link, not has_coords, order_id)
 
@@ -148,23 +154,26 @@ async def get_online_coords(order_id: str):
         raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
     
-    # Если координаты уже есть (загрузились в фоне) - отдаем МГНОВЕННО
     if o.get("current_lat"):
         return {"lat": o["current_lat"], "lng": o["current_lng"]}
         
-    # Если координат нет, пробуем получить прямо сейчас
     if o.get("gps_link"):
-        lat, lng = get_coords_from_baltgps(o["gps_link"])
+        lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
             o["current_lat"] = lat
             o["current_lng"] = lng
             return {"lat": lat, "lng": lng}
+        else:
+            # Если ссылка оказалась невалидной, удаляем её из базы
+            if status in ["invalid_token", "error"]:
+                o["gps_link"] = None
     
-    raise HTTPException(404, "Не удалось получить координаты от GPS")
+    raise HTTPException(404, "GPS недоступен")
 
 @app.get("/api/admin/report")
 async def get_report(user=Depends(check_admin)):
     in_transit = [o for o in DB.values() if str(o.get("status", "")).lower() in ['в пути', 'планируется']]
+    # Теперь в отчете без GPS будут и те, у кого ссылка невалидна
     return {"total": len(in_transit), "with_gps": [o for o in in_transit if o.get("gps_link")], "without_gps": [o for o in in_transit if not o.get("gps_link")]}
 
 # ============ ИНТЕРФЕЙС ============
@@ -290,21 +299,20 @@ async def user_portal():
             ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>` : ''}
             <div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
             
-        // Если координаты есть в памяти - рисуем моментально
         if (o.current_lat && o.current_lng) {
             renderMap(o.current_lat, o.current_lng);
         } else if (o.gps_link) {
-            // Если нет, запрашиваем у сервера
             try {
                 const res = await fetch(`/api/coords/${o.order_id}`);
                 if (res.ok) {
                     const data = await res.json();
                     renderMap(data.lat, data.lng);
                 } else {
-                    document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Спутник не отвечает.<br><a href="${o.gps_link}" target="_blank" style="color:var(--primary);margin-top:10px;display:block;">Открыть ссылку на GPS</a></div>`;
+                    // Если ссылка невалидна, выводим как "без GPS"
+                    document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует (ссылка недействительна). Ориентируйтесь на примечание.</div>';
                 }
             } catch(e) {
-                document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Ошибка сети.<br><a href="${o.gps_link}" target="_blank">Открыть ссылку на GPS</a></div>`;
+                document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">Ошибка сети.</div>';
             }
         } else {
             document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>';
@@ -327,7 +335,7 @@ async def user_portal():
 </html>
 """
 
-# ============ АДМИН-ПАНЕЛЬ ============
+# ============ АДМИН-ПАНЕЛЬ (ОТЧЕТ) ============
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(user=Depends(check_admin)):
     return """
