@@ -7,6 +7,10 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
+# === ИМПОРТЫ ДЛЯ БОТА MAX ===
+from maxapi import Bot, Dispatcher, F
+from maxapi.types import MessageCreated
+
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
 
@@ -15,6 +19,13 @@ ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
 DB = {}
 SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
+
+# === НАСТРОЙКА БОТА MAX ===
+# ВСТАВЬТЕ СЮДА ВАШ ТОКЕН ИЗ ЛИЧНОГО КАБИНЕТА MAX
+MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
+
+max_bot = Bot(token=MAX_BOT_TOKEN)
+max_dp = Dispatcher()
 
 class Shipment(BaseModel):
     order_id: str
@@ -96,6 +107,47 @@ async def update_all_coords():
     save_db()
     print("✅ Фоновая проверка GPS завершена.")
 
+# === ОБРАБОТЧИК СООБЩЕНИЙ БОТА MAX ===
+@max_dp.message_created(F.message.body.text)
+async def handle_order_request(event: MessageCreated):
+    order_id = event.message.body.text.strip().upper()
+    
+    if order_id not in DB:
+        await event.message.answer(f"❌ Заказ {order_id} не найден.")
+        return
+
+    order = DB[order_id]
+    
+    text = (
+        f"📦 **Заказ:** {order.get('order_id')}\n"
+        f"📍 **Адрес:** {order.get('address') or '—'}\n"
+        f"🚚 **Перевозчик:** {order.get('carrier') or '—'}\n"
+        f"🚛 **Машина:** {order.get('vehicle') or '—'}\n"
+        f"📊 **Статус:** {order.get('status') or '—'}"
+    )
+    if order.get('comment'):
+        text += f"\n📝 **Примечание:** {order['comment']}"
+
+    lat = order.get("current_lat")
+    lng = order.get("current_lng")
+    
+    if not lat and order.get("gps_link") and order.get("has_valid_gps") is not False:
+        lat, lng, status = get_coords_from_baltgps(order["gps_link"])
+        if lat and lng:
+            order["current_lat"] = lat
+            order["current_lng"] = lng
+
+    if lat and lng:
+        map_link = f"https://yandex.ru/maps/?pt={lng},{lat}&z=12&l=map"
+        text += f"\n\n🗺️ [Точка на карте]({map_link})"
+    else:
+        text += "\n\n🗺️ Координаты GPS недоступны."
+
+    await event.message.answer(text)
+
+async def run_max_bot():
+    await max_dp.start_polling(max_bot)
+
 @app.on_event("startup")
 async def startup():
     global DB
@@ -103,12 +155,17 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         asyncio.create_task(update_all_coords())
+    
+    # Запуск бота MAX в фоне
+    asyncio.create_task(run_max_bot())
+    print("✅ MAX-бот запущен в фоне")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
+# === API ДЛЯ САЙТА (ОСТАЛЬНОЙ КОД БЕЗ ИЗМЕНЕНИЙ) ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
