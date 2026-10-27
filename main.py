@@ -7,9 +7,8 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ БОТА MAX ===
+# === ИМПОРТЫ ДЛЯ БОТА MAX (ТОЛЬКО БАЗОВЫЕ) ===
 from maxapi import Bot, Dispatcher
-from maxapi.types import MessageCreated
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -21,7 +20,6 @@ DB = {}
 SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
 
 # === НАСТРОЙКА БОТА MAX ===
-# ВСТАВЬТЕ СЮДА ВАШ ТОКЕН ИЗ ЛИЧНОГО КАБИНЕТА MAX
 MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
@@ -121,9 +119,9 @@ async def update_all_coords():
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
-# === ЛОГИКА БОТА MAX ===
+# === ЛОГИКА БОТА MAX (БЕЗ АННОТАЦИЙ ТИПОВ) ===
 @max_dp.message_created()
-async def handle_message(event: MessageCreated):
+async def handle_message(event):
     # Проверка, что это текстовое сообщение
     if not event.message or not event.message.body or not event.message.body.text:
         return
@@ -146,7 +144,6 @@ async def handle_message(event: MessageCreated):
             await event.message.answer("Нет активных заказов в пути.")
             return
         
-        # Формируем список (максимум 15 штук, чтобы не спамить)
         response = "Выберите заказ (нажмите на номер или введите 4 цифры):\n\n"
         for o in active_orders[:15]:
             gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
@@ -156,7 +153,6 @@ async def handle_message(event: MessageCreated):
         return
 
     # 3. Поиск по номеру или 4 цифрам
-    # Если ввели ровно 4 цифры, ищем совпадение в конце номера заказа
     found_order = None
     search_query = text.upper()
     
@@ -166,14 +162,12 @@ async def handle_message(event: MessageCreated):
                 found_order = o
                 break
     else:
-        # Ищем по полному номеру
         if search_query in DB:
             found_order = DB[search_query]
 
     if found_order:
         o = found_order
         
-        # Если есть ссылка, но нет координат, пробуем получить их "на лету"
         if not o.get("current_lat") and o.get("gps_link"):
             lat, lng, status = get_coords_from_baltgps(o["gps_link"])
             if lat:
