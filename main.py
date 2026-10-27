@@ -3,7 +3,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import os, json, requests
+import os, json, requests, asyncio
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -31,37 +31,29 @@ class Shipment(BaseModel):
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None
-    
     try:
         token = gps_link.split("?t=")[-1]
-        # 1. Получаем список машин по токену
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
-            "svc": "token/login",
-            "params": json.dumps({"token": token})
-        }, timeout=10)
-        
+            "svc": "token/login", "params": json.dumps({"token": token})
+        }, timeout=5)
         data = r.json()
         if "token" not in data: return None, None
         
-        # 2. Получаем ID машины
         unit_info = json.loads(data["token"])
         items = unit_info.get("items", [])
         if not items: return None, None
         unit_id = items[0]
-        
-        # 3. Запрашиваем позицию через сессию
         sid = data.get("eid")
+        
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
-            "svc": "core/search_item",
-            "params": json.dumps({"id": unit_id, "flags": 1025}),
-            "sid": sid
-        }, timeout=10)
+            "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
+        }, timeout=5)
         
         pos = r2.json().get("item", {}).get("pos", {})
         if pos and "x" in pos and "y" in pos:
-            return float(pos["y"]), float(pos["x"]) # lat, lng
+            return float(pos["y"]), float(pos["x"])
     except Exception as e:
-        print(f"Ошибка GPS: {e}")
+        pass
     return None, None
 
 @app.on_event("startup")
@@ -71,6 +63,19 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         print(f"✅ Загружено {len(DB)} заказов")
+        asyncio.create_task(update_all_coords())
+
+async def update_all_coords():
+    print("⏳ Начинаю фоновое обновление GPS-координат...")
+    count = 0
+    for o in DB.values():
+        if o.get("gps_link") and not o.get("current_lat"):
+            lat, lng = get_coords_from_baltgps(o["gps_link"])
+            if lat and lng:
+                o["current_lat"] = lat
+                o["current_lng"] = lng
+                count += 1
+    print(f"✅ Координаты обновлены для {count} машин.")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
@@ -92,29 +97,33 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
             q = search.lower()
             if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower() and q not in o.get("vehicle", "").lower():
                 continue
-        
-        # Добавляем координаты, если их еще нет
-        if o.get("gps_link") and not o.get("current_lat"):
-            lat, lng = get_coords_from_baltgps(o["gps_link"])
-            o["current_lat"] = lat
-            o["current_lng"] = lng
-            
         result.append(o)
     
-    # === УМНАЯ СОРТИРОВКА ===
+    # === СОРТИРОВКА ===
     def sort_key(x):
         has_gps = 1 if x.get("current_lat") else 0
-        has_link = 1 if x.get("gps_link") else 0
-        arrival = x.get("plan_arrival") or "9999-12-31"
+        order_id = str(x.get("order_id") or "")
+        city = str(x.get("address") or "").lower() # Приводим к нижнему регистру для алфавитной сортировки
+        arrival = str(x.get("plan_arrival") or "9999-12-31")
         weight = x.get("weight") or 0
-        
+
         if sort_by == "gps":
-            return (not has_gps, not has_link, arrival) # Сначала GPS
+            # Сначала те, у кого есть координаты, затем по номеру заказа
+            return (not has_gps, order_id)
+        elif sort_by == "order_id":
+            # Строго по номеру заказа (ТПК...)
+            return order_id
+        elif sort_by == "city":
+            # По городу (адресу), пустые в конец
+            return (city == "", city, order_id)
         elif sort_by == "date":
-            return (arrival, not has_gps) # Сначала ближайшие
+            # По дате прибытия, пустые в конец
+            return (arrival == "9999-12-31", arrival, order_id)
         elif sort_by == "weight":
-            return (-weight, not has_gps) # Сначала тяжелые
-        return (not has_gps, arrival)
+            # По весу (от тяжелых к легким), пустые в конец
+            return (weight == 0, -weight, order_id)
+        
+        return (not has_gps, order_id)
 
     result.sort(key=sort_key)
     return result
@@ -122,11 +131,7 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
 @app.get("/api/admin/report")
 async def get_report(user=Depends(check_admin)):
     in_transit = [o for o in DB.values() if str(o.get("status", "")).lower() in ['в пути', 'планируется']]
-    return {
-        "total": len(in_transit),
-        "with_gps": [o for o in in_transit if o.get("gps_link")],
-        "without_gps": [o for o in in_transit if not o.get("gps_link")]
-    }
+    return {"total": len(in_transit), "with_gps": [o for o in in_transit if o.get("gps_link")], "without_gps": [o for o in in_transit if not o.get("gps_link")]}
 
 # ============ ИНТЕРФЕЙС ============
 @app.get("/", response_class=HTMLResponse)
@@ -140,17 +145,17 @@ async def user_portal():
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
-    :root { --bg: #f0f2f5; --card: #fff; --text: #1a1a1a; --text-sec: #6c757d; --border: #e0e0e0; --primary: #007bff; --success: #28a745; --warn: #ffc107; --shadow: 0 2px 12px rgba(0,0,0,0.08); }
-    [data-theme="dark"] { --bg: #1a1a1a; --card: #2d2d2d; --text: #e8e8e8; --text-sec: #a0a0a0; --border: #404040; --primary: #4a9eff; --success: #28a745; --warn: #ffc107; }
+    :root { --bg: #f0f2f5; --card: #fff; --text: #1a1a1a; --text-sec: #6c757d; --border: #e0e0e0; --primary: #007bff; --success: #28a745; --shadow: 0 2px 12px rgba(0,0,0,0.08); }
+    [data-theme="dark"] { --bg: #1a1a1a; --card: #2d2d2d; --text: #e8e8e8; --text-sec: #a0a0a0; --border: #404040; --primary: #4a9eff; --success: #28a745; }
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
     .header { max-width: 1100px; margin: 0 auto 24px; display: flex; justify-content: space-between; align-items: center; }
     .header h1 { font-size: 28px; }
-    .controls { max-width: 1100px; margin: 0 auto 16px; display: flex; gap: 10px; flex-wrap: wrap; }
+    .controls { max-width: 1100px; margin: 0 auto 16px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
     .search-box { position: relative; flex: 1; min-width: 250px; }
     .search-box input { width: 100%; padding: 14px 20px 14px 48px; border-radius: 12px; border: 2px solid var(--border); background: var(--card); color: var(--text); }
     .search-box::before { content: '🔍'; position: absolute; left: 16px; top: 50%; transform: translateY(-50%); }
-    .sort-select { padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-weight: 600; }
+    .sort-select { padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-weight: 600; outline: none; }
     .tabs { max-width: 1100px; margin: 0 auto 24px; display: flex; gap: 8px; background: var(--card); padding: 8px; border-radius: 12px; box-shadow: var(--shadow); }
     .tab { flex: 1; padding: 12px; border: none; background: transparent; color: var(--text-sec); font-weight: 600; cursor: pointer; border-radius: 8px; }
     .tab.active { background: var(--primary); color: white; }
@@ -179,9 +184,11 @@ async def user_portal():
     <div class="header"><h1>📍 ТПК — Отслеживание</h1><button class="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button></div>
     
     <div class="controls">
-        <div class="search-box"><input id="searchInput" placeholder="Поиск..." oninput="debounceSearch()"></div>
+        <div class="search-box"><input id="searchInput" placeholder="Поиск по номеру, городу или машине..." oninput="debounceSearch()"></div>
         <select class="sort-select" id="sortSelect" onchange="loadOrders()">
             <option value="gps">📍 Сначала с GPS</option>
+            <option value="order_id">🔢 По номеру заказа</option>
+            <option value="city">🏙️ По городу</option>
             <option value="date">📅 По дате прибытия</option>
             <option value="weight">⚖️ По весу</option>
         </select>
@@ -208,25 +215,30 @@ async def user_portal():
         const sort = document.getElementById('sortSelect').value;
         document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;">Загрузка...</div>';
         
-        const res = await fetch(`/api/shipments?status=${currentTab}&sort_by=${sort}${search ? '&search='+search : ''}`);
-        const orders = await res.json();
-        const grid = document.getElementById('ordersGrid');
-        
-        if (!orders.length) { grid.innerHTML = '<div style="text-align:center;width:100%;">Нет заказов</div>'; return; }
-        
-        grid.innerHTML = orders.map(o => {
-            let badge = o.status === 'в пути' ? '<span class="order-status in-transit">В пути</span>' : (o.status === 'завершено' ? '<span class="order-status delivered">Выгружено</span>' : '');
-            let loc = o.comment ? `<div class="loc-info">📝 ${o.comment}</div>` : '';
+        try {
+            const res = await fetch(`/api/shipments?status=${currentTab}&sort_by=${sort}${search ? '&search='+search : ''}`);
+            if (!res.ok) throw new Error("Ошибка сервера");
+            const orders = await res.json();
+            const grid = document.getElementById('ordersGrid');
             
-            return `<div class="order-card ${o.status === 'завершено' ? 'delivered' : ''}" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
-                <div style="display:flex; justify-content:space-between; margin-bottom:10px;"><span class="order-id">${o.order_id}</span>${badge}</div>
-                <div class="order-row"><strong>Адрес:</strong> ${o.address || '—'}</div>
-                <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier || '—'}</div>
-                <div class="order-row"><strong>Машина:</strong> ${o.vehicle || '—'}</div>
-                <div class="order-row"><strong>Вес:</strong> ${o.weight ? o.weight + ' кг' : '—'}</div>
-                ${loc}
-            </div>`;
-        }).join('');
+            if (!orders.length) { grid.innerHTML = '<div style="text-align:center;width:100%;">Нет заказов</div>'; return; }
+            
+            grid.innerHTML = orders.map(o => {
+                let badge = o.status === 'в пути' ? '<span class="order-status in-transit">В пути</span>' : (o.status === 'завершено' ? '<span class="order-status delivered">Выгружено</span>' : '');
+                let loc = o.comment ? `<div class="loc-info">📝 ${o.comment}</div>` : '';
+                
+                return `<div class="order-card ${o.status === 'завершено' ? 'delivered' : ''}" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+                    <div style="display:flex; justify-content:space-between; margin-bottom:10px;"><span class="order-id">${o.order_id}</span>${badge}</div>
+                    <div class="order-row"><strong>Адрес:</strong> ${o.address || '—'}</div>
+                    <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier || '—'}</div>
+                    <div class="order-row"><strong>Машина:</strong> ${o.vehicle || '—'}</div>
+                    <div class="order-row"><strong>Вес:</strong> ${o.weight ? o.weight + ' кг' : '—'}</div>
+                    ${loc}
+                </div>`;
+            }).join('');
+        } catch(e) {
+            document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;color:red;">Ошибка загрузки данных</div>';
+        }
     }
     
     function openOrder(o) {
