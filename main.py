@@ -13,6 +13,8 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
 DB = {}
+# Настройки видимости вкладок (по умолчанию все включены)
+SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
 
 class Shipment(BaseModel):
     order_id: str
@@ -76,7 +78,7 @@ async def fetch_single_order_coords(order_id, o):
         o["gps_status"] = status
 
 async def update_all_coords():
-    # Принудительно сбрасываем координаты у тех, у кого уже известно, что GPS невалиден
+    # Принудительно сбрасываем координаты у всех, кто уже известен как невалидный
     for o in DB.values():
         if o.get("has_valid_gps") is False:
             o["current_lat"] = None
@@ -84,7 +86,7 @@ async def update_all_coords():
 
     tasks = []
     for order_id, o in DB.items():
-        if o.get("gps_link") and not o.get("current_lat") and o.get("has_valid_gps") is not False:
+        if o.get("gps_link") and o.get("has_valid_gps") is not False:
             tasks.append(fetch_single_order_coords(order_id, o))
     
     semaphore = asyncio.Semaphore(10)
@@ -92,6 +94,7 @@ async def update_all_coords():
         async with semaphore: await task
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
+    print("✅ Фоновая проверка GPS завершена.")
 
 @app.on_event("startup")
 async def startup():
@@ -106,6 +109,17 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
+# === API ===
+@app.get("/api/settings/tabs")
+async def get_tabs():
+    return SETTINGS
+
+@app.post("/api/admin/settings/tabs")
+async def set_tabs(s: dict, user=Depends(check_admin)):
+    global SETTINGS
+    SETTINGS.update(s)
+    return {"ok": True}
+
 @app.get("/api/shipments")
 async def list_shipments(status: Optional[str] = None, search: Optional[str] = None, sort_by: str = "gps"):
     result = []
@@ -114,7 +128,7 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         
-        # Вкладка "С GPS" - ТОЛЬКО ТЕ, ГДЕ ЕСТЬ КООРДИНАТЫ
+        # Вкладка "С GPS" - ТОЛЬКО ВАЛИДНЫЕ
         if status == "with_gps":
             if not o.get("current_lat"): continue
         
@@ -125,13 +139,13 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         result.append(o)
     
     def sort_key(x):
-        # Валидным считаем только если есть реальные координаты
+        # 1, если есть координаты (карта точно откроется). Иначе 0.
         is_valid = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
         
         if sort_by == "gps":
-            # Сначала все с координатами (по порядку номеров), затем все остальные
+            # Сначала валидные (по номеру), затем невалидные (по номеру)
             return (not is_valid, order_id)
         elif sort_by == "order_id":
             return order_id
@@ -188,6 +202,7 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     global DB
     try:
         contents = await file.read()
+        # Четко указываем лист
         df = pd.read_excel(io.BytesIO(contents), sheet_name="Исх.логистика")
         df = df.dropna(subset=['Заказ'])
         
@@ -214,21 +229,14 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
                 "gps_link": gps,
                 "comment": str(row.get('Примечания', '')) if not pd.isna(row.get('Примечания')) else None,
                 "status": str(row.get('статус доставки', '')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
-                "has_valid_gps": None
+                "has_valid_gps": None # Принудительно сбрасываем статус
             }
         DB = new_db
         save_db()
         asyncio.create_task(update_all_coords())
-        return {"ok": True, "message": f"Загружено {len(DB)} заказов. Идет проверка GPS..."}
+        return {"ok": True, "message": f"Успешно загружено {len(DB)} заказов"}
     except Exception as e:
-        raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
-
-@app.get("/api/admin/report")
-async def get_report(user=Depends(check_admin)):
-    in_transit = [o for o in DB.values() if str(o.get("status", "")).lower() in ['в пути', 'планируется']]
-    with_gps = [o for o in in_transit if o.get("current_lat")]
-    without_gps = [o for o in in_transit if not o.get("current_lat")]
-    return {"total": len(in_transit), "with_gps": with_gps, "without_gps": without_gps}
+        raise HTTPException(500, f"Ошибка: {str(e)}")
 
 # ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
@@ -254,7 +262,8 @@ async def user_portal():
     .search-box::before { content: '🔍'; position: absolute; left: 16px; top: 50%; transform: translateY(-50%); }
     .sort-select { padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; }
     .tabs { max-width: 1100px; margin: 0 auto 24px; display: flex; gap: 8px; background: var(--card); padding: 8px; border-radius: 12px; box-shadow: var(--shadow); }
-    .tab { flex: 1; padding: 12px; border: none; background: transparent; color: var(--text-sec); font-weight: 600; cursor: pointer; border-radius: 8px; }
+    .tab { flex: 1; padding: 12px; border: none; background: transparent; color: var(--text-sec); font-weight: 600; cursor: pointer; border-radius: 8px; display: none; }
+    .tab.visible { display: block; }
     .tab.active { background: var(--primary); color: white; }
     .container { max-width: 1100px; margin: 0 auto; }
     .orders-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
@@ -289,8 +298,8 @@ async def user_portal():
             <option value="city">🏙️ По городу</option>
         </select>
     </div>
-    <div class="tabs">
-        <button class="tab active" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути</button>
+    <div class="tabs" id="tabsContainer">
+        <button class="tab" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути</button>
         <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Выгружено</button>
         <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 С GPS</button>
     </div>
@@ -298,8 +307,30 @@ async def user_portal():
     <div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
     <script>
     let currentTab = 'in_transit'; let map = null;
+    
     function toggleTheme() { const isDark = document.documentElement.getAttribute('data-theme') === 'dark'; document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark'); localStorage.setItem('theme', isDark ? 'light' : 'dark'); }
     document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
+    
+    async function loadTabs() {
+        const res = await fetch('/api/settings/tabs');
+        const settings = await res.json();
+        document.querySelectorAll('.tab').forEach(tab => {
+            const status = tab.dataset.status;
+            const key = 'show_' + status;
+            if (settings[key] !== false) {
+                tab.classList.add('visible');
+            } else {
+                tab.classList.remove('visible');
+            }
+        });
+        // Если текущая вкладка скрыта, переключаем на первую видимую
+        const activeTab = document.querySelector('.tab.active');
+        if (activeTab && !activeTab.classList.contains('visible')) {
+            const firstVisible = document.querySelector('.tab.visible');
+            if (firstVisible) setTab(firstVisible.dataset.status);
+        }
+    }
+    
     function setTab(s) { currentTab = s; document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); document.querySelector(`.tab[data-status="${s}"]`).classList.add('active'); loadOrders(); }
     function debounceSearch() { clearTimeout(window.searchTimeout); window.searchTimeout = setTimeout(loadOrders, 300); }
     
@@ -357,7 +388,8 @@ async def user_portal():
         L.marker([lat, lng]).addTo(map);
     }
     function closeModal() { document.getElementById('modal').classList.remove('open'); if(map){map.remove(); map=null;} }
-    loadOrders();
+    
+    loadTabs().then(() => loadOrders());
     </script>
 </body>
 </html>
@@ -378,7 +410,11 @@ async def admin_panel(user=Depends(check_admin)):
             .btn-green { background: #28a745; color: white; }
             .btn-blue { background: #007bff; color: white; }
             .btn-red { background: #dc3545; color: white; }
-            .upload-box { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; gap: 10px; align-items: center; }
+            .panel { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }
+            .panel h3 { margin-top: 0; }
+            .upload-box { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+            .settings-grid { display: flex; gap: 20px; margin-top: 10px; }
+            .settings-grid label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
             table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
             th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
             th { background: #333; color: white; position: sticky; top: 0; }
@@ -389,6 +425,7 @@ async def admin_panel(user=Depends(check_admin)):
             #modalContent label { display:block; margin-top:10px; font-weight:bold; }
             #modalContent input, #modalContent select { width:100%; padding:8px; box-sizing:border-box; margin-top:4px; }
             .modal-buttons { margin-top:20px; text-align:right; }
+            #uploadStatus { font-weight: bold; margin-left: 10px; }
         </style>
     </head>
     <body>
@@ -396,12 +433,26 @@ async def admin_panel(user=Depends(check_admin)):
             <h1>🚚 Управление перевозками</h1>
             <button class="btn btn-green" onclick="openAdd()">➕ Добавить заказ</button>
         </div>
-        <div class="upload-box">
-            <strong>📥 Загрузить Excel:</strong>
-            <input type="file" id="excelFile" accept=".xlsx, .xls">
-            <button class="btn btn-blue" onclick="uploadExcel()">Обновить базу из файла</button>
-            <span id="uploadStatus" style="color: green; font-weight: bold;"></span>
+        
+        <div class="panel">
+            <h3>👁️ Видимость вкладок на главной</h3>
+            <div class="settings-grid">
+                <label><input type="checkbox" id="chk_in_transit" onchange="saveTabs()"> 🚚 В пути</label>
+                <label><input type="checkbox" id="chk_delivered" onchange="saveTabs()"> ✅ Выгружено</label>
+                <label><input type="checkbox" id="chk_with_gps" onchange="saveTabs()"> 📍 С GPS</label>
+            </div>
         </div>
+
+        <div class="panel">
+            <h3>📥 Загрузка данных из Excel</h3>
+            <div class="upload-box">
+                <input type="file" id="excelFile" accept=".xlsx, .xls">
+                <button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
+                <span id="uploadStatus"></span>
+            </div>
+            <p style="font-size: 12px; color: #666; margin-top: 10px;">Берется лист <b>"Исх.логистика"</b>. Предыдущая база полностью заменяется.</p>
+        </div>
+
         <input id="filter" placeholder="Поиск по номеру или адресу..." oninput="renderTable()"/>
         <table id="shipments">
             <thead><tr><th>Заказ</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Действия</th></tr></thead>
@@ -435,6 +486,22 @@ async def admin_panel(user=Depends(check_admin)):
         </div>
         <script>
         let allData=[];
+        async function loadSettings() {
+            const res = await fetch('/api/settings/tabs');
+            const s = await res.json();
+            document.getElementById('chk_in_transit').checked = s.show_in_transit !== false;
+            document.getElementById('chk_delivered').checked = s.show_delivered !== false;
+            document.getElementById('chk_with_gps').checked = s.show_with_gps !== false;
+        }
+        async function saveTabs() {
+            const payload = {
+                show_in_transit: document.getElementById('chk_in_transit').checked,
+                show_delivered: document.getElementById('chk_delivered').checked,
+                show_with_gps: document.getElementById('chk_with_gps').checked
+            };
+            await fetch('/api/admin/settings/tabs', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+        }
+
         async function load(){
             const res = await fetch('/api/admin/shipments'); allData = await res.json();
             renderTable();
@@ -491,25 +558,43 @@ async def admin_panel(user=Depends(check_admin)):
             if(!confirm('Удалить '+order_id+'?')) return; 
             await fetch('/api/admin/shipments/'+order_id,{method:'DELETE'}); load(); 
         }
+        
         async function uploadExcel() {
             const fileInput = document.getElementById('excelFile');
             if (!fileInput.files.length) { alert("Выберите файл!"); return; }
+            
             const formData = new FormData();
             formData.append("file", fileInput.files[0]);
-            document.getElementById('uploadStatus').innerText = "⏳ Загрузка...";
+            
+            const btn = document.getElementById('uploadBtn');
+            const status = document.getElementById('uploadStatus');
+            
+            btn.disabled = true;
+            btn.innerText = "⏳ Обработка...";
+            status.innerText = "Пожалуйста, подождите...";
+            status.style.color = "blue";
+            
             try {
                 const res = await fetch('/api/admin/upload', { method: 'POST', body: formData });
                 const data = await res.json();
                 if (res.ok) {
-                    document.getElementById('uploadStatus').innerText = "✅ " + data.message;
-                    load();
+                    status.innerText = "✅ " + data.message + " (" + new Date().toLocaleTimeString() + ")";
+                    status.style.color = "green";
+                    load(); // Обновляем таблицу
                 } else {
-                    document.getElementById('uploadStatus').innerText = "❌ Ошибка: " + data.detail;
+                    status.innerText = "❌ Ошибка: " + data.detail;
+                    status.style.color = "red";
                 }
             } catch(e) {
-                document.getElementById('uploadStatus').innerText = "❌ Ошибка сети";
+                status.innerText = "❌ Ошибка сети";
+                status.style.color = "red";
+            } finally {
+                btn.disabled = false;
+                btn.innerText = "Обновить базу из файла";
             }
         }
+
+        loadSettings();
         load();
         </script>
     </body>
