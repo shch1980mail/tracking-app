@@ -1,0 +1,4 @@
+{
+  "runtime": "python_web",
+  "startCommand": "gunicorn main:app"
+}
