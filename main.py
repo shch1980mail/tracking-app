@@ -27,7 +27,7 @@ class Shipment(BaseModel):
     comment: Optional[str] = None
     status: Optional[str] = None
 
-# === ФУНКЦИЯ ПАРСИНГА GPS ===
+# === НАДЕЖНАЯ ФУНКЦИЯ ПАРСИНГА GPS ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None
@@ -36,7 +36,7 @@ def get_coords_from_baltgps(gps_link: str):
         # 1. Авторизация
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
-        }, timeout=(3.05, 10))
+        }, timeout=(3.05, 5)) # Уменьшили таймаут для скорости
         
         data = r.json()
         if "token" not in data: return None, None
@@ -47,19 +47,45 @@ def get_coords_from_baltgps(gps_link: str):
         unit_id = items[0]
         sid = data.get("eid")
         
-        # 2. Запрос последней позиции
+        # 2. Запрос позиции (возвращаемся к search_item, он работал)
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
-            "svc": "unit/calc_last", "params": json.dumps([unit_id]), "sid": sid
-        }, timeout=(3.05, 10))
+            "svc": "core/search_item", 
+            "params": json.dumps({"id": unit_id, "flags": 1025}), 
+            "sid": sid
+        }, timeout=(3.05, 5))
         
-        pos_data = r2.json()
-        if isinstance(pos_data, list) and len(pos_data) > 0:
-            pos = pos_data[0]
-            if "y" in pos and "x" in pos:
-                return float(pos["y"]), float(pos["x"])
+        pos = r2.json().get("item", {}).get("pos", {})
+        if pos and "x" in pos and "y" in pos:
+            return float(pos["y"]), float(pos["x"])
     except Exception as e:
         print(f"Ошибка GPS: {e}")
     return None, None
+
+# === АСИНХРОННЫЙ ФОНОВЫЙ СБОР КООРДИНАТ ===
+async def fetch_single_order_coords(order_id, o):
+    # Используем run_in_executor, чтобы не блокировать сервер
+    loop = asyncio.get_event_loop()
+    lat, lng = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
+    if lat and lng:
+        o["current_lat"] = lat
+        o["current_lng"] = lng
+        print(f"✅ GPS получен для {order_id}")
+
+async def update_all_coords():
+    print("⏳ Начинаю фоновое обновление GPS-координат...")
+    tasks = []
+    for order_id, o in DB.items():
+        if o.get("gps_link") and not o.get("current_lat"):
+            tasks.append(fetch_single_order_coords(order_id, o))
+    
+    # Запускаем ВСЕ запросы параллельно (максимум 10 одновременно)
+    semaphore = asyncio.Semaphore(10)
+    async def limited_task(task):
+        async with semaphore:
+            await task
+            
+    await asyncio.gather(*(limited_task(t) for t in tasks))
+    print("✅ Фоновое обновление завершено.")
 
 @app.on_event("startup")
 async def startup():
@@ -68,19 +94,7 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         print(f"✅ Загружено {len(DB)} заказов")
-        asyncio.create_task(update_all_coords())
-
-async def update_all_coords():
-    print("⏳ Начинаю фоновое обновление GPS-координат...")
-    count = 0
-    for o in DB.values():
-        if o.get("gps_link") and not o.get("current_lat"):
-            lat, lng = get_coords_from_baltgps(o["gps_link"])
-            if lat and lng:
-                o["current_lat"] = lat
-                o["current_lng"] = lng
-                count += 1
-    print(f"✅ Координаты обновлены для {count} машин.")
+        asyncio.create_task(update_all_coords()) # Запускаем в фоне
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
@@ -113,7 +127,6 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         weight = x.get("weight") or 0
 
         if sort_by == "gps":
-            # Приоритет 1: Наличие ссылки. Приоритет 2: Наличие координат. Приоритет 3: Номер заказа
             return (not has_link, not has_coords, order_id)
         elif sort_by == "order_id":
             return order_id
@@ -134,17 +147,18 @@ async def get_online_coords(order_id: str):
     if order_id not in DB:
         raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
-    if not o.get("gps_link"):
-        raise HTTPException(404, "Нет GPS ссылки")
     
+    # Если координаты уже есть (загрузились в фоне) - отдаем МГНОВЕННО
     if o.get("current_lat"):
         return {"lat": o["current_lat"], "lng": o["current_lng"]}
         
-    lat, lng = get_coords_from_baltgps(o["gps_link"])
-    if lat and lng:
-        o["current_lat"] = lat
-        o["current_lng"] = lng
-        return {"lat": lat, "lng": lng}
+    # Если координат нет, пробуем получить прямо сейчас
+    if o.get("gps_link"):
+        lat, lng = get_coords_from_baltgps(o["gps_link"])
+        if lat and lng:
+            o["current_lat"] = lat
+            o["current_lng"] = lng
+            return {"lat": lat, "lng": lng}
     
     raise HTTPException(404, "Не удалось получить координаты от GPS")
 
@@ -153,7 +167,7 @@ async def get_report(user=Depends(check_admin)):
     in_transit = [o for o in DB.values() if str(o.get("status", "")).lower() in ['в пути', 'планируется']]
     return {"total": len(in_transit), "with_gps": [o for o in in_transit if o.get("gps_link")], "without_gps": [o for o in in_transit if not o.get("gps_link")]}
 
-# ============ ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС ============
+# ============ ИНТЕРФЕЙС ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -276,9 +290,11 @@ async def user_portal():
             ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>` : ''}
             <div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
             
+        // Если координаты есть в памяти - рисуем моментально
         if (o.current_lat && o.current_lng) {
             renderMap(o.current_lat, o.current_lng);
         } else if (o.gps_link) {
+            // Если нет, запрашиваем у сервера
             try {
                 const res = await fetch(`/api/coords/${o.order_id}`);
                 if (res.ok) {
@@ -311,7 +327,7 @@ async def user_portal():
 </html>
 """
 
-# ============ АДМИН-ПАНЕЛЬ (ОТЧЕТ) ============
+# ============ АДМИН-ПАНЕЛЬ ============
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(user=Depends(check_admin)):
     return """
