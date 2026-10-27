@@ -53,7 +53,7 @@ def get_coords_from_baltgps(gps_link: str):
         if pos and "x" in pos and "y" in pos:
             return float(pos["y"]), float(pos["x"])
     except Exception as e:
-        pass
+        print(f"Ошибка GPS: {e}")
     return None, None
 
 @app.on_event("startup")
@@ -63,6 +63,7 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         print(f"✅ Загружено {len(DB)} заказов")
+        # Фоновое обновление при старте (опционально)
         asyncio.create_task(update_all_coords())
 
 async def update_all_coords():
@@ -87,7 +88,6 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
     result = []
     for o in DB.values():
         s = str(o.get("status", "")).lower()
-        
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         if status == "no_status" and s != '': continue
@@ -99,34 +99,44 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
                 continue
         result.append(o)
     
-    # === СОРТИРОВКА ===
     def sort_key(x):
         has_gps = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
-        city = str(x.get("address") or "").lower() # Приводим к нижнему регистру для алфавитной сортировки
+        city = str(x.get("address") or "").lower()
         arrival = str(x.get("plan_arrival") or "9999-12-31")
         weight = x.get("weight") or 0
 
-        if sort_by == "gps":
-            # Сначала те, у кого есть координаты, затем по номеру заказа
-            return (not has_gps, order_id)
-        elif sort_by == "order_id":
-            # Строго по номеру заказа (ТПК...)
-            return order_id
-        elif sort_by == "city":
-            # По городу (адресу), пустые в конец
-            return (city == "", city, order_id)
-        elif sort_by == "date":
-            # По дате прибытия, пустые в конец
-            return (arrival == "9999-12-31", arrival, order_id)
-        elif sort_by == "weight":
-            # По весу (от тяжелых к легким), пустые в конец
-            return (weight == 0, -weight, order_id)
-        
+        if sort_by == "gps": return (not has_gps, order_id)
+        elif sort_by == "order_id": return order_id
+        elif sort_by == "city": return (city == "", city, order_id)
+        elif sort_by == "date": return (arrival == "9999-12-31", arrival, order_id)
+        elif sort_by == "weight": return (weight == 0, -weight, order_id)
         return (not has_gps, order_id)
 
     result.sort(key=sort_key)
     return result
+
+# НОВЫЙ ЭНДПОИНТ ДЛЯ ОНЛАЙН-ЗАПРОСА GPS
+@app.get("/api/coords/{order_id}")
+async def get_online_coords(order_id: str):
+    if order_id not in DB:
+        raise HTTPException(404, "Заказ не найден")
+    o = DB[order_id]
+    if not o.get("gps_link"):
+        raise HTTPException(404, "Нет GPS ссылки")
+    
+    # Если уже есть координаты - отдаем их
+    if o.get("current_lat"):
+        return {"lat": o["current_lat"], "lng": o["current_lng"]}
+        
+    # Если нет - парсим прямо сейчас
+    lat, lng = get_coords_from_baltgps(o["gps_link"])
+    if lat and lng:
+        o["current_lat"] = lat
+        o["current_lng"] = lng
+        return {"lat": lat, "lng": lng}
+    
+    raise HTTPException(404, "Не удалось получить координаты от GPS")
 
 @app.get("/api/admin/report")
 async def get_report(user=Depends(check_admin)):
@@ -175,9 +185,11 @@ async def user_portal():
     #modal.open { display: block; }
     .modal-content { background: var(--card); max-width: 900px; margin: 40px auto; border-radius: 16px; padding: 28px; position: relative; }
     .modal-close { position: absolute; top: 16px; right: 16px; font-size: 24px; cursor: pointer; border: none; background: none; }
-    #map { height: 400px; margin-top: 20px; border-radius: 12px; }
+    #map { height: 400px; margin-top: 20px; border-radius: 12px; display: flex; align-items: center; justify-content: center; background: #eaeaea; color: #888; }
     .modal-info { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 20px; }
     .modal-info strong { display: block; color: var(--text-sec); font-size: 12px; text-transform: uppercase; }
+    .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin-bottom: 10px; }
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
 </style>
 </head>
 <body>
@@ -217,7 +229,6 @@ async def user_portal():
         
         try {
             const res = await fetch(`/api/shipments?status=${currentTab}&sort_by=${sort}${search ? '&search='+search : ''}`);
-            if (!res.ok) throw new Error("Ошибка сервера");
             const orders = await res.json();
             const grid = document.getElementById('ordersGrid');
             
@@ -241,8 +252,9 @@ async def user_portal():
         }
     }
     
-    function openOrder(o) {
+    async function openOrder(o) {
         document.getElementById('modal').classList.add('open');
+        const mapDiv = document.getElementById('map');
         document.getElementById('modalContent').innerHTML = `<h2>📦 ${o.order_id}</h2>
             <div class="modal-info">
                 <div><strong>Адрес</strong>${o.address || '—'}</div>
@@ -253,19 +265,37 @@ async def user_portal():
                 <div><strong>Прибытие</strong>${o.plan_arrival || '—'}</div>
             </div>
             ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>` : ''}
-            <div id="map"></div>`;
+            <div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
             
         if (o.current_lat && o.current_lng) {
-            if (map) map.remove();
-            map = L.map('map').setView([o.current_lat, o.current_lng], 8);
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
-            L.marker([o.current_lat, o.current_lng]).addTo(map);
+            renderMap(o.current_lat, o.current_lng);
         } else if (o.gps_link) {
-            document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Координаты еще не получены от GPS-сервера. <br><a href="${o.gps_link}" target="_blank">Открыть ссылку</a></div>`;
+            // Делаем запрос на сервер для получения координат
+            try {
+                const res = await fetch(`/api/coords/${o.order_id}`);
+                if (res.ok) {
+                    const data = await res.json();
+                    renderMap(data.lat, data.lng);
+                } else {
+                    document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Не удалось получить координаты.<br><a href="${o.gps_link}" target="_blank" style="color:var(--primary);margin-top:10px;display:block;">Открыть ссылку на GPS</a></div>`;
+                }
+            } catch(e) {
+                document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Ошибка сети.<br><a href="${o.gps_link}" target="_blank">Открыть ссылку на GPS</a></div>`;
+            }
         } else {
             document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>';
         }
     }
+    
+    function renderMap(lat, lng) {
+        const mapDiv = document.getElementById('map');
+        mapDiv.innerHTML = ''; // Очищаем спиннер
+        if (map) map.remove();
+        map = L.map('map').setView([lat, lng], 8);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+        L.marker([lat, lng]).addTo(map);
+    }
+
     function closeModal() { document.getElementById('modal').classList.remove('open'); if(map){map.remove(); map=null;} }
     loadOrders();
     </script>
