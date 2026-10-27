@@ -5,6 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 import os, json, requests, asyncio, io
 import pandas as pd
+import openpyxl
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -127,7 +128,7 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         
-        # Вкладка "С GPS" - ТОЛЬКО ВАЛИДНЫЕ (есть реальные координаты)
+        # Вкладка "С GPS" - только те, у кого реально есть координаты
         if status == "with_gps":
             if not o.get("current_lat"): continue
         
@@ -138,18 +139,14 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         result.append(o)
     
     def sort_key(x):
-        # 1, если есть координаты (карта откроется). Иначе 0.
+        # Приоритет 1 - есть координаты. Приоритет 2 - номер заказа
         is_valid = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
         
-        if sort_by == "gps":
-            # Сначала валидные, затем невалидные
-            return (not is_valid, order_id)
-        elif sort_by == "order_id":
-            return order_id
-        elif sort_by == "city":
-            return (city == "", city, order_id)
+        if sort_by == "gps": return (not is_valid, order_id)
+        elif sort_by == "order_id": return order_id
+        elif sort_by == "city": return (city == "", city, order_id)
         return (not is_valid, order_id)
 
     result.sort(key=sort_key)
@@ -201,20 +198,42 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     global DB
     try:
         contents = await file.read()
-        # Читаем как строки, чтобы избежать проблем с типами и пустыми NaN
-        df = pd.read_excel(io.BytesIO(contents), sheet_name="Исх.логистика", dtype=str)
+        
+        # 1. Открываем через openpyxl и снимаем скрытие со всех строк
+        wb = openpyxl.load_workbook(io.BytesIO(contents))
+        if "Исх.логистика" not in wb.sheetnames:
+            raise HTTPException(400, "В файле нет листа 'Исх.логистика'")
+            
+        ws = wb["Исх.логистика"]
+        for row_idx in range(1, ws.max_row + 1):
+            if ws.row_dimensions[row_idx].hidden:
+                ws.row_dimensions[row_idx].hidden = False
+                
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        
+        # 2. Читаем через pandas. dtype=str — чтобы "тест1" не превратился в NaN
+        df = pd.read_excel(output, sheet_name="Исх.логистика", dtype=str)
         
         new_db = {}
         skipped = 0
+        last_orders = []
         
         for _, row in df.iterrows():
             raw_order = row.get('Заказ')
+            
+            # 3. Строгая проверка на пустоту
             if pd.isna(raw_order) or str(raw_order).strip() == '' or str(raw_order).strip().lower() == 'nan':
                 skipped += 1
                 continue
                 
+            # 4. Очистка пробелов
             order_id = str(raw_order).strip()
+            last_orders.append(order_id)
+            if len(last_orders) > 5: last_orders.pop(0)
             
+            # 5. Безопасный парсинг
             def fmt_date(val):
                 if pd.isna(val) or str(val).strip() == '': return None
                 try: return pd.to_datetime(val).strftime('%Y-%m-%d')
@@ -245,7 +264,9 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         save_db()
         asyncio.create_task(update_all_coords())
         
-        return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}"}
+        # 6. Выводим отладку в сообщение
+        debug_msg = ", ".join(last_orders)
+        return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}. Последние: {debug_msg}"}
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
 
