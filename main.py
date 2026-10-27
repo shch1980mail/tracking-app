@@ -34,7 +34,6 @@ def save_db():
     with open("shipments.json", "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
 
-# === ПАРСИНГ GPS ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None, "no_link"
@@ -42,7 +41,7 @@ def get_coords_from_baltgps(gps_link: str):
         token = gps_link.split("?t=")[-1]
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
-        }, timeout=(2.0, 3.0)) # Уменьшили таймаут для скорости
+        }, timeout=(2.0, 3.0))
         
         data = r.json()
         if "error" in data: return None, None, "invalid_token"
@@ -62,7 +61,7 @@ def get_coords_from_baltgps(gps_link: str):
         if pos and "x" in pos and "y" in pos:
             return float(pos["y"]), float(pos["x"]), "ok"
         return None, None, "no_data"
-    except Exception as e:
+    except Exception:
         return None, None, "error"
 
 async def fetch_single_order_coords(order_id, o):
@@ -90,7 +89,7 @@ async def update_all_coords():
         if o.get("gps_link") and o.get("has_valid_gps") is not False:
             tasks.append(fetch_single_order_coords(order_id, o))
     
-    semaphore = asyncio.Semaphore(15) # Увеличили до 15 потоков для скорости
+    semaphore = asyncio.Semaphore(15)
     async def limited_task(task):
         async with semaphore: await task
     await asyncio.gather(*(limited_task(t) for t in tasks))
@@ -110,7 +109,6 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# === API ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
@@ -123,7 +121,6 @@ async def set_tabs(s: dict, user=Depends(check_admin)):
 
 @app.get("/api/shipments")
 async def list_shipments(status: Optional[str] = None, search: Optional[str] = None, sort_by: str = "gps", force_refresh: bool = False):
-    # Если передан force_refresh=True, запускаем обновление в фоне (но не ждем его)
     if force_refresh:
         asyncio.create_task(update_all_coords())
 
@@ -132,7 +129,6 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         s = str(o.get("status", "")).lower()
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
-        
         if status == "with_gps":
             if not o.get("current_lat"): continue
         
@@ -159,9 +155,7 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
 async def get_online_coords(order_id: str):
     if order_id not in DB: raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
-    
     if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
-    
     if o.get("gps_link") and o.get("has_valid_gps") is not False:
         lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
@@ -174,10 +168,8 @@ async def get_online_coords(order_id: str):
             o["has_valid_gps"] = False
             o["gps_status"] = status
             save_db()
-            
     raise HTTPException(404, "GPS недоступен")
 
-# === АДМИНКА ===
 @app.get("/api/admin/shipments")
 async def admin_list(user=Depends(check_admin)):
     return list(DB.values())
@@ -202,7 +194,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     global DB
     try:
         contents = await file.read()
-        
         wb = openpyxl.load_workbook(io.BytesIO(contents))
         if "Исх.логистика" not in wb.sheetnames:
             raise HTTPException(400, "В файле нет листа 'Исх.логистика'")
@@ -224,7 +215,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         
         for _, row in df.iterrows():
             raw_order = row.get('Заказ')
-            
             if pd.isna(raw_order) or str(raw_order).strip() == '' or str(raw_order).strip().lower() == 'nan':
                 skipped += 1
                 continue
@@ -267,7 +257,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}. Последние: {debug_msg}"}
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
-
 
 # ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
@@ -367,7 +356,6 @@ async def user_portal():
         const sort = document.getElementById('sortSelect').value;
         document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;">Загрузка...</div>';
         
-        // Добавляем случайный параметр только если force_refresh = true (по кнопке)
         const cacheParam = force_refresh ? `&force_refresh=true&_t=${Date.now()}` : '';
         const url = `/api/shipments?status=${currentTab}&sort_by=${sort}${search ? '&search='+search : ''}${cacheParam}`;
         
@@ -437,3 +425,209 @@ async def user_portal():
 </body>
 </html>
 """
+
+# ============ АДМИН-ПАНЕЛЬ ============
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_panel(user=Depends(check_admin)):
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Админ-панель</title>
+        <style>
+            body { font-family: Arial; padding: 20px; background: #f0f2f5; margin: 0; }
+            .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+            .btn { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+            .btn-green { background: #28a745; color: white; }
+            .btn-blue { background: #007bff; color: white; }
+            .btn-red { background: #dc3545; color: white; }
+            .panel { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; }
+            .panel h3 { margin-top: 0; }
+            .upload-box { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+            .settings-grid { display: flex; gap: 20px; margin-top: 10px; }
+            .settings-grid label { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+            table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background: #333; color: white; position: sticky; top: 0; }
+            tr:hover { background: #f0f8ff; }
+            #filter { padding: 10px; width: 300px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 6px; }
+            #modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index: 1000; }
+            #modalContent { background:white; max-width:600px; margin:80px auto; padding:30px; border-radius:8px; max-height:80vh; overflow-y:auto; }
+            #modalContent label { display:block; margin-top:10px; font-weight:bold; }
+            #modalContent input, #modalContent select { width:100%; padding:8px; box-sizing:border-box; margin-top:4px; }
+            .modal-buttons { margin-top:20px; text-align:right; }
+            #uploadStatus { font-weight: bold; margin-left: 10px; }
+        </style>
+    </head>
+    <body>
+        <div class="top-bar">
+            <h1>🚚 Управление перевозками</h1>
+            <button class="btn btn-green" onclick="openAdd()">➕ Добавить заказ</button>
+        </div>
+        
+        <div class="panel">
+            <h3>👁️ Видимость вкладок на главной</h3>
+            <div class="settings-grid">
+                <label><input type="checkbox" id="chk_in_transit" onchange="saveTabs()"> 🚚 В пути</label>
+                <label><input type="checkbox" id="chk_delivered" onchange="saveTabs()"> ✅ Выгружено</label>
+                <label><input type="checkbox" id="chk_with_gps" onchange="saveTabs()"> 📍 С GPS</label>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h3>📥 Загрузка данных из Excel</h3>
+            <div class="upload-box">
+                <input type="file" id="excelFile" accept=".xlsx, .xls">
+                <button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
+                <span id="uploadStatus"></span>
+            </div>
+            <p style="font-size: 12px; color: #666; margin-top: 10px;">Берется лист <b>"Исх.логистика"</b>. Предыдущая база полностью заменяется.</p>
+        </div>
+
+        <input id="filter" placeholder="Поиск по номеру или адресу..." oninput="renderTable()"/>
+        <table id="shipments">
+            <thead><tr><th>Заказ</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Действия</th></tr></thead>
+            <tbody></tbody>
+        </table>
+        <div id="modal">
+            <div id="modalContent">
+                <h2 id="modalTitle">Добавить заказ</h2>
+                <label>Номер заказа *</label><input id="f_order_id"/>
+                <label>Адрес доставки</label><input id="f_address"/>
+                <label>Вес</label><input id="f_weight" type="number"/>
+                <label>Перевозчик</label><input id="f_carrier"/>
+                <label>Машина</label><input id="f_vehicle"/>
+                <label>Водитель</label><input id="f_driver"/>
+                <label>GPS-ссылка</label><input id="f_gps_link"/>
+                <label>Примечание</label><input id="f_comment"/>
+                <label>План. прибытие</label><input id="f_plan_arrival" type="date"/>
+                <label>Статус</label>
+                <select id="f_status">
+                    <option value="">Без статуса</option>
+                    <option value="планируется">планируется</option>
+                    <option value="в пути">в пути</option>
+                    <option value="выгружено">выгружено</option>
+                    <option value="завершено">завершено</option>
+                </select>
+                <div class="modal-buttons">
+                    <button class="btn" onclick="closeModal()">Отмена</button>
+                    <button class="btn btn-green" onclick="saveOrder()">Сохранить</button>
+                </div>
+            </div>
+        </div>
+        <script>
+        let allData=[];
+        async function loadSettings() {
+            const res = await fetch('/api/settings/tabs');
+            const s = await res.json();
+            document.getElementById('chk_in_transit').checked = s.show_in_transit !== false;
+            document.getElementById('chk_delivered').checked = s.show_delivered !== false;
+            document.getElementById('chk_with_gps').checked = s.show_with_gps !== false;
+        }
+        async function saveTabs() {
+            const payload = {
+                show_in_transit: document.getElementById('chk_in_transit').checked,
+                show_delivered: document.getElementById('chk_delivered').checked,
+                show_with_gps: document.getElementById('chk_with_gps').checked
+            };
+            await fetch('/api/admin/settings/tabs', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
+        }
+
+        async function load(){
+            const res = await fetch('/api/admin/shipments'); allData = await res.json();
+            renderTable();
+        }
+        function renderTable(){
+            const q = document.getElementById('filter').value.toLowerCase(); 
+            let filtered = allData.filter(s => (s.order_id||'').toLowerCase().includes(q) || (s.address||'').toLowerCase().includes(q));
+            document.querySelector('#shipments tbody').innerHTML = filtered.map(s=>`
+                <tr>
+                    <td><b>${s.order_id}</b></td>
+                    <td>${s.address||''}</td>
+                    <td>${s.carrier||''}</td>
+                    <td>${s.vehicle||''}</td>
+                    <td>${s.status||'—'}</td>
+                    <td>
+                        <button class="btn btn-blue" style="padding:4px 8px;" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
+                        <button class="btn btn-red" style="padding:4px 8px;" onclick="del('${s.order_id}')">🗑</button>
+                    </td>
+                </tr>
+            `).join('');
+        }
+        function openAdd(){ 
+            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f=>document.getElementById('f_'+f).value=''); 
+            document.getElementById('f_order_id').disabled=false;
+            document.getElementById('f_status').value=''; 
+            document.getElementById('modalTitle').innerText='Добавить заказ'; 
+            document.getElementById('modal').style.display='block'; 
+        }
+        function openEdit(s){ 
+            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f=>document.getElementById('f_'+f).value=s[f]||''); 
+            document.getElementById('f_order_id').disabled=true; 
+            document.getElementById('f_status').value=s.status||''; 
+            document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id; 
+            document.getElementById('modal').style.display='block'; 
+        }
+        function closeModal(){ document.getElementById('modal').style.display='none'; }
+        async function saveOrder(){
+            const payload = { 
+                order_id: document.getElementById('f_order_id').value, 
+                address: document.getElementById('f_address').value, 
+                weight: parseFloat(document.getElementById('f_weight').value)||null,
+                carrier: document.getElementById('f_carrier').value, 
+                vehicle: document.getElementById('f_vehicle').value, 
+                driver: document.getElementById('f_driver').value,
+                gps_link: document.getElementById('f_gps_link').value,
+                comment: document.getElementById('f_comment').value,
+                plan_arrival: document.getElementById('f_plan_arrival').value,
+                status: document.getElementById('f_status').value 
+            };
+            await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+            closeModal(); load();
+        }
+        async function del(order_id){ 
+            if(!confirm('Удалить '+order_id+'?')) return; 
+            await fetch('/api/admin/shipments/'+order_id,{method:'DELETE'}); load(); 
+        }
+        
+        async function uploadExcel() {
+            const fileInput = document.getElementById('excelFile');
+            if (!fileInput.files.length) { alert("Выберите файл!"); return; }
+            
+            const formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+            
+            const btn = document.getElementById('uploadBtn');
+            const status = document.getElementById('uploadStatus');
+            
+            btn.disabled = true;
+            btn.innerText = "⏳ Обработка...";
+            status.innerText = "Пожалуйста, подождите...";
+            status.style.color = "blue";
+            
+            try {
+                const res = await fetch('/api/admin/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (res.ok) {
+                    status.innerText = "✅ " + data.message + " (" + new Date().toLocaleTimeString() + ")";
+                    status.style.color = "green";
+                    load();
+                } else {
+                    status.innerText = "❌ Ошибка: " + data.detail;
+                    status.style.color = "red";
+                }
+            } catch(e) {
+                status.innerText = "❌ Ошибка сети";
+                status.style.color = "red";
+            } finally {
+                btn.disabled = false;
+                btn.innerText = "Обновить базу из файла";
+            }
+        }
+
+        loadSettings();
+        load();
+        </script>
+    </body>
+    </html>
+    """
