@@ -1,6 +1,0 @@
-fastapi
-uvicorn
-asyncpg
-httpx
-requests
-playwright
