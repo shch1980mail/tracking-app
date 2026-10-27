@@ -13,7 +13,6 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
 DB = {}
-# Настройки видимости вкладок (по умолчанию все включены)
 SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
 
 class Shipment(BaseModel):
@@ -78,7 +77,6 @@ async def fetch_single_order_coords(order_id, o):
         o["gps_status"] = status
 
 async def update_all_coords():
-    # Принудительно сбрасываем координаты у всех, кто уже известен как невалидный
     for o in DB.values():
         if o.get("has_valid_gps") is False:
             o["current_lat"] = None
@@ -109,7 +107,6 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# === API ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
@@ -128,7 +125,6 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         
-        # Вкладка "С GPS" - ТОЛЬКО ВАЛИДНЫЕ
         if status == "with_gps":
             if not o.get("current_lat"): continue
         
@@ -139,18 +135,12 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         result.append(o)
     
     def sort_key(x):
-        # 1, если есть координаты (карта точно откроется). Иначе 0.
         is_valid = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
-        
-        if sort_by == "gps":
-            # Сначала валидные (по номеру), затем невалидные (по номеру)
-            return (not is_valid, order_id)
-        elif sort_by == "order_id":
-            return order_id
-        elif sort_by == "city":
-            return (city == "", city, order_id)
+        if sort_by == "gps": return (not is_valid, order_id)
+        elif sort_by == "order_id": return order_id
+        elif sort_by == "city": return (city == "", city, order_id)
         return (not is_valid, order_id)
 
     result.sort(key=sort_key)
@@ -160,9 +150,7 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
 async def get_online_coords(order_id: str):
     if order_id not in DB: raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
-    
     if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
-    
     if o.get("gps_link") and o.get("has_valid_gps") is not False:
         lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
@@ -175,7 +163,6 @@ async def get_online_coords(order_id: str):
             o["has_valid_gps"] = False
             o["gps_status"] = status
             save_db()
-            
     raise HTTPException(404, "GPS недоступен")
 
 @app.get("/api/admin/shipments")
@@ -202,13 +189,21 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     global DB
     try:
         contents = await file.read()
-        # Четко указываем лист
+        # Читаем Excel, принудительно беря все строки
         df = pd.read_excel(io.BytesIO(contents), sheet_name="Исх.логистика")
+        
+        # Убираем пустые строки, но оставляем ВСЕ, где есть хоть какой-то текст в "Заказ"
         df = df.dropna(subset=['Заказ'])
         
         new_db = {}
+        skipped = 0
         for _, row in df.iterrows():
+            # Берем номер заказа как строку, даже если это число или текст
             order_id = str(row['Заказ']).strip()
+            if not order_id or order_id == 'nan':
+                skipped += 1
+                continue
+                
             def safe_float(val):
                 try: return float(str(val).replace(',', '.')) if not pd.isna(val) else None
                 except: return None
@@ -229,16 +224,16 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
                 "gps_link": gps,
                 "comment": str(row.get('Примечания', '')) if not pd.isna(row.get('Примечания')) else None,
                 "status": str(row.get('статус доставки', '')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
-                "has_valid_gps": None # Принудительно сбрасываем статус
+                "has_valid_gps": None
             }
         DB = new_db
         save_db()
         asyncio.create_task(update_all_coords())
-        return {"ok": True, "message": f"Успешно загружено {len(DB)} заказов"}
+        return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}"}
     except Exception as e:
         raise HTTPException(500, f"Ошибка: {str(e)}")
 
-# ============ ГЛАВНАЯ СТРАНИЦА ============
+# ============ ИНТЕРФЕЙС ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -307,7 +302,6 @@ async def user_portal():
     <div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
     <script>
     let currentTab = 'in_transit'; let map = null;
-    
     function toggleTheme() { const isDark = document.documentElement.getAttribute('data-theme') === 'dark'; document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark'); localStorage.setItem('theme', isDark ? 'light' : 'dark'); }
     document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
     
@@ -317,13 +311,8 @@ async def user_portal():
         document.querySelectorAll('.tab').forEach(tab => {
             const status = tab.dataset.status;
             const key = 'show_' + status;
-            if (settings[key] !== false) {
-                tab.classList.add('visible');
-            } else {
-                tab.classList.remove('visible');
-            }
+            if (settings[key] !== false) { tab.classList.add('visible'); } else { tab.classList.remove('visible'); }
         });
-        // Если текущая вкладка скрыта, переключаем на первую видимую
         const activeTab = document.querySelector('.tab.active');
         if (activeTab && !activeTab.classList.contains('visible')) {
             const firstVisible = document.querySelector('.tab.visible');
@@ -580,7 +569,7 @@ async def admin_panel(user=Depends(check_admin)):
                 if (res.ok) {
                     status.innerText = "✅ " + data.message + " (" + new Date().toLocaleTimeString() + ")";
                     status.style.color = "green";
-                    load(); // Обновляем таблицу
+                    load();
                 } else {
                     status.innerText = "❌ Ошибка: " + data.detail;
                     status.style.color = "red";
