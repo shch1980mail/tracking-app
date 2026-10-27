@@ -5,3 +5,4 @@ pydantic
 pandas
 openpyxl
 python-multipart
+maxapi-sdk
