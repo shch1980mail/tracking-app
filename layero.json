@@ -1,4 +1,6 @@
 {
+  "$schema": "https://layero.ru/schema/layero-v2.json",
+  "framework": "generic",
   "runtime": "python_web",
   "startCommand": "uvicorn main:app --host 0.0.0.0 --port $PORT"
 }
