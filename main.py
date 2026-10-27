@@ -7,8 +7,8 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ БОТА MAX ===
-from maxapi import Bot, Dispatcher, F
+# === ИМПОРТЫ ДЛЯ БОТА MAX (БЕЗ F) ===
+from maxapi import Bot, Dispatcher
 from maxapi.types import MessageCreated
 
 app = FastAPI(title="ТПК Отслеживание")
@@ -107,9 +107,13 @@ async def update_all_coords():
     save_db()
     print("✅ Фоновая проверка GPS завершена.")
 
-# === ОБРАБОТЧИК СООБЩЕНИЙ БОТА MAX ===
-@max_dp.message_created(F.message.body.text)
+# === ОБРАБОТЧИК СООБЩЕНИЙ БОТА MAX (БЕЗ ФИЛЬТРА F) ===
+@max_dp.message_created()
 async def handle_order_request(event: MessageCreated):
+    # Ручная проверка: если это не текст, игнорируем
+    if not event.message.body or not event.message.body.text:
+        return
+
     order_id = event.message.body.text.strip().upper()
     
     if order_id not in DB:
