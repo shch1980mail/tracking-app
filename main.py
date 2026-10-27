@@ -33,6 +33,7 @@ def save_db():
     with open("shipments.json", "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
 
+# === ПАРСИНГ GPS ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None, "no_link"
@@ -107,6 +108,7 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
+# === API ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
@@ -125,6 +127,7 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         
+        # Вкладка "С GPS" - ТОЛЬКО ВАЛИДНЫЕ (есть реальные координаты)
         if status == "with_gps":
             if not o.get("current_lat"): continue
         
@@ -135,12 +138,18 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         result.append(o)
     
     def sort_key(x):
+        # 1, если есть координаты (карта откроется). Иначе 0.
         is_valid = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
-        if sort_by == "gps": return (not is_valid, order_id)
-        elif sort_by == "order_id": return order_id
-        elif sort_by == "city": return (city == "", city, order_id)
+        
+        if sort_by == "gps":
+            # Сначала валидные, затем невалидные
+            return (not is_valid, order_id)
+        elif sort_by == "order_id":
+            return order_id
+        elif sort_by == "city":
+            return (city == "", city, order_id)
         return (not is_valid, order_id)
 
     result.sort(key=sort_key)
@@ -150,7 +159,9 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
 async def get_online_coords(order_id: str):
     if order_id not in DB: raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
+    
     if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
+    
     if o.get("gps_link") and o.get("has_valid_gps") is not False:
         lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
@@ -163,6 +174,7 @@ async def get_online_coords(order_id: str):
             o["has_valid_gps"] = False
             o["gps_status"] = status
             save_db()
+            
     raise HTTPException(404, "GPS недоступен")
 
 @app.get("/api/admin/shipments")
@@ -189,51 +201,55 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     global DB
     try:
         contents = await file.read()
-        # Читаем Excel, принудительно беря все строки
-        df = pd.read_excel(io.BytesIO(contents), sheet_name="Исх.логистика")
-        
-        # Убираем пустые строки, но оставляем ВСЕ, где есть хоть какой-то текст в "Заказ"
-        df = df.dropna(subset=['Заказ'])
+        # Читаем как строки, чтобы избежать проблем с типами и пустыми NaN
+        df = pd.read_excel(io.BytesIO(contents), sheet_name="Исх.логистика", dtype=str)
         
         new_db = {}
         skipped = 0
+        
         for _, row in df.iterrows():
-            # Берем номер заказа как строку, даже если это число или текст
-            order_id = str(row['Заказ']).strip()
-            if not order_id or order_id == 'nan':
+            raw_order = row.get('Заказ')
+            if pd.isna(raw_order) or str(raw_order).strip() == '' or str(raw_order).strip().lower() == 'nan':
                 skipped += 1
                 continue
                 
-            def safe_float(val):
-                try: return float(str(val).replace(',', '.')) if not pd.isna(val) else None
-                except: return None
+            order_id = str(raw_order).strip()
+            
             def fmt_date(val):
-                try: return pd.to_datetime(val).strftime('%Y-%m-%d') if not pd.isna(val) else None
+                if pd.isna(val) or str(val).strip() == '': return None
+                try: return pd.to_datetime(val).strftime('%Y-%m-%d')
                 except: return str(val)[:10]
 
-            gps = str(row.get('ссылка', '')) if not pd.isna(row.get('ссылка')) else None
+            def safe_float(val):
+                if pd.isna(val) or str(val).strip() == '': return None
+                try: return float(str(val).replace(',', '.').strip())
+                except: return None
+
+            gps = str(row.get('ссылка')).strip() if not pd.isna(row.get('ссылка')) else None
             
             new_db[order_id] = {
                 "order_id": order_id,
-                "address": str(row.get('Адрес доставки', '')) if not pd.isna(row.get('Адрес доставки')) else None,
+                "address": str(row.get('Адрес доставки')).strip() if not pd.isna(row.get('Адрес доставки')) else None,
                 "weight": safe_float(row.get('вес')),
                 "plan_arrival": fmt_date(row.get('Дата прибытия')),
-                "carrier": str(row.get('Перевозчик', '')) if not pd.isna(row.get('Перевозчик')) else None,
-                "vehicle": str(row.get('Машина', '')) if not pd.isna(row.get('Машина')) else None,
-                "driver": str(row.get('Водитель', '')) if not pd.isna(row.get('Водитель')) else None,
+                "carrier": str(row.get('Перевозчик')).strip() if not pd.isna(row.get('Перевозчик')) else None,
+                "vehicle": str(row.get('Машина')).strip() if not pd.isna(row.get('Машина')) else None,
+                "driver": str(row.get('Водитель')).strip() if not pd.isna(row.get('Водитель')) else None,
                 "gps_link": gps,
-                "comment": str(row.get('Примечания', '')) if not pd.isna(row.get('Примечания')) else None,
-                "status": str(row.get('статус доставки', '')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
+                "comment": str(row.get('Примечания')).strip() if not pd.isna(row.get('Примечания')) else None,
+                "status": str(row.get('статус доставки')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
                 "has_valid_gps": None
             }
+            
         DB = new_db
         save_db()
         asyncio.create_task(update_all_coords())
+        
         return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}"}
     except Exception as e:
-        raise HTTPException(500, f"Ошибка: {str(e)}")
+        raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
 
-# ============ ИНТЕРФЕЙС ============
+# ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
