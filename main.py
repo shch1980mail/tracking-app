@@ -7,9 +7,8 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ БОТА MAX ===
+# === ИМПОРТЫ ДЛЯ БОТА MAX (БЕЗ MessageCreated) ===
 from maxapi import Bot, Dispatcher
-from maxapi.types import MessageCreated
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -21,7 +20,7 @@ DB = {}
 SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
 
 # === НАСТРОЙКА БОТА MAX ===
-MAX_BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ" 
+MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
@@ -106,38 +105,39 @@ async def update_all_coords():
     save_db()
     print("✅ Фоновая проверка GPS завершена.")
 
-# === ЛОГИКА БОТА MAX ===
+# === ОБРАБОТЧИК БОТА MAX (БЕЗ MessageCreated) ===
 @max_dp.message_created()
-async def handle_message(event: MessageCreated):
+async def handle_message(event):
+    # Проверка, что это текстовое сообщение
+    if not event.message or not event.message.body or not event.message.body.text:
+        return
+
     text = event.message.body.text.strip()
-    
-    # Если пользователь нажал "Выбрать заказ"
+
+    # Логика выбора заказа
     if text == "📋 Выбрать заказ":
-        # Показываем список заказов (например, первые 10 в пути с GPS)
         active_orders = [o for o in DB.values() if o.get("status") == "в пути" and o.get("current_lat")]
         if not active_orders:
             await event.message.answer("Нет активных заказов с GPS.")
             return
-            
-        text = "Выберите заказ:\n"
-        for o in active_orders[:10]:  # Ограничиваем для удобства
-            text += f"• {o['order_id']} ({o.get('address', '—')})\n"
-        text += "\nОтправьте номер заказа для подробностей."
         
-        await event.message.answer(text)
+        response = "Выберите заказ (отправьте номер):\n"
+        for o in active_orders[:15]:
+            response += f"• {o['order_id']} ({o.get('address', '—')})\n"
+        
+        await event.message.answer(response)
         return
-    
-    # Если пришел номер заказа
+
+    # Если введен номер заказа
     order_id = text.upper()
     if order_id in DB:
         o = DB[order_id]
-        # Получаем координаты, если их нет
         lat, lng = o.get("current_lat"), o.get("current_lng")
         if not lat and o.get("gps_link"):
             lat, lng, _ = get_coords_from_baltgps(o["gps_link"])
             if lat:
                 o["current_lat"], o["current_lng"] = lat, lng
-                
+
         response = (
             f"📦 Заказ: {o['order_id']}\n"
             f"📍 Адрес: {o.get('address', '—')}\n"
@@ -147,7 +147,7 @@ async def handle_message(event: MessageCreated):
         )
         if o.get('comment'):
             response += f"📝 Примечание: {o['comment']}\n"
-            
+        
         if lat and lng:
             response += f"🗺️ [Точка на карте](https://yandex.ru/maps/?pt={lng},{lat}&z=12)"
         else:
@@ -155,10 +155,9 @@ async def handle_message(event: MessageCreated):
             
         await event.message.answer(response)
     else:
-        await event.message.answer("❌ Заказ не найден. Попробуйте снова или нажмите «Выбрать заказ».")
+        await event.message.answer("❌ Заказ не найден. Попробуйте снова или напишите «Выбрать заказ».")
 
 async def run_max_bot():
-    # Отправляем приветственное сообщение с кнопкой (если нужно)
     await max_dp.start_polling(max_bot)
 
 @app.on_event("startup")
@@ -177,7 +176,7 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# === API ===
+# === API ДЛЯ САЙТА ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
