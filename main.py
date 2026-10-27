@@ -33,9 +33,11 @@ def get_coords_from_baltgps(gps_link: str):
         return None, None
     try:
         token = gps_link.split("?t=")[-1]
+        # 1. Авторизация
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
-        }, timeout=5)
+        }, timeout=(3.05, 10))
+        
         data = r.json()
         if "token" not in data: return None, None
         
@@ -45,13 +47,16 @@ def get_coords_from_baltgps(gps_link: str):
         unit_id = items[0]
         sid = data.get("eid")
         
+        # 2. Запрос последней позиции
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
-            "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
-        }, timeout=5)
+            "svc": "unit/calc_last", "params": json.dumps([unit_id]), "sid": sid
+        }, timeout=(3.05, 10))
         
-        pos = r2.json().get("item", {}).get("pos", {})
-        if pos and "x" in pos and "y" in pos:
-            return float(pos["y"]), float(pos["x"])
+        pos_data = r2.json()
+        if isinstance(pos_data, list) and len(pos_data) > 0:
+            pos = pos_data[0]
+            if "y" in pos and "x" in pos:
+                return float(pos["y"]), float(pos["x"])
     except Exception as e:
         print(f"Ошибка GPS: {e}")
     return None, None
@@ -63,7 +68,6 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         print(f"✅ Загружено {len(DB)} заказов")
-        # Фоновое обновление при старте (опционально)
         asyncio.create_task(update_all_coords())
 
 async def update_all_coords():
@@ -99,24 +103,32 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
                 continue
         result.append(o)
     
+    # === ИСПРАВЛЕННАЯ СОРТИРОВКА ===
     def sort_key(x):
-        has_gps = 1 if x.get("current_lat") else 0
+        has_link = 1 if x.get("gps_link") else 0
+        has_coords = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
         arrival = str(x.get("plan_arrival") or "9999-12-31")
         weight = x.get("weight") or 0
 
-        if sort_by == "gps": return (not has_gps, order_id)
-        elif sort_by == "order_id": return order_id
-        elif sort_by == "city": return (city == "", city, order_id)
-        elif sort_by == "date": return (arrival == "9999-12-31", arrival, order_id)
-        elif sort_by == "weight": return (weight == 0, -weight, order_id)
-        return (not has_gps, order_id)
+        if sort_by == "gps":
+            # Приоритет 1: Наличие ссылки. Приоритет 2: Наличие координат. Приоритет 3: Номер заказа
+            return (not has_link, not has_coords, order_id)
+        elif sort_by == "order_id":
+            return order_id
+        elif sort_by == "city":
+            return (city == "", city, order_id)
+        elif sort_by == "date":
+            return (arrival == "9999-12-31", arrival, order_id)
+        elif sort_by == "weight":
+            return (weight == 0, -weight, order_id)
+        
+        return (not has_link, not has_coords, order_id)
 
     result.sort(key=sort_key)
     return result
 
-# НОВЫЙ ЭНДПОИНТ ДЛЯ ОНЛАЙН-ЗАПРОСА GPS
 @app.get("/api/coords/{order_id}")
 async def get_online_coords(order_id: str):
     if order_id not in DB:
@@ -125,11 +137,9 @@ async def get_online_coords(order_id: str):
     if not o.get("gps_link"):
         raise HTTPException(404, "Нет GPS ссылки")
     
-    # Если уже есть координаты - отдаем их
     if o.get("current_lat"):
         return {"lat": o["current_lat"], "lng": o["current_lng"]}
         
-    # Если нет - парсим прямо сейчас
     lat, lng = get_coords_from_baltgps(o["gps_link"])
     if lat and lng:
         o["current_lat"] = lat
@@ -143,7 +153,7 @@ async def get_report(user=Depends(check_admin)):
     in_transit = [o for o in DB.values() if str(o.get("status", "")).lower() in ['в пути', 'планируется']]
     return {"total": len(in_transit), "with_gps": [o for o in in_transit if o.get("gps_link")], "without_gps": [o for o in in_transit if not o.get("gps_link")]}
 
-# ============ ИНТЕРФЕЙС ============
+# ============ ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -254,7 +264,6 @@ async def user_portal():
     
     async function openOrder(o) {
         document.getElementById('modal').classList.add('open');
-        const mapDiv = document.getElementById('map');
         document.getElementById('modalContent').innerHTML = `<h2>📦 ${o.order_id}</h2>
             <div class="modal-info">
                 <div><strong>Адрес</strong>${o.address || '—'}</div>
@@ -270,14 +279,13 @@ async def user_portal():
         if (o.current_lat && o.current_lng) {
             renderMap(o.current_lat, o.current_lng);
         } else if (o.gps_link) {
-            // Делаем запрос на сервер для получения координат
             try {
                 const res = await fetch(`/api/coords/${o.order_id}`);
                 if (res.ok) {
                     const data = await res.json();
                     renderMap(data.lat, data.lng);
                 } else {
-                    document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Не удалось получить координаты.<br><a href="${o.gps_link}" target="_blank" style="color:var(--primary);margin-top:10px;display:block;">Открыть ссылку на GPS</a></div>`;
+                    document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Спутник не отвечает.<br><a href="${o.gps_link}" target="_blank" style="color:var(--primary);margin-top:10px;display:block;">Открыть ссылку на GPS</a></div>`;
                 }
             } catch(e) {
                 document.getElementById('map').innerHTML = `<div style="text-align:center;padding:50px;color:#888;">Ошибка сети.<br><a href="${o.gps_link}" target="_blank">Открыть ссылку на GPS</a></div>`;
@@ -289,7 +297,7 @@ async def user_portal():
     
     function renderMap(lat, lng) {
         const mapDiv = document.getElementById('map');
-        mapDiv.innerHTML = ''; // Очищаем спиннер
+        mapDiv.innerHTML = '';
         if (map) map.remove();
         map = L.map('map').setView([lat, lng], 8);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
@@ -302,3 +310,68 @@ async def user_portal():
 </body>
 </html>
 """
+
+# ============ АДМИН-ПАНЕЛЬ (ОТЧЕТ) ============
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_panel(user=Depends(check_admin)):
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>Админ-панель: Отчет по транспорту</title>
+        <style>
+            body { font-family: Arial; padding: 20px; background: #f0f2f5; }
+            h2 { margin-top: 30px; color: #333; }
+            table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
+            th { background: #007bff; color: white; position: sticky; top: 0; }
+            tr:hover { background: #f0f8ff; }
+            .no-gps { background: #fff3cd; }
+            .gps-yes { color: green; font-weight: bold; }
+        </style>
+    </head>
+    <body>
+        <h1>📊 Отчет: Транспорт в пути</h1>
+        <p>Разделение машин по наличию GPS-трекинга.</p>
+        
+        <h2>🟢 В пути с GPS (Базовый трекинг)</h2>
+        <table id="table-gps">
+            <thead><tr><th>Заказ</th><th>Машина</th><th>Адрес</th><th>GPS Ссылка</th><th>Примечание</th></tr></thead>
+            <tbody></tbody>
+        </table>
+
+        <h2>🟡 В пути без GPS (Только по примечанию)</h2>
+        <table id="table-no-gps">
+            <thead><tr><th>Заказ</th><th>Машина</th><th>Адрес</th><th>Примечание (Местоположение)</th></tr></thead>
+            <tbody></tbody>
+        </table>
+
+        <script>
+        async function loadReport() {
+            const res = await fetch('/api/admin/report');
+            const data = await res.json();
+            
+            document.querySelector('#table-gps tbody').innerHTML = data.with_gps.map(o => `
+                <tr>
+                    <td><b>${o.order_id}</b></td>
+                    <td>${o.vehicle || '—'}</td>
+                    <td>${o.address || '—'}</td>
+                    <td><a href="${o.gps_link}" target="_blank" class="gps-yes">📍 Открыть</a></td>
+                    <td>${o.comment || '—'}</td>
+                </tr>
+            `).join('');
+            
+            document.querySelector('#table-no-gps tbody').innerHTML = data.without_gps.map(o => `
+                <tr class="no-gps">
+                    <td><b>${o.order_id}</b></td>
+                    <td>${o.vehicle || '—'}</td>
+                    <td>${o.address || '—'}</td>
+                    <td><b>${o.comment || 'Нет данных о местоположении'}</b></td>
+                </tr>
+            `).join('');
+        }
+        loadReport();
+        </script>
+    </body>
+    </html>
+    """
