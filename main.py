@@ -32,7 +32,6 @@ def save_db():
     with open("shipments.json", "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
 
-# === ПАРСИНГ GPS ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None, "no_link"
@@ -71,15 +70,23 @@ async def fetch_single_order_coords(order_id, o):
         o["current_lng"] = lng
         o["has_valid_gps"] = True
     else:
+        o["current_lat"] = None
+        o["current_lng"] = None
         o["has_valid_gps"] = False
-        if status in ["invalid_token", "error"]:
-            o["gps_status"] = "invalid"
+        o["gps_status"] = status
 
 async def update_all_coords():
+    # Принудительно сбрасываем координаты у тех, у кого уже известно, что GPS невалиден
+    for o in DB.values():
+        if o.get("has_valid_gps") is False:
+            o["current_lat"] = None
+            o["current_lng"] = None
+
     tasks = []
     for order_id, o in DB.items():
-        if o.get("gps_link") and not o.get("current_lat"):
+        if o.get("gps_link") and not o.get("current_lat") and o.get("has_valid_gps") is not False:
             tasks.append(fetch_single_order_coords(order_id, o))
+    
     semaphore = asyncio.Semaphore(10)
     async def limited_task(task):
         async with semaphore: await task
@@ -99,7 +106,6 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# === API ===
 @app.get("/api/shipments")
 async def list_shipments(status: Optional[str] = None, search: Optional[str] = None, sort_by: str = "gps"):
     result = []
@@ -108,7 +114,7 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         
-        # Вкладка "С GPS" - ТОЛЬКО ВАЛИДНЫЕ (есть реальные координаты)
+        # Вкладка "С GPS" - ТОЛЬКО ТЕ, ГДЕ ЕСТЬ КООРДИНАТЫ
         if status == "with_gps":
             if not o.get("current_lat"): continue
         
@@ -119,12 +125,18 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         result.append(o)
     
     def sort_key(x):
+        # Валидным считаем только если есть реальные координаты
         is_valid = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
+        city = str(x.get("address") or "").lower()
         
-        if sort_by == "gps": return (not is_valid, order_id)
-        elif sort_by == "order_id": return order_id
-        elif sort_by == "city": return (str(x.get("address") or "").lower(), order_id)
+        if sort_by == "gps":
+            # Сначала все с координатами (по порядку номеров), затем все остальные
+            return (not is_valid, order_id)
+        elif sort_by == "order_id":
+            return order_id
+        elif sort_by == "city":
+            return (city == "", city, order_id)
         return (not is_valid, order_id)
 
     result.sort(key=sort_key)
@@ -137,15 +149,17 @@ async def get_online_coords(order_id: str):
     
     if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
     
-    if o.get("gps_link"):
+    if o.get("gps_link") and o.get("has_valid_gps") is not False:
         lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
             o["current_lat"] = lat
             o["current_lng"] = lng
             o["has_valid_gps"] = True
+            save_db()
             return {"lat": lat, "lng": lng}
         else:
             o["has_valid_gps"] = False
+            o["gps_status"] = status
             save_db()
             
     raise HTTPException(404, "GPS недоступен")
@@ -157,7 +171,7 @@ async def admin_list(user=Depends(check_admin)):
 @app.post("/api/admin/shipments")
 async def admin_create(s: Shipment, user=Depends(check_admin)):
     DB[s.order_id] = s.model_dump()
-    if DB[s.order_id].get("gps_link"): DB[s.order_id]["has_valid_gps"] = None 
+    DB[s.order_id]["has_valid_gps"] = None
     save_db()
     asyncio.create_task(update_all_coords())
     return {"ok": True}
@@ -327,7 +341,7 @@ async def user_portal():
             ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>` : ''}
             <div id="map"><div class="spinner"></div>Загрузка...</div>`;
         if (o.current_lat && o.current_lng) { renderMap(o.current_lat, o.current_lng); }
-        else if (o.gps_link) {
+        else if (o.gps_link && o.has_valid_gps !== false) {
             try {
                 const res = await fetch(`/api/coords/${o.order_id}`);
                 if (res.ok) { const data = await res.json(); renderMap(data.lat, data.lng); }
