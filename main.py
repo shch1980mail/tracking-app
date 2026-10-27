@@ -7,7 +7,7 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ БОТА MAX (БЕЗ MessageCreated) ===
+# === ИМПОРТЫ ДЛЯ БОТА MAX ===
 from maxapi import Bot, Dispatcher
 
 app = FastAPI(title="ТПК Отслеживание")
@@ -48,12 +48,15 @@ def get_coords_from_baltgps(gps_link: str):
         return None, None, "no_link"
     try:
         token = gps_link.split("?t=")[-1]
+        # 1. Авторизация по токену
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
-        }, timeout=(2.0, 3.0))
+        }, timeout=(3.0, 5.0))
         
         data = r.json()
-        if "error" in data: return None, None, "invalid_token"
+        if "error" in data: 
+            print(f"Wialon auth error: {data['error']}")
+            return None, None, "invalid_token"
         if "token" not in data: return None, None, "invalid_token"
         
         unit_info = json.loads(data["token"])
@@ -62,15 +65,36 @@ def get_coords_from_baltgps(gps_link: str):
         unit_id = items[0]
         sid = data.get("eid")
         
+        # 2. Пробуем unit/calc_last (более надежный)
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
-            "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
-        }, timeout=(2.0, 3.0))
+            "svc": "unit/calc_last", 
+            "params": json.dumps([unit_id]), 
+            "sid": sid
+        }, timeout=(3.0, 5.0))
         
-        pos = r2.json().get("item", {}).get("pos", {})
+        pos_data = r2.json()
+        
+        if isinstance(pos_data, list) and len(pos_data) > 0:
+            pos = pos_data[0]
+            if "y" in pos and "x" in pos:
+                return float(pos["y"]), float(pos["x"]), "ok"
+        elif isinstance(pos_data, dict) and "error" not in pos_data:
+            pos = pos_data.get(str(unit_id), {})
+            if "y" in pos and "x" in pos:
+                return float(pos["y"]), float(pos["x"]), "ok"
+        
+        # 3. Если не вышло, пробуем старый добрый search_item
+        r3 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
+            "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
+        }, timeout=(3.0, 5.0))
+        
+        pos = r3.json().get("item", {}).get("pos", {})
         if pos and "x" in pos and "y" in pos:
             return float(pos["y"]), float(pos["x"]), "ok"
+            
         return None, None, "no_data"
-    except Exception:
+    except Exception as e:
+        print(f"Wialon exception: {e}")
         return None, None, "error"
 
 async def fetch_single_order_coords(order_id, o):
@@ -80,6 +104,7 @@ async def fetch_single_order_coords(order_id, o):
         o["current_lat"] = lat
         o["current_lng"] = lng
         o["has_valid_gps"] = True
+        o["gps_status"] = "ok"
     else:
         o["current_lat"] = None
         o["current_lng"] = None
@@ -95,48 +120,49 @@ async def update_all_coords():
 
     tasks = []
     for order_id, o in DB.items():
-        if o.get("gps_link") and o.get("has_valid_gps") is not False:
+        if o.get("gps_link"):
             tasks.append(fetch_single_order_coords(order_id, o))
     
-    semaphore = asyncio.Semaphore(15)
+    semaphore = asyncio.Semaphore(10)
     async def limited_task(task):
         async with semaphore: await task
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
     print("✅ Фоновая проверка GPS завершена.")
 
-# === ОБРАБОТЧИК БОТА MAX (БЕЗ MessageCreated) ===
+# === ОБРАБОТЧИК БОТА MAX ===
 @max_dp.message_created()
 async def handle_message(event):
-    # Проверка, что это текстовое сообщение
     if not event.message or not event.message.body or not event.message.body.text:
         return
 
     text = event.message.body.text.strip()
 
-    # Логика выбора заказа
     if text == "📋 Выбрать заказ":
-        active_orders = [o for o in DB.values() if o.get("status") == "в пути" and o.get("current_lat")]
+        active_orders = [o for o in DB.values() if o.get("status") == "в пути"]
         if not active_orders:
-            await event.message.answer("Нет активных заказов с GPS.")
+            await event.message.answer("Нет активных заказов.")
             return
         
         response = "Выберите заказ (отправьте номер):\n"
         for o in active_orders[:15]:
-            response += f"• {o['order_id']} ({o.get('address', '—')})\n"
+            gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
+            response += f"{gps_mark} {o['order_id']} ({o.get('address', '—')})\n"
         
         await event.message.answer(response)
         return
 
-    # Если введен номер заказа
     order_id = text.upper()
     if order_id in DB:
         o = DB[order_id]
-        lat, lng = o.get("current_lat"), o.get("current_lng")
-        if not lat and o.get("gps_link"):
-            lat, lng, _ = get_coords_from_baltgps(o["gps_link"])
+        
+        if not o.get("current_lat") and o.get("gps_link"):
+            lat, lng, status = get_coords_from_baltgps(o["gps_link"])
             if lat:
                 o["current_lat"], o["current_lng"] = lat, lng
+                o["gps_status"] = "ok"
+            else:
+                o["gps_status"] = status
 
         response = (
             f"📦 Заказ: {o['order_id']}\n"
@@ -148,10 +174,12 @@ async def handle_message(event):
         if o.get('comment'):
             response += f"📝 Примечание: {o['comment']}\n"
         
-        if lat and lng:
-            response += f"🗺️ [Точка на карте](https://yandex.ru/maps/?pt={lng},{lat}&z=12)"
+        if o.get("current_lat") and o.get("current_lng"):
+            response += f"🗺️ [Точка на карте](https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12)"
+        elif o.get("gps_link"):
+            response += f"🗺️ [Открыть карту BaltGPS]({o['gps_link']})"
         else:
-            response += "🗺️ GPS недоступен"
+            response += "🗺️ GPS недоступен."
             
         await event.message.answer(response)
     else:
@@ -176,7 +204,7 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# === API ДЛЯ САЙТА ===
+# === API ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
@@ -223,8 +251,8 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
 async def get_online_coords(order_id: str):
     if order_id not in DB: raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
-    if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
-    if o.get("gps_link") and o.get("has_valid_gps") is not False:
+    
+    if o.get("gps_link"):
         lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
             o["current_lat"] = lat
@@ -233,9 +261,14 @@ async def get_online_coords(order_id: str):
             save_db()
             return {"lat": lat, "lng": lng}
         else:
-            o["has_valid_gps"] = False
             o["gps_status"] = status
             save_db()
+            if status == "invalid_token":
+                raise HTTPException(400, "Ссылка на GPS устарела")
+            elif status == "error":
+                raise HTTPException(503, "Спутник не отвечает")
+    
+    if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
     raise HTTPException(404, "GPS недоступен")
 
 @app.get("/api/admin/shipments")
@@ -370,12 +403,14 @@ async def user_portal():
     #modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,0.6); z-index: 1000; padding: 20px; overflow-y: auto; }
     #modal.open { display: block; }
     .modal-content { background: var(--card); max-width: 900px; margin: 40px auto; border-radius: 16px; padding: 28px; position: relative; }
-    .modal-close { position: absolute; top: 16px; right: 16px; font-size: 24px; cursor: pointer; border: none; background: none; }
-    #map { height: 400px; margin-top: 20px; border-radius: 12px; display: flex; align-items: center; justify-content: center; background: #eaeaea; color: #888; }
+    .modal-close { position: absolute; top: 16px; right: 16px; font-size: 24px; cursor: pointer; border: none; background: none; color: var(--text); }
+    #map { height: 400px; margin-top: 20px; border-radius: 12px; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #eaeaea; color: #888; gap: 10px; }
+    [data-theme="dark"] #map { background: #1a1a1a; }
     .modal-info { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 20px; }
     .modal-info strong { display: block; color: var(--text-sec); font-size: 12px; text-transform: uppercase; }
     .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin-bottom: 10px; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    .btn-reload { padding: 10px 20px; background: var(--primary); color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
 </style>
 </head>
 <body>
@@ -469,16 +504,40 @@ async def user_portal():
                 <div><strong>Прибытие</strong>${o.plan_arrival || '—'}</div>
             </div>
             ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>` : ''}
-            <div id="map"><div class="spinner"></div>Загрузка...</div>`;
-        if (o.current_lat && o.current_lng) { renderMap(o.current_lat, o.current_lng); }
-        else if (o.gps_link && o.has_valid_gps !== false) {
-            try {
-                const res = await fetch(`/api/coords/${o.order_id}`);
-                if (res.ok) { const data = await res.json(); renderMap(data.lat, data.lng); }
-                else { document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>'; }
-            } catch(e) { document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">Ошибка сети.</div>'; }
-        } else { document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>'; }
+            <div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
+            
+        if (o.current_lat && o.current_lng) { 
+            renderMap(o.current_lat, o.current_lng); 
+        } else if (o.gps_link) {
+            loadCoords(o.order_id, o.gps_link);
+        } else { 
+            document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>'; 
+        }
     }
+    
+    async function loadCoords(orderId, gpsLink) {
+        const mapDiv = document.getElementById('map');
+        mapDiv.innerHTML = '<div class="spinner"></div><div>Запрос к спутнику...</div>';
+        try {
+            const res = await fetch(`/api/coords/${orderId}`);
+            if (res.ok) { 
+                const data = await res.json(); 
+                renderMap(data.lat, data.lng); 
+            } else {
+                const errorData = await res.json();
+                mapDiv.innerHTML = `<div style="text-align:center;padding:20px;color:#888;">
+                    ${errorData.detail || 'GPS недоступен'}<br><br>
+                    <a href="${gpsLink}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a>
+                </div>`;
+            }
+        } catch(e) { 
+            mapDiv.innerHTML = `<div style="text-align:center;padding:20px;color:#888;">
+                Ошибка сети<br><br>
+                <a href="${gpsLink}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a>
+            </div>`; 
+        }
+    }
+    
     function renderMap(lat, lng) {
         const mapDiv = document.getElementById('map'); mapDiv.innerHTML = '';
         if (map) map.remove();
