@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException, Depends
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import os, json, requests, asyncio
+import os, json, requests, asyncio, io
+import pandas as pd
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -27,7 +28,12 @@ class Shipment(BaseModel):
     comment: Optional[str] = None
     status: Optional[str] = None
 
-# === ФУНКЦИЯ ПАРСИНГА GPS (С ПРОВЕРКОЙ НА ОШИБКИ) ===
+# === ФУНКЦИЯ СОХРАНЕНИЯ В ФАЙЛ ===
+def save_db():
+    with open("shipments.json", "w", encoding="utf-8") as f:
+        json.dump(DB, f, ensure_ascii=False, indent=2)
+
+# === ПАРСИНГ GPS ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None, "no_link"
@@ -38,14 +44,10 @@ def get_coords_from_baltgps(gps_link: str):
         }, timeout=(3.05, 5))
         
         data = r.json()
-        
-        # Wialon возвращает ошибку, если токен неверный или просрочен
         if "error" in data:
-            print(f"❌ Wialon Error: {data['error']}")
             return None, None, "invalid_token"
             
-        if "token" not in data: 
-            return None, None, "invalid_token"
+        if "token" not in data: return None, None, "invalid_token"
         
         unit_info = json.loads(data["token"])
         items = unit_info.get("items", [])
@@ -54,36 +56,27 @@ def get_coords_from_baltgps(gps_link: str):
         sid = data.get("eid")
         
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
-            "svc": "core/search_item", 
-            "params": json.dumps({"id": unit_id, "flags": 1025}), 
-            "sid": sid
+            "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
         }, timeout=(3.05, 5))
         
         pos = r2.json().get("item", {}).get("pos", {})
         if pos and "x" in pos and "y" in pos:
             return float(pos["y"]), float(pos["x"]), "ok"
-            
         return None, None, "no_data"
     except Exception as e:
-        print(f"Ошибка GPS: {e}")
-    return None, None, "error"
+        return None, None, "error"
 
 async def fetch_single_order_coords(order_id, o):
     loop = asyncio.get_event_loop()
     lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
-    
     if lat and lng:
         o["current_lat"] = lat
         o["current_lng"] = lng
-        o["gps_status"] = "ok"
     else:
-        # Если ссылка невалидна, помечаем это, чтобы на фронте показывать как "без GPS"
-        o["gps_status"] = status
-        if status in ["invalid_token", "no_link", "error"]:
-            o["gps_link"] = None # Убираем ссылку, чтобы не вводить в заблуждение
+        if status in ["invalid_token", "error"]:
+            o["gps_link"] = None # Удаляем битую ссылку
 
 async def update_all_coords():
-    print("⏳ Начинаю фоновое обновление GPS-координат...")
     tasks = []
     for order_id, o in DB.items():
         if o.get("gps_link") and not o.get("current_lat"):
@@ -93,9 +86,7 @@ async def update_all_coords():
     async def limited_task(task):
         async with semaphore:
             await task
-            
     await asyncio.gather(*(limited_task(t) for t in tasks))
-    print("✅ Фоновое обновление завершено.")
 
 @app.on_event("startup")
 async def startup():
@@ -103,7 +94,6 @@ async def startup():
     if os.path.exists("shipments.json"):
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
-        print(f"✅ Загружено {len(DB)} заказов")
         asyncio.create_task(update_all_coords())
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -111,6 +101,7 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
+# === API ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ===
 @app.get("/api/shipments")
 async def list_shipments(status: Optional[str] = None, search: Optional[str] = None, sort_by: str = "gps"):
     result = []
@@ -118,14 +109,11 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         s = str(o.get("status", "")).lower()
         if status == "in_transit" and s not in ['в пути', 'планируется']: continue
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
-        if status == "no_status" and s != '': continue
-        
-        # Если ищем "с GPS", показываем только тех, у кого есть ссылка И она валидна
         if status == "with_gps" and not o.get("gps_link"): continue
         
         if search:
             q = search.lower()
-            if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower() and q not in o.get("vehicle", "").lower():
+            if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower():
                 continue
         result.append(o)
     
@@ -133,16 +121,10 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         has_link = 1 if x.get("gps_link") else 0
         has_coords = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
-        city = str(x.get("address") or "").lower()
-        arrival = str(x.get("plan_arrival") or "9999-12-31")
-        weight = x.get("weight") or 0
-
+        
         if sort_by == "gps": return (not has_link, not has_coords, order_id)
         elif sort_by == "order_id": return order_id
-        elif sort_by == "city": return (city == "", city, order_id)
-        elif sort_by == "date": return (arrival == "9999-12-31", arrival, order_id)
-        elif sort_by == "weight": return (weight == 0, -weight, order_id)
-        
+        elif sort_by == "city": return (str(x.get("address") or "").lower(), order_id)
         return (not has_link, not has_coords, order_id)
 
     result.sort(key=sort_key)
@@ -150,33 +132,77 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
 
 @app.get("/api/coords/{order_id}")
 async def get_online_coords(order_id: str):
-    if order_id not in DB:
-        raise HTTPException(404, "Заказ не найден")
+    if order_id not in DB: raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
-    
-    if o.get("current_lat"):
-        return {"lat": o["current_lat"], "lng": o["current_lng"]}
-        
+    if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
     if o.get("gps_link"):
         lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
             o["current_lat"] = lat
             o["current_lng"] = lng
             return {"lat": lat, "lng": lng}
-        else:
-            # Если ссылка оказалась невалидной, удаляем её из базы
-            if status in ["invalid_token", "error"]:
-                o["gps_link"] = None
-    
+        elif status == "invalid_token":
+            o["gps_link"] = None
+            save_db()
     raise HTTPException(404, "GPS недоступен")
 
-@app.get("/api/admin/report")
-async def get_report(user=Depends(check_admin)):
-    in_transit = [o for o in DB.values() if str(o.get("status", "")).lower() in ['в пути', 'планируется']]
-    # Теперь в отчете без GPS будут и те, у кого ссылка невалидна
-    return {"total": len(in_transit), "with_gps": [o for o in in_transit if o.get("gps_link")], "without_gps": [o for o in in_transit if not o.get("gps_link")]}
+# === API ДЛЯ АДМИНКИ ===
+@app.get("/api/admin/shipments")
+async def admin_list(user=Depends(check_admin)):
+    return list(DB.values())
 
-# ============ ИНТЕРФЕЙС ============
+@app.post("/api/admin/shipments")
+async def admin_create(s: Shipment, user=Depends(check_admin)):
+    DB[s.order_id] = s.model_dump()
+    save_db()
+    return {"ok": True}
+
+@app.delete("/api/admin/shipments/{order_id}")
+async def admin_delete(order_id: str, user=Depends(check_admin)):
+    if order_id in DB:
+        del DB[order_id]
+        save_db()
+    return {"ok": True}
+
+@app.post("/api/admin/upload")
+async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_admin)):
+    global DB
+    try:
+        contents = await file.read()
+        df = pd.read_excel(io.BytesIO(contents), sheet_name="Исх.логистика")
+        df = df.dropna(subset=['Заказ'])
+        
+        new_db = {}
+        for _, row in df.iterrows():
+            order_id = str(row['Заказ']).strip()
+            
+            def safe_float(val):
+                try: return float(str(val).replace(',', '.')) if not pd.isna(val) else None
+                except: return None
+            def fmt_date(val):
+                try: return pd.to_datetime(val).strftime('%Y-%m-%d') if not pd.isna(val) else None
+                except: return str(val)[:10]
+
+            new_db[order_id] = {
+                "order_id": order_id,
+                "address": str(row.get('Адрес доставки', '')) if not pd.isna(row.get('Адрес доставки')) else None,
+                "weight": safe_float(row.get('вес')),
+                "plan_arrival": fmt_date(row.get('Дата прибытия')),
+                "carrier": str(row.get('Перевозчик', '')) if not pd.isna(row.get('Перевозчик')) else None,
+                "vehicle": str(row.get('Машина', '')) if not pd.isna(row.get('Машина')) else None,
+                "driver": str(row.get('Водитель', '')) if not pd.isna(row.get('Водитель')) else None,
+                "gps_link": str(row.get('ссылка', '')) if not pd.isna(row.get('ссылка')) else None,
+                "comment": str(row.get('Примечания', '')) if not pd.isna(row.get('Примечания')) else None,
+                "status": str(row.get('статус доставки', '')).strip().lower() if not pd.isna(row.get('статус доставки')) else ""
+            }
+        DB = new_db
+        save_db()
+        asyncio.create_task(update_all_coords())
+        return {"ok": True, "message": f"Загружено {len(DB)} заказов"}
+    except Exception as e:
+        raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
+
+# ============ ПОЛЬЗОВАТЕЛЬСКИЙ ИНТЕРФЕЙС (ГЛАВНАЯ) ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -194,11 +220,11 @@ async def user_portal():
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); padding: 24px; }
     .header { max-width: 1100px; margin: 0 auto 24px; display: flex; justify-content: space-between; align-items: center; }
     .header h1 { font-size: 28px; }
-    .controls { max-width: 1100px; margin: 0 auto 16px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .controls { max-width: 1100px; margin: 0 auto 16px; display: flex; gap: 10px; flex-wrap: wrap; }
     .search-box { position: relative; flex: 1; min-width: 250px; }
     .search-box input { width: 100%; padding: 14px 20px 14px 48px; border-radius: 12px; border: 2px solid var(--border); background: var(--card); color: var(--text); }
     .search-box::before { content: '🔍'; position: absolute; left: 16px; top: 50%; transform: translateY(-50%); }
-    .sort-select { padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; font-weight: 600; outline: none; }
+    .sort-select { padding: 14px; border-radius: 12px; border: 2px solid var(--border); background: var(--card); color: var(--text); cursor: pointer; }
     .tabs { max-width: 1100px; margin: 0 auto 24px; display: flex; gap: 8px; background: var(--card); padding: 8px; border-radius: 12px; box-shadow: var(--shadow); }
     .tab { flex: 1; padding: 12px; border: none; background: transparent; color: var(--text-sec); font-weight: 600; cursor: pointer; border-radius: 8px; }
     .tab.active { background: var(--primary); color: white; }
@@ -227,31 +253,25 @@ async def user_portal():
 </head>
 <body>
     <div class="header"><h1>📍 ТПК — Отслеживание</h1><button class="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button></div>
-    
     <div class="controls">
-        <div class="search-box"><input id="searchInput" placeholder="Поиск по номеру, городу или машине..." oninput="debounceSearch()"></div>
+        <div class="search-box"><input id="searchInput" placeholder="Поиск..." oninput="debounceSearch()"></div>
         <select class="sort-select" id="sortSelect" onchange="loadOrders()">
             <option value="gps">📍 Сначала с GPS</option>
             <option value="order_id">🔢 По номеру заказа</option>
             <option value="city">🏙️ По городу</option>
-            <option value="date">📅 По дате прибытия</option>
-            <option value="weight">⚖️ По весу</option>
         </select>
     </div>
-
     <div class="tabs">
         <button class="tab active" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути</button>
         <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Выгружено</button>
         <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 С GPS</button>
     </div>
     <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
-    
     <div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
     <script>
     let currentTab = 'in_transit'; let map = null;
     function toggleTheme() { const isDark = document.documentElement.getAttribute('data-theme') === 'dark'; document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark'); localStorage.setItem('theme', isDark ? 'light' : 'dark'); }
     document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
-    
     function setTab(s) { currentTab = s; document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); document.querySelector(`.tab[data-status="${s}"]`).classList.add('active'); loadOrders(); }
     function debounceSearch() { clearTimeout(window.searchTimeout); window.searchTimeout = setTimeout(loadOrders, 300); }
     
@@ -259,18 +279,14 @@ async def user_portal():
         const search = document.getElementById('searchInput').value.trim();
         const sort = document.getElementById('sortSelect').value;
         document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;">Загрузка...</div>';
-        
         try {
             const res = await fetch(`/api/shipments?status=${currentTab}&sort_by=${sort}${search ? '&search='+search : ''}`);
             const orders = await res.json();
             const grid = document.getElementById('ordersGrid');
-            
             if (!orders.length) { grid.innerHTML = '<div style="text-align:center;width:100%;">Нет заказов</div>'; return; }
-            
             grid.innerHTML = orders.map(o => {
                 let badge = o.status === 'в пути' ? '<span class="order-status in-transit">В пути</span>' : (o.status === 'завершено' ? '<span class="order-status delivered">Выгружено</span>' : '');
                 let loc = o.comment ? `<div class="loc-info">📝 ${o.comment}</div>` : '';
-                
                 return `<div class="order-card ${o.status === 'завершено' ? 'delivered' : ''}" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
                     <div style="display:flex; justify-content:space-between; margin-bottom:10px;"><span class="order-id">${o.order_id}</span>${badge}</div>
                     <div class="order-row"><strong>Адрес:</strong> ${o.address || '—'}</div>
@@ -280,9 +296,7 @@ async def user_portal():
                     ${loc}
                 </div>`;
             }).join('');
-        } catch(e) {
-            document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;color:red;">Ошибка загрузки данных</div>';
-        }
+        } catch(e) { document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;color:red;">Ошибка</div>'; }
     }
     
     async function openOrder(o) {
@@ -297,37 +311,23 @@ async def user_portal():
                 <div><strong>Прибытие</strong>${o.plan_arrival || '—'}</div>
             </div>
             ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>` : ''}
-            <div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
-            
-        if (o.current_lat && o.current_lng) {
-            renderMap(o.current_lat, o.current_lng);
-        } else if (o.gps_link) {
+            <div id="map"><div class="spinner"></div>Загрузка...</div>`;
+        if (o.current_lat && o.current_lng) { renderMap(o.current_lat, o.current_lng); }
+        else if (o.gps_link) {
             try {
                 const res = await fetch(`/api/coords/${o.order_id}`);
-                if (res.ok) {
-                    const data = await res.json();
-                    renderMap(data.lat, data.lng);
-                } else {
-                    // Если ссылка невалидна, выводим как "без GPS"
-                    document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует (ссылка недействительна). Ориентируйтесь на примечание.</div>';
-                }
-            } catch(e) {
-                document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">Ошибка сети.</div>';
-            }
-        } else {
-            document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>';
-        }
+                if (res.ok) { const data = await res.json(); renderMap(data.lat, data.lng); }
+                else { document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>'; }
+            } catch(e) { document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">Ошибка сети.</div>'; }
+        } else { document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>'; }
     }
-    
     function renderMap(lat, lng) {
-        const mapDiv = document.getElementById('map');
-        mapDiv.innerHTML = '';
+        const mapDiv = document.getElementById('map'); mapDiv.innerHTML = '';
         if (map) map.remove();
         map = L.map('map').setView([lat, lng], 8);
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
         L.marker([lat, lng]).addTo(map);
     }
-
     function closeModal() { document.getElementById('modal').classList.remove('open'); if(map){map.remove(); map=null;} }
     loadOrders();
     </script>
@@ -335,66 +335,167 @@ async def user_portal():
 </html>
 """
 
-# ============ АДМИН-ПАНЕЛЬ (ОТЧЕТ) ============
+# ============ ПОЛНОЦЕННАЯ АДМИН-ПАНЕЛЬ (CRM) ============
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(user=Depends(check_admin)):
     return """
     <!DOCTYPE html>
     <html>
     <head>
-        <title>Админ-панель: Отчет по транспорту</title>
+        <title>Админ-панель: Управление перевозками</title>
         <style>
-            body { font-family: Arial; padding: 20px; background: #f0f2f5; }
-            h2 { margin-top: 30px; color: #333; }
-            table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; margin-bottom: 20px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
-            th, td { border: 1px solid #ddd; padding: 10px; text-align: left; }
-            th { background: #007bff; color: white; position: sticky; top: 0; }
+            body { font-family: Arial; padding: 20px; background: #f0f2f5; margin: 0; }
+            .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+            .btn { padding: 10px 20px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; }
+            .btn-green { background: #28a745; color: white; }
+            .btn-blue { background: #007bff; color: white; }
+            .btn-red { background: #dc3545; color: white; }
+            .upload-box { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); margin-bottom: 20px; display: flex; gap: 10px; align-items: center; }
+            table { border-collapse: collapse; width: 100%; background: white; font-size: 13px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }
+            th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+            th { background: #333; color: white; position: sticky; top: 0; }
             tr:hover { background: #f0f8ff; }
-            .no-gps { background: #fff3cd; }
-            .gps-yes { color: green; font-weight: bold; }
+            #filter { padding: 10px; width: 300px; margin-bottom: 10px; border: 1px solid #ccc; border-radius: 6px; }
+            
+            /* Модальное окно */
+            #modal { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.5); z-index: 1000; }
+            #modalContent { background:white; max-width:600px; margin:80px auto; padding:30px; border-radius:8px; max-height:80vh; overflow-y:auto; }
+            #modalContent label { display:block; margin-top:10px; font-weight:bold; }
+            #modalContent input, #modalContent select { width:100%; padding:8px; box-sizing:border-box; margin-top:4px; }
+            .modal-buttons { margin-top:20px; text-align:right; }
         </style>
     </head>
     <body>
-        <h1>📊 Отчет: Транспорт в пути</h1>
-        <p>Разделение машин по наличию GPS-трекинга.</p>
-        
-        <h2>🟢 В пути с GPS (Базовый трекинг)</h2>
-        <table id="table-gps">
-            <thead><tr><th>Заказ</th><th>Машина</th><th>Адрес</th><th>GPS Ссылка</th><th>Примечание</th></tr></thead>
+        <div class="top-bar">
+            <h1>🚚 Управление перевозками</h1>
+            <button class="btn btn-green" onclick="openAdd()">➕ Добавить заказ</button>
+        </div>
+
+        <div class="upload-box">
+            <strong>📥 Загрузить Excel:</strong>
+            <input type="file" id="excelFile" accept=".xlsx, .xls">
+            <button class="btn btn-blue" onclick="uploadExcel()">Обновить базу из файла</button>
+            <span id="uploadStatus" style="color: green; font-weight: bold;"></span>
+        </div>
+
+        <input id="filter" placeholder="Поиск по номеру или адресу..." oninput="renderTable()"/>
+        <table id="shipments">
+            <thead><tr><th>Заказ</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Действия</th></tr></thead>
             <tbody></tbody>
         </table>
 
-        <h2>🟡 В пути без GPS (Только по примечанию)</h2>
-        <table id="table-no-gps">
-            <thead><tr><th>Заказ</th><th>Машина</th><th>Адрес</th><th>Примечание (Местоположение)</th></tr></thead>
-            <tbody></tbody>
-        </table>
+        <div id="modal">
+            <div id="modalContent">
+                <h2 id="modalTitle">Добавить заказ</h2>
+                <label>Номер заказа *</label><input id="f_order_id"/>
+                <label>Адрес доставки</label><input id="f_address"/>
+                <label>Вес</label><input id="f_weight" type="number"/>
+                <label>Перевозчик</label><input id="f_carrier"/>
+                <label>Машина</label><input id="f_vehicle"/>
+                <label>Водитель</label><input id="f_driver"/>
+                <label>GPS-ссылка</label><input id="f_gps_link"/>
+                <label>Примечание</label><input id="f_comment"/>
+                <label>План. прибытие</label><input id="f_plan_arrival" type="date"/>
+                <label>Статус</label>
+                <select id="f_status">
+                    <option value="">Без статуса</option>
+                    <option value="планируется">планируется</option>
+                    <option value="в пути">в пути</option>
+                    <option value="выгружено">выгружено</option>
+                    <option value="завершено">завершено</option>
+                </select>
+                <div class="modal-buttons">
+                    <button class="btn" onclick="closeModal()">Отмена</button>
+                    <button class="btn btn-green" onclick="saveOrder()">Сохранить</button>
+                </div>
+            </div>
+        </div>
 
         <script>
-        async function loadReport() {
-            const res = await fetch('/api/admin/report');
-            const data = await res.json();
-            
-            document.querySelector('#table-gps tbody').innerHTML = data.with_gps.map(o => `
+        let allData=[];
+        async function load(){
+            const res = await fetch('/api/admin/shipments'); allData = await res.json();
+            renderTable();
+        }
+        function renderTable(){
+            const q = document.getElementById('filter').value.toLowerCase(); 
+            let filtered = allData.filter(s => (s.order_id||'').toLowerCase().includes(q) || (s.address||'').toLowerCase().includes(q));
+            document.querySelector('#shipments tbody').innerHTML = filtered.map(s=>`
                 <tr>
-                    <td><b>${o.order_id}</b></td>
-                    <td>${o.vehicle || '—'}</td>
-                    <td>${o.address || '—'}</td>
-                    <td><a href="${o.gps_link}" target="_blank" class="gps-yes">📍 Открыть</a></td>
-                    <td>${o.comment || '—'}</td>
-                </tr>
-            `).join('');
-            
-            document.querySelector('#table-no-gps tbody').innerHTML = data.without_gps.map(o => `
-                <tr class="no-gps">
-                    <td><b>${o.order_id}</b></td>
-                    <td>${o.vehicle || '—'}</td>
-                    <td>${o.address || '—'}</td>
-                    <td><b>${o.comment || 'Нет данных о местоположении'}</b></td>
+                    <td><b>${s.order_id}</b></td>
+                    <td>${s.address||''}</td>
+                    <td>${s.carrier||''}</td>
+                    <td>${s.vehicle||''}</td>
+                    <td>${s.status||'—'}</td>
+                    <td>
+                        <button class="btn btn-blue" style="padding:4px 8px;" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
+                        <button class="btn btn-red" style="padding:4px 8px;" onclick="del('${s.order_id}')">🗑</button>
+                    </td>
                 </tr>
             `).join('');
         }
-        loadReport();
+        function openAdd(){ 
+            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f=>document.getElementById('f_'+f).value=''); 
+            document.getElementById('f_order_id').disabled=false;
+            document.getElementById('f_status').value=''; 
+            document.getElementById('modalTitle').innerText='Добавить заказ'; 
+            document.getElementById('modal').style.display='block'; 
+        }
+        function openEdit(s){ 
+            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f=>document.getElementById('f_'+f).value=s[f]||''); 
+            document.getElementById('f_order_id').disabled=true; 
+            document.getElementById('f_status').value=s.status||''; 
+            document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id; 
+            document.getElementById('modal').style.display='block'; 
+        }
+        function closeModal(){ document.getElementById('modal').style.display='none'; }
+        
+        async function saveOrder(){
+            const payload = { 
+                order_id: document.getElementById('f_order_id').value, 
+                address: document.getElementById('f_address').value, 
+                weight: parseFloat(document.getElementById('f_weight').value)||null,
+                carrier: document.getElementById('f_carrier').value, 
+                vehicle: document.getElementById('f_vehicle').value, 
+                driver: document.getElementById('f_driver').value,
+                gps_link: document.getElementById('f_gps_link').value,
+                comment: document.getElementById('f_comment').value,
+                plan_arrival: document.getElementById('f_plan_arrival').value,
+                status: document.getElementById('f_status').value 
+            };
+            await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+            closeModal(); load();
+        }
+        
+        async function del(order_id){ 
+            if(!confirm('Удалить '+order_id+'?')) return; 
+            await fetch('/api/admin/shipments/'+order_id,{method:'DELETE'}); load(); 
+        }
+
+        async function uploadExcel() {
+            const fileInput = document.getElementById('excelFile');
+            if (!fileInput.files.length) { alert("Выберите файл!"); return; }
+            
+            const formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+            
+            document.getElementById('uploadStatus').innerText = "⏳ Загрузка...";
+            
+            try {
+                const res = await fetch('/api/admin/upload', { method: 'POST', body: formData });
+                const data = await res.json();
+                if (res.ok) {
+                    document.getElementById('uploadStatus').innerText = "✅ " + data.message;
+                    load(); // Обновляем таблицу
+                } else {
+                    document.getElementById('uploadStatus').innerText = "❌ Ошибка: " + data.detail;
+                }
+            } catch(e) {
+                document.getElementById('uploadStatus').innerText = "❌ Ошибка сети";
+            }
+        }
+
+        load();
         </script>
     </body>
     </html>
