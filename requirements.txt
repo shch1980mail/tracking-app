@@ -1,5 +1,7 @@
 fastapi
 uvicorn
-asyncpg
-pydantic
 requests
+pydantic
+pandas
+openpyxl
+python-multipart
