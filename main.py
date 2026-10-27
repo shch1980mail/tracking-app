@@ -9,6 +9,7 @@ import openpyxl
 
 # === ИМПОРТЫ ДЛЯ БОТА MAX ===
 from maxapi import Bot, Dispatcher
+from maxapi.types import MessageCreated
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -20,6 +21,7 @@ DB = {}
 SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
 
 # === НАСТРОЙКА БОТА MAX ===
+# ВСТАВЬТЕ СЮДА ВАШ ТОКЕН ИЗ ЛИЧНОГО КАБИНЕТА MAX
 MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
@@ -48,15 +50,12 @@ def get_coords_from_baltgps(gps_link: str):
         return None, None, "no_link"
     try:
         token = gps_link.split("?t=")[-1]
-        # 1. Авторизация по токену
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
         }, timeout=(3.0, 5.0))
         
         data = r.json()
-        if "error" in data: 
-            print(f"Wialon auth error: {data['error']}")
-            return None, None, "invalid_token"
+        if "error" in data: return None, None, "invalid_token"
         if "token" not in data: return None, None, "invalid_token"
         
         unit_info = json.loads(data["token"])
@@ -65,15 +64,12 @@ def get_coords_from_baltgps(gps_link: str):
         unit_id = items[0]
         sid = data.get("eid")
         
-        # 2. Пробуем unit/calc_last (более надежный)
+        # Пробуем unit/calc_last
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
-            "svc": "unit/calc_last", 
-            "params": json.dumps([unit_id]), 
-            "sid": sid
+            "svc": "unit/calc_last", "params": json.dumps([unit_id]), "sid": sid
         }, timeout=(3.0, 5.0))
         
         pos_data = r2.json()
-        
         if isinstance(pos_data, list) and len(pos_data) > 0:
             pos = pos_data[0]
             if "y" in pos and "x" in pos:
@@ -83,7 +79,7 @@ def get_coords_from_baltgps(gps_link: str):
             if "y" in pos and "x" in pos:
                 return float(pos["y"]), float(pos["x"]), "ok"
         
-        # 3. Если не вышло, пробуем старый добрый search_item
+        # Пробуем search_item
         r3 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
         }, timeout=(3.0, 5.0))
@@ -93,8 +89,7 @@ def get_coords_from_baltgps(gps_link: str):
             return float(pos["y"]), float(pos["x"]), "ok"
             
         return None, None, "no_data"
-    except Exception as e:
-        print(f"Wialon exception: {e}")
+    except Exception:
         return None, None, "error"
 
 async def fetch_single_order_coords(order_id, o):
@@ -104,15 +99,12 @@ async def fetch_single_order_coords(order_id, o):
         o["current_lat"] = lat
         o["current_lng"] = lng
         o["has_valid_gps"] = True
-        o["gps_status"] = "ok"
     else:
         o["current_lat"] = None
         o["current_lng"] = None
         o["has_valid_gps"] = False
-        o["gps_status"] = status
 
 async def update_all_coords():
-    print("⏳ Начинаю фоновую проверку GPS...")
     for o in DB.values():
         if o.get("has_valid_gps") is False:
             o["current_lat"] = None
@@ -128,23 +120,34 @@ async def update_all_coords():
         async with semaphore: await task
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
-    print("✅ Фоновая проверка GPS завершена.")
 
-# === ОБРАБОТЧИК БОТА MAX ===
+# === ЛОГИКА БОТА MAX ===
 @max_dp.message_created()
-async def handle_message(event):
+async def handle_message(event: MessageCreated):
+    # Проверка, что это текстовое сообщение
     if not event.message or not event.message.body or not event.message.body.text:
         return
 
     text = event.message.body.text.strip()
 
+    # 1. Приветствие и меню
+    if text.lower() in ["/start", "привет", "меню", "начать"]:
+        await event.message.answer(
+            "👋 Я бот для отслеживания заказов ТПК.\n\n"
+            "Введите **4 цифры** номера заказа (например, `1668`), чтобы получить информацию.\n"
+            "Или нажмите кнопку ниже, чтобы увидеть список активных заказов."
+        )
+        return
+
+    # 2. Кнопка "Выбрать заказ"
     if text == "📋 Выбрать заказ":
         active_orders = [o for o in DB.values() if o.get("status") == "в пути"]
         if not active_orders:
-            await event.message.answer("Нет активных заказов.")
+            await event.message.answer("Нет активных заказов в пути.")
             return
         
-        response = "Выберите заказ (отправьте номер):\n"
+        # Формируем список (максимум 15 штук, чтобы не спамить)
+        response = "Выберите заказ (нажмите на номер или введите 4 цифры):\n\n"
         for o in active_orders[:15]:
             gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
             response += f"{gps_mark} {o['order_id']} ({o.get('address', '—')})\n"
@@ -152,38 +155,51 @@ async def handle_message(event):
         await event.message.answer(response)
         return
 
-    order_id = text.upper()
-    if order_id in DB:
-        o = DB[order_id]
+    # 3. Поиск по номеру или 4 цифрам
+    # Если ввели ровно 4 цифры, ищем совпадение в конце номера заказа
+    found_order = None
+    search_query = text.upper()
+    
+    if search_query.isdigit() and len(search_query) == 4:
+        for o in DB.values():
+            if o["order_id"].endswith(search_query):
+                found_order = o
+                break
+    else:
+        # Ищем по полному номеру
+        if search_query in DB:
+            found_order = DB[search_query]
+
+    if found_order:
+        o = found_order
         
+        # Если есть ссылка, но нет координат, пробуем получить их "на лету"
         if not o.get("current_lat") and o.get("gps_link"):
             lat, lng, status = get_coords_from_baltgps(o["gps_link"])
             if lat:
                 o["current_lat"], o["current_lng"] = lat, lng
-                o["gps_status"] = "ok"
-            else:
-                o["gps_status"] = status
+                o["has_valid_gps"] = True
 
         response = (
-            f"📦 Заказ: {o['order_id']}\n"
-            f"📍 Адрес: {o.get('address', '—')}\n"
-            f"🚚 Перевозчик: {o.get('carrier', '—')}\n"
-            f"🚛 Машина: {o.get('vehicle', '—')}\n"
-            f"📊 Статус: {o.get('status', '—')}\n"
+            f"📦 **Заказ:** {o['order_id']}\n"
+            f"📍 **Адрес:** {o.get('address') or '—'}\n"
+            f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+            f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+            f"📊 **Статус:** {o.get('status') or '—'}\n"
         )
         if o.get('comment'):
-            response += f"📝 Примечание: {o['comment']}\n"
+            response += f"📝 **Примечание:** {o['comment']}\n"
         
         if o.get("current_lat") and o.get("current_lng"):
-            response += f"🗺️ [Точка на карте](https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12)"
+            response += f"\n🗺️ [Точка на карте](https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12)"
         elif o.get("gps_link"):
-            response += f"🗺️ [Открыть карту BaltGPS]({o['gps_link']})"
+            response += f"\n🗺️ [Открыть карту BaltGPS]({o['gps_link']})"
         else:
-            response += "🗺️ GPS недоступен."
+            response += "\n🗺️ GPS недоступен."
             
         await event.message.answer(response)
     else:
-        await event.message.answer("❌ Заказ не найден. Попробуйте снова или напишите «Выбрать заказ».")
+        await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или напишите «Выбрать заказ».")
 
 async def run_max_bot():
     await max_dp.start_polling(max_bot)
@@ -204,7 +220,7 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# === API ===
+# === API ДЛЯ САЙТА ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
@@ -261,8 +277,6 @@ async def get_online_coords(order_id: str):
             save_db()
             return {"lat": lat, "lng": lng}
         else:
-            o["gps_status"] = status
-            save_db()
             if status == "invalid_token":
                 raise HTTPException(400, "Ссылка на GPS устарела")
             elif status == "error":
