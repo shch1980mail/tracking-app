@@ -3,7 +3,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import os, json, httpx
+import os, json
 from datetime import date, datetime, timedelta
 
 app = FastAPI(title="ТПК Отслеживание")
@@ -12,7 +12,6 @@ security = HTTPBasic()
 # Настройки админа
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
 
 # Глобальная "база данных" в памяти
 DB = {}
@@ -94,7 +93,6 @@ async def track_order(order_id: str):
 
 @app.post("/api/admin/refresh/all")
 async def admin_refresh_all(user=Depends(check_admin)):
-    # Заглушка для парсера, так как мы теперь работаем без БД
     return {"ok": True, "message": "Парсер в разработке"}
 
 @app.get("/api/admin/shipments")
