@@ -193,32 +193,6 @@ async def update_all_coords(force=False):
 # ============================================================================
 HTML_FMT = TextFormat.HTML
 
-CAR_IMAGE_URL = os.environ.get("CAR_IMAGE_URL", "").strip()
-WAIT_IMAGE_URL = os.environ.get("WAIT_IMAGE_URL", "").strip()
-CAR_IMAGE_PATH = os.environ.get("CAR_IMAGE_PATH", "truck.png")
-WAIT_IMAGE_PATH = os.environ.get("WAIT_IMAGE_PATH", "truck_wait.png")
-_IMG_CACHE = {}
-
-async def get_image_attachment(kind: str):
-    try:
-        if kind == "found" and CAR_IMAGE_URL:
-            return {"type": "image", "payload": {"url": CAR_IMAGE_URL}}
-        if kind == "wait" and WAIT_IMAGE_URL:
-            return {"type": "image", "payload": {"url": WAIT_IMAGE_URL}}
-        
-        path = CAR_IMAGE_PATH if kind == "found" else WAIT_IMAGE_PATH
-        if kind in _IMG_CACHE:
-            return _IMG_CACHE[kind]
-        if not os.path.exists(path):
-            return None
-        att = await max_bot.upload_attachment(upload_type="image", path=path)
-        _IMG_CACHE[kind] = att
-        return att
-    except Exception as e:
-        log(f"[IMG] не удалось подготовить картинку ({kind}): {e!r}")
-        _IMG_CACHE.pop(kind, None)
-        return None
-
 class MenuAction(CallbackPayloadSchema):
     prefix = "menu"
     action: str
@@ -284,21 +258,18 @@ def build_order_card(o):
 
     b = InlineKeyboardBuilder()
     if has_coords(o):
-        kind = "found"
         text += "\n✅ <b>Машина найдена!</b> Нажмите кнопку, чтобы увидеть её на карте."
         b.link("🗺️ Найти на карте", yandex_map_url(o["current_lat"], o["current_lng"]))
         b.row()
     elif o.get("gps_link"):
-        kind = "wait"
         text += "\n🔍 Точные координаты пока не получены — откройте трекер."
         b.link("🗺️ Открыть BaltGPS", o["gps_link"])
         b.row()
     else:
-        kind = "none"
         text += "\n🗺️ GPS недоступен. Попробуйте «🔄 Обновить GPS»."
     b.callback("🔙 Назад", MenuAction(action="back").pack())
     b.row()
-    return text, b, kind
+    return text, b
 
 def _norm(s):
     return re.sub(r"[\s\-_/\\.]+", "", str(s)).upper()
@@ -325,18 +296,14 @@ def find_orders(text):
 _INFLIGHT = set()
 
 async def send_order_card(chat_id, o):
-    text, kb, kind = build_order_card(o)
-    att = await get_image_attachment("found" if kind == "found" else "wait") if kind != "none" else None
+    text, kb = build_order_card(o)
     try:
         await max_bot.send_message(
-            chat_id=chat_id, text=text, format=HTML_FMT, keyboard=kb,
-            attachments=[att] if att else None,
+            chat_id=chat_id, text=text, format=HTML_FMT, keyboard=kb
         )
     except Exception as e:
-        if not att: raise
-        log(f"[CARD] отправка с картинкой не удалась ({e!r}), шлю без картинки")
-        _IMG_CACHE.clear()
-        await max_bot.send_message(chat_id=chat_id, text=text, format=HTML_FMT, keyboard=kb)
+        log(f"[CARD] ошибка отправки: {e!r}")
+        raise
 
 async def deliver_order(chat_id, order_id):
     key = (chat_id, order_id)
@@ -347,13 +314,10 @@ async def deliver_order(chat_id, order_id):
         if not o:
             await max_bot.send_message(chat_id=chat_id, text="❌ Заказ не найден.", keyboard=get_main_menu())
             return
+        # Сначала отправляем карточку с тем, что есть в кэше.
+        # Если координат нет — в фоне запрашиваем их, чтобы следующее нажатие было с картой.
         if o.get("gps_link") and not has_coords(o):
-            try: await max_bot.send_chat_action(chat_id)
-            except Exception: pass
-            try:
-                await asyncio.wait_for(fetch_single_order_coords(order_id, o, force=True), timeout=15)
-            except Exception as e:
-                log(f"[CARD] {order_id}: координаты не получены: {e!r}")
+            spawn(fetch_single_order_coords(order_id, o, force=True))
         await send_order_card(chat_id, o)
     except Exception as e:
         log(f"[CARD] ошибка {order_id}: {e!r}")
@@ -432,7 +396,7 @@ HELP_TEXT = (
     "• Или нажмите «📋 Выбрать заказ».\n\n"
     "🗺️ <b>Что я умею:</b>\n"
     "• Показывать адрес, перевозчика, машину и статус.\n"
-    "• Присылать картинку и кнопку «🗺️ Найти на карте», если есть GPS.\n"
+    "• Отправлять кнопку «🗺️ Найти на карте», если есть GPS.\n"
     "• Если координат нет — открывать трекер BaltGPS.\n\n"
     "🟢 в пути, GPS есть · 🔴 в пути, GPS нет · ✅ доставлен · 📦 прочее"
 )
@@ -648,7 +612,7 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
 
 # ============================================================================
-# ГЛАВНАЯ СТРАНИЦА (САЙТ)
+# ГЛАВНАЯ СТРАНИЦА (САЙТ) — БЕЗ ИЗМЕНЕНИЙ
 # ============================================================================
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
