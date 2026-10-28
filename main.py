@@ -7,7 +7,7 @@ import os, json, requests, asyncio, io, re, time, traceback
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ MAXAPI-SDK (БЕЗ НЕСУЩЕСТВУЮЩИХ МОДУЛЕЙ) ===
+# === ИМПОРТЫ ДЛЯ MAXAPI-SDK ===
 from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder, CallbackPayloadSchema
 
 app = FastAPI(title="ТПК Отслеживание")
@@ -224,6 +224,7 @@ def get_choice_menu(orders):
     return builder
 
 def build_order_card(o):
+    """Строит карточку БЕЗ синхронного парсинга GPS. Если координат нет — пишет «GPS загружается»."""
     log(f"[CARD] build for {o['order_id']}")
     response = (
         f"📦 **Заказ:** {o['order_id']}\n"
@@ -240,6 +241,7 @@ def build_order_card(o):
         map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
         builder.link("🗺️ Открыть карту", map_url)
     elif o.get("gps_link"):
+        response += "\n⏳ **GPS загружается…** Откройте карточку снова через 5–10 секунд или нажмите «Обновить GPS»."
         builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
     else:
         response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
@@ -317,7 +319,13 @@ async def handle_message(event):
 
         found = find_orders(text)
         if len(found) == 1:
-            response, builder = build_order_card(found[0])
+            o = found[0]
+            # Фоновый парсинг, если координат нет — НЕ блокируем ответ
+            if o.get("gps_link") and not (o.get("current_lat") and o.get("current_lng")):
+                if not gps_update_running():
+                    spawn(fetch_single_order_coords(o["order_id"], o, force=True))
+                    log(f"[GPS] фоновый парсинг для {o['order_id']} запущен")
+            response, builder = build_order_card(o)
             await event.message.answer(text=response, keyboard=builder)
         elif len(found) > 1:
             await event.message.answer(
@@ -404,6 +412,13 @@ async def handle_order_callback(callback_event, callback_payload_text):
         if not o:
             await callback_event.answer(notification="Заказ не найден.")
             return
+
+        # Фоновый парсинг, если координат нет — НЕ блокируем ответ
+        if o.get("gps_link") and not (o.get("current_lat") and o.get("current_lng")):
+            if not gps_update_running():
+                spawn(fetch_single_order_coords(order_id, o, force=True))
+                log(f"[GPS] фоновый парсинг для {order_id} запущен")
+
         response, builder = build_order_card(o)
         await callback_event.answer(message={"text": response}, keyboard=builder)
     except Exception as e:
@@ -437,10 +452,8 @@ async def handle_unknown_callback(callback_event, callback_payload_text):
         except Exception:
             pass
 
-# === ЗАПУСК POLLING ===
+# === ЗАПУСК POLLING (БЕЗ delete_webhook) ===
 async def run_max_bot():
-    # delete_webhook() не вызываем: в maxapi-sdk он требует url и падает с 400.
-    # При polling это не нужно — вебхук просто не установлен.
     while True:
         try:
             log("[BOT] start_polling")
@@ -624,8 +637,8 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
 
 # ============ ГЛАВНАЯ СТРАНИЦА ============
-# Вставьте сюда HTML-код из вашего текущего файла (user_portal и admin_panel).
-# Он не меняется.
+# HTML-код для @app.get("/") и @app.get("/admin") — вставьте из вашего текущего файла без изменений.
+# Он не трогался в этом исправлении.
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
