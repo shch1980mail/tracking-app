@@ -451,9 +451,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
 
-# ============ ГЛАВНАЯ СТРАНИЦА (БЕЗ ИЗМЕНЕНИЙ) ============
-# (Вставьте сюда HTML-код для @app.get("/") и @app.get("/admin"), который был в прошлом сообщении)
-
 # ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
