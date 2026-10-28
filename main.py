@@ -16,8 +16,23 @@ security = HTTPBasic()
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
+# === НАСТРОЙКИ ===
+SETTINGS_FILE = "settings.json"
+DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": False, "show_with_gps": False}
+
+if os.path.exists(SETTINGS_FILE):
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        SETTINGS = json.load(f)
+else:
+    SETTINGS = DEFAULT_SETTINGS.copy()
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
+
+def save_settings():
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
+
 DB = {}
-SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
 
 # === НАСТРОЙКА БОТА MAX ===
 MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
@@ -62,7 +77,6 @@ def get_coords_from_baltgps(gps_link: str):
         unit_id = items[0]
         sid = data.get("eid")
         
-        # Пробуем unit/calc_last
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "unit/calc_last", "params": json.dumps([unit_id]), "sid": sid
         }, timeout=(3.0, 5.0))
@@ -77,7 +91,6 @@ def get_coords_from_baltgps(gps_link: str):
             if "y" in pos and "x" in pos:
                 return float(pos["y"]), float(pos["x"]), "ok"
         
-        # Пробуем search_item
         r3 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
         }, timeout=(3.0, 5.0))
@@ -119,7 +132,7 @@ async def update_all_coords():
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
-# === ЛОГИКА БОТА MAX (С МЕНЮ) ===
+# === ЛОГИКА БОТА MAX ===
 @max_dp.message_created()
 async def handle_message(event):
     if not event.message or not event.message.body or not event.message.body.text:
@@ -127,7 +140,6 @@ async def handle_message(event):
 
     text = event.message.body.text.strip()
 
-    # 1. Приветствие и меню
     if text.lower() in ["/start", "привет", "меню", "начать", "/help"]:
         await event.message.answer(
             "👋 **Добро пожаловать в бот ТПК!**\n\n"
@@ -139,7 +151,6 @@ async def handle_message(event):
         )
         return
 
-    # 2. Кнопка "Выбрать заказ"
     if text == "📋 Выбрать заказ":
         active_orders = [o for o in DB.values() if o.get("status") == "в пути"]
         if not active_orders:
@@ -154,13 +165,11 @@ async def handle_message(event):
         await event.message.answer(response)
         return
 
-    # 3. Принудительное обновление GPS
     if text == "🔄 Обновить GPS":
         await event.message.answer("⏳ Запускаю обновление GPS в фоне. Это может занять минуту...")
         asyncio.create_task(update_all_coords())
         return
 
-    # 4. Поиск по номеру или 4 цифрам
     found_order = None
     search_query = text.upper()
     
@@ -194,14 +203,35 @@ async def handle_message(event):
             )
         elif o.get("gps_link"):
             await event.message.answer(
-                text=response,
-                buttons=[[{"type": "link", "text": "🗺️ Открыть карту BaltGPS", "url": o['gps_link']}]]
+                text=response + "\n\n🗺️ **Координаты ещё не загружены.** Нажмите кнопку ниже, чтобы запросить GPS в фоне.",
+                buttons=[[{"type": "callback", "text": "🗺️ Загрузить GPS (в фоне)", "payload": f"load_gps_{o['order_id']}"}]]
             )
         else:
-            response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+            response += "\n🗺️ GPS недоступен. Ориентируйтесь на примечание."
             await event.message.answer(response)
     else:
         await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или напишите «Выбрать заказ».")
+
+@max_dp.message_callback()
+async def handle_callback(event):
+    if not event.callback or not event.callback.payload:
+        return
+
+    payload = event.callback.payload
+    if payload.startswith("load_gps_"):
+        order_id = payload.replace("load_gps_", "")
+        if order_id in DB:
+            o = DB[order_id]
+            # Запускаем фоновое обновление
+            loop = asyncio.get_event_loop()
+            asyncio.create_task(loop.run_in_executor(None, fetch_single_order_coords, order_id, o))
+            
+            # Мгновенно сообщаем, что процесс запущен
+            await event.message.edit(
+                text="⏳ Запрос GPS отправлен в фоновом режиме. Пожалуйста, подождите 5-10 секунд и откройте заказ снова."
+            )
+        else:
+            await event.message.answer("Заказ не найден.")
 
 async def run_max_bot():
     await max_dp.start_polling(max_bot)
@@ -231,6 +261,7 @@ async def get_tabs():
 async def set_tabs(s: dict, user=Depends(check_admin)):
     global SETTINGS
     SETTINGS.update(s)
+    save_settings()
     return {"ok": True}
 
 @app.get("/api/shipments")
