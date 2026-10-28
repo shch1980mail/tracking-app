@@ -210,21 +210,23 @@ async def handle_message(event):
 
 # === ОБРАБОТКА НАЖАТИЙ КНОПОК ===
 @max_dp.message_callback()
-async def handle_callback(event):
-    payload = event.payload_text  # строка payload из .callback(...)
+async def handle_callback(event, payload):
     if not payload:
         return
 
-    # В maxapi-sdk у Message нет .edit(): сообщение с кнопкой
-    # обновляется через event.answer(message={...}, keyboard=...)
-    async def update(text, keyboard):
-        await event.answer(message={"text": text}, keyboard=keyboard)
-
+    # В maxapi-sdk ответ на callback отправляется через event.answer()
+    # с параметром message (обновление сообщения) или notification (всплывашка)
     if payload == "menu_choose_order":
-        await update("Выберите заказ из списка:", get_orders_menu())
+        await event.answer(
+            message={"text": "Выберите заказ из списка:"},
+            keyboard=get_orders_menu()
+        )
     elif payload == "menu_update_gps":
         asyncio.create_task(update_all_coords())
-        await update("⏳ Запускаю обновление GPS в фоне. Это может занять минуту...", get_main_menu())
+        await event.answer(
+            message={"text": "⏳ Запускаю обновление GPS в фоне. Это может занять минуту..."},
+            keyboard=get_main_menu()
+        )
     elif payload == "menu_help":
         help_text = (
             "👋 **Помощь**\n\n"
@@ -236,19 +238,18 @@ async def handle_callback(event):
             "• Отправлять точку на карте (если есть GPS).\n"
             "• Показывать примечания (если GPS нет)."
         )
-        await update(help_text, get_main_menu())
+        await event.answer(message={"text": help_text}, keyboard=get_main_menu())
     elif payload == "menu_back":
-        await update("👋 Главное меню:", get_main_menu())
+        await event.answer(message={"text": "👋 Главное меню:"}, keyboard=get_main_menu())
     elif payload.startswith("order_"):
         order_id = payload.replace("order_", "", 1)
         if order_id in DB:
             response, builder = build_order_card(DB[order_id])
-            await update(response, builder)
+            await event.answer(message={"text": response}, keyboard=builder)
         else:
             await event.answer(notification="Заказ не найден.")
     else:
         await event.answer()
-
 async def run_max_bot():
     try:
         await max_bot.delete_webhook()
