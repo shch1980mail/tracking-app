@@ -16,11 +16,23 @@ security = HTTPBasic()
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
+# === ЗАГРУЗКА НАСТРОЕК ===
 DB = {}
-SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
+SETTINGS_FILE = "settings.json"
+DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
+
+if os.path.exists(SETTINGS_FILE):
+    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+        SETTINGS = json.load(f)
+else:
+    SETTINGS = DEFAULT_SETTINGS.copy()
+
+def save_settings():
+    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+        json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
 
 # === НАСТРОЙКА БОТА MAX ===
-MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
+MAX_BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ" 
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
@@ -140,8 +152,7 @@ async def handle_message(event):
             "• Отправлять точку на карте (если есть GPS).\n"
             "• Показывать примечания (если GPS нет).\n\n"
             "🔄 **Обновление GPS:**\n"
-            "• Напишите **🔄 Обновить GPS**, чтобы принудительно обновить координаты для всех заказов.\n\n"
-            "💡 **Совет:** Если заказ не найден, проверьте, правильно ли вы ввели цифры."
+            "• Напишите **🔄 Обновить GPS**, чтобы принудительно обновить координаты для всех заказов."
         )
         await event.message.answer(help_text)
         return
@@ -193,7 +204,6 @@ async def handle_message(event):
         if o.get('comment'):
             response += f"📝 **Примечание:** {o['comment']}\n"
         
-        # Добавляем кнопку с картой (если есть координаты или ссылка)
         if o.get("current_lat") and o.get("current_lng"):
             map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
             await event.message.answer(
@@ -239,6 +249,7 @@ async def get_tabs():
 async def set_tabs(s: dict, user=Depends(check_admin)):
     global SETTINGS
     SETTINGS.update(s)
+    save_settings()
     return {"ok": True}
 
 @app.get("/api/shipments")
