@@ -3,12 +3,12 @@ from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import os, json, requests, asyncio, io
+import os, json, requests, asyncio, io, re, time, traceback
 import pandas as pd
 import openpyxl
 
 # === ИМПОРТЫ ДЛЯ MAXAPI-SDK ===
-from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
+from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder, CallbackPayloadSchema
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -103,41 +103,106 @@ def get_coords_from_baltgps(gps_link: str):
     except Exception:
         return None, None, "error"
 
-async def fetch_single_order_coords(order_id, o):
-    loop = asyncio.get_event_loop()
-    lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
+# ============================================================================
+# GPS: КЭШ + БЛОКИРОВКИ
+# ============================================================================
+GPS_CACHE_TTL = 120
+GPS_FORCE_COOLDOWN = 30
+GPS_CACHE = {}
+_gps_locks = {}
+_update_lock = None
+_last_full_update = 0.0
+_BG_TASKS = set()
+
+def log(*args):
+    print(*args, flush=True)
+
+def spawn(coro):
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    def _done(t):
+        _BG_TASKS.discard(t)
+        if not t.cancelled() and t.exception():
+            log(f"[TASK] ошибка фоновой задачи: {t.exception()!r}")
+    task.add_done_callback(_done)
+    return task
+
+def _order_lock(order_id):
+    lock = _gps_locks.get(order_id)
+    if lock is None:
+        lock = _gps_locks[order_id] = asyncio.Lock()
+    return lock
+
+def _apply_coords(o, lat, lng):
     if lat and lng:
-        o["current_lat"] = lat
-        o["current_lng"] = lng
-        o["has_valid_gps"] = True
+        o["current_lat"], o["current_lng"], o["has_valid_gps"] = lat, lng, True
     else:
-        o["current_lat"] = None
-        o["current_lng"] = None
-        o["has_valid_gps"] = False
+        o["current_lat"], o["current_lng"], o["has_valid_gps"] = None, None, False
 
-async def update_all_coords():
-    for o in DB.values():
-        if o.get("has_valid_gps") is False:
-            o["current_lat"] = None
-            o["current_lng"] = None
+def gps_update_running():
+    return _update_lock is not None and _update_lock.locked()
 
-    tasks = []
-    for order_id, o in DB.items():
-        if o.get("gps_link"):
-            tasks.append(fetch_single_order_coords(order_id, o))
-    
-    semaphore = asyncio.Semaphore(10)
-    async def limited_task(task):
-        async with semaphore: await task
-    await asyncio.gather(*(limited_task(t) for t in tasks))
-    save_db()
+async def fetch_single_order_coords(order_id, o, force=False):
+    async with _order_lock(order_id):
+        c = GPS_CACHE.get(order_id)
+        fresh = c and c["link"] == o.get("gps_link") and (time.time() - c["ts"]) < GPS_CACHE_TTL
+        if fresh and not force:
+            _apply_coords(o, c["lat"], c["lng"])
+            return
+        loop = asyncio.get_running_loop()
+        lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
+        GPS_CACHE[order_id] = {"ts": time.time(), "link": o.get("gps_link"), "lat": lat, "lng": lng}
+        _apply_coords(o, lat, lng)
 
-# === ФУНКЦИИ ДЛЯ КЛАВИАТУР (maxapi-sdk) ===
+async def update_all_coords(force=False):
+    global _update_lock, _last_full_update
+    if _update_lock is None:
+        _update_lock = asyncio.Lock()
+    if _update_lock.locked():
+        log("[GPS] обновление уже выполняется — повторный запуск пропущен")
+        return False
+    async with _update_lock:
+        if force and (time.time() - _last_full_update) < GPS_FORCE_COOLDOWN:
+            log("[GPS] кулдаун принудительного обновления — использую кэш")
+            force = False
+
+        for o in DB.values():
+            if o.get("has_valid_gps") is False:
+                o["current_lat"] = None
+                o["current_lng"] = None
+
+        semaphore = asyncio.Semaphore(10)
+        async def limited(order_id, o):
+            async with semaphore:
+                await fetch_single_order_coords(order_id, o, force=force)
+
+        items = [(oid, o) for oid, o in list(DB.items()) if o.get("gps_link")]
+        results = await asyncio.gather(*(limited(oid, o) for oid, o in items), return_exceptions=True)
+        for (oid, _), r in zip(items, results):
+            if isinstance(r, Exception):
+                log(f"[GPS] {oid}: ошибка {r!r}")
+        _last_full_update = time.time()
+        save_db()
+        log(f"[GPS] обновлено заказов: {len(items)}")
+        return True
+
+# ============================================================================
+# CALLBACK-PAYLOAD'Ы
+# ============================================================================
+class MenuAction(CallbackPayloadSchema):
+    prefix = "menu"
+    action: str
+
+class OrderAction(CallbackPayloadSchema):
+    prefix = "order"
+    order_id: str
+
+# === ФУНКЦИИ ДЛЯ КЛАВИАТУР ===
 def get_main_menu():
     builder = InlineKeyboardBuilder()
-    builder.callback("📋 Выбрать заказ", "menu_choose_order")
-    builder.callback("🔄 Обновить GPS", "menu_update_gps")
-    builder.callback("❓ Помощь", "menu_help")
+    builder.callback("📋 Выбрать заказ", MenuAction(action="choose_order").pack())
+    builder.callback("🔄 Обновить GPS", MenuAction(action="update_gps").pack())
+    builder.callback("❓ Помощь", MenuAction(action="help").pack())
     return builder
 
 def get_orders_menu():
@@ -145,12 +210,19 @@ def get_orders_menu():
     builder = InlineKeyboardBuilder()
     for o in active_orders:
         gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
-        builder.callback(f"{gps_mark} {o['order_id']}", f"order_{o['order_id']}")
-    builder.callback("🔙 Назад в меню", "menu_back")
+        builder.callback(f"{gps_mark} {o['order_id']}", OrderAction(order_id=o["order_id"]).pack())
+    builder.callback("🔙 Назад в меню", MenuAction(action="back").pack())
+    return builder
+
+def get_choice_menu(orders):
+    builder = InlineKeyboardBuilder()
+    for o in orders[:10]:
+        builder.callback(f"📦 {o['order_id']}", OrderAction(order_id=o["order_id"]).pack())
+    builder.callback("🔙 Назад в меню", MenuAction(action="back").pack())
     return builder
 
 def build_order_card(o):
-    """Текст + клавиатура карточки заказа (с картой Яндекс / BaltGPS)."""
+    log(f"[CARD] build for {o['order_id']}")
     response = (
         f"📦 **Заказ:** {o['order_id']}\n"
         f"📍 **Адрес:** {o.get('address') or '—'}\n"
@@ -170,97 +242,215 @@ def build_order_card(o):
     else:
         response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
 
-    builder.callback("🔙 Назад в меню", "menu_back")
+    builder.callback("🔙 Назад в меню", MenuAction(action="back").pack())
     return response, builder
+
+# === ПОИСК ЗАКАЗОВ ===
+def _norm(s):
+    return re.sub(r"[\s\-_/\\.]+", "", str(s)).upper()
+
+def find_orders(text):
+    q = _norm(text)
+    if not q:
+        return []
+    for oid, o in DB.items():
+        if _norm(oid) == q:
+            return [o]
+    tokens = re.findall(r"\d{4,}", text)
+    if not tokens and re.fullmatch(r"[\d\s\-]+", text.strip()):
+        digits = re.sub(r"\D", "", text)
+        tokens = [digits] if len(digits) >= 4 else []
+    for token in tokens:
+        ends = [o for oid, o in DB.items() if _norm(oid).endswith(token)]
+        if ends:
+            return ends[:10]
+        inside = [o for oid, o in DB.items() if token in _norm(oid)]
+        if inside:
+            return inside[:10]
+    if len(q) >= 3:
+        inside = [o for oid, o in DB.items() if q in _norm(oid)]
+        if inside:
+            return inside[:10]
+    return []
+
+# ============================================================================
+# ЗАЩИТА ОТ ЗАЦИКЛИВАНИЯ
+# ============================================================================
+async def error_guard(handler, event, data):
+    try:
+        return await handler(event, data)
+    except Exception as e:
+        log(f"[ERROR] handler={handler.__name__}, error={e!r}")
+        traceback.print_exc()
+        if hasattr(event, "answer"):
+            try:
+                await event.answer()
+            except Exception as e2:
+                log(f"[ERROR] failed to answer callback: {e2!r}")
+        return None
+
+max_dp.use(error_guard)
 
 # === ЛОГИКА БОТА MAX ===
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
-    await event.message.answer(
-        text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
-        keyboard=get_main_menu()
-    )
+    try:
+        await event.message.answer(
+            text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
+            keyboard=get_main_menu()
+        )
+    except Exception as e:
+        log(f"[START] ошибка: {e!r}")
+        traceback.print_exc()
 
 @max_dp.message_created()
 async def handle_message(event):
-    if not event.message or not event.message.body or not event.message.body.text:
-        return
+    try:
+        if not event.message or not event.message.body or not event.message.body.text:
+            return
+        text = event.message.body.text.strip()
+        if text.startswith("/"):
+            return
+        log(f"[MESSAGE] text={text!r}")
 
-    text = event.message.body.text.strip()
-    if text.startswith("/"):
-        return
+        found = find_orders(text)
+        if len(found) == 1:
+            response, builder = build_order_card(found[0])
+            await event.message.answer(text=response, keyboard=builder)
+        elif len(found) > 1:
+            await event.message.answer(
+                text=f"🔎 Найдено заказов: {len(found)}. Выберите нужный:",
+                keyboard=get_choice_menu(found)
+            )
+        else:
+            await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню.")
+    except Exception as e:
+        log(f"[MESSAGE] ошибка: {e!r}")
+        traceback.print_exc()
 
-    found_order = None
-    search_query = text.upper()
-    
-    if search_query.isdigit() and len(search_query) == 4:
-        for o in DB.values():
-            if o["order_id"].endswith(search_query):
-                found_order = o
-                break
-    else:
-        if search_query in DB:
-            found_order = DB[search_query]
+# ============================================================================
+# ОБРАБОТКА НАЖАТИЙ КНОПОК
+# ============================================================================
+HELP_TEXT = (
+    "👋 **Помощь**\n\n"
+    "🔍 **Как искать:**\n"
+    "• Введите **4 цифры** номера заказа (например, `1668`).\n"
+    "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
+    "🗺️ **Что я умею:**\n"
+    "• Показывать адрес, перевозчика, машину и статус.\n"
+    "• Отправлять точку на карте (если есть GPS).\n"
+    "• Показывать примечания (если GPS нет)."
+)
 
-    if found_order:
-        response, builder = build_order_card(found_order)
-        await event.message.answer(text=response, keyboard=builder)
-    else:
-        await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню.")
+@max_dp.message_callback(MenuAction.filter())
+async def handle_menu_callback(callback_event, callback_payload_text):
+    log(f"[CALLBACK] menu payload={callback_payload_text!r}")
+    try:
+        try:
+            parsed = callback_event.unpack(MenuAction)
+        except Exception as e:
+            log(f"[CALLBACK] menu unpack failed: {e!r}, payload={callback_payload_text!r}")
+            await callback_event.answer()
+            return
 
-# === ОБРАБОТКА НАЖАТИЙ КНОПОК ===
+        action = parsed.action
+        if action == "choose_order":
+            await callback_event.answer(
+                message={"text": "Выберите заказ из списка:"},
+                keyboard=get_orders_menu()
+            )
+        elif action == "update_gps":
+            if gps_update_running():
+                await callback_event.answer(
+                    message={"text": "⏳ GPS уже обновляется, подождите..."},
+                    keyboard=get_main_menu()
+                )
+            else:
+                spawn(update_all_coords(force=True))
+                await callback_event.answer(
+                    message={"text": "⏳ Запускаю обновление GPS..."},
+                    keyboard=get_main_menu()
+                )
+        elif action == "help":
+            await callback_event.answer(message={"text": HELP_TEXT}, keyboard=get_main_menu())
+        elif action == "back":
+            await callback_event.answer(message={"text": "👋 Главное меню:"}, keyboard=get_main_menu())
+        else:
+            log(f"[CALLBACK] неизвестное menu action: {action!r}")
+            await callback_event.answer()
+    except Exception as e:
+        log(f"[CALLBACK] menu handler error: {e!r}")
+        traceback.print_exc()
+        try:
+            await callback_event.answer(notification="Ошибка обработки кнопки.")
+        except Exception:
+            pass
+
+@max_dp.message_callback(OrderAction.filter())
+async def handle_order_callback(callback_event, callback_payload_text):
+    log(f"[CALLBACK] order payload={callback_payload_text!r}")
+    try:
+        try:
+            parsed = callback_event.unpack(OrderAction)
+        except Exception as e:
+            log(f"[CALLBACK] order unpack failed: {e!r}, payload={callback_payload_text!r}")
+            await callback_event.answer()
+            return
+
+        order_id = parsed.order_id
+        o = DB.get(order_id)
+        if not o:
+            await callback_event.answer(notification="Заказ не найден.")
+            return
+        response, builder = build_order_card(o)
+        await callback_event.answer(message={"text": response}, keyboard=builder)
+    except Exception as e:
+        log(f"[CALLBACK] order handler error: {e!r}")
+        traceback.print_exc()
+        try:
+            await callback_event.answer(notification="Ошибка обработки заказа.")
+        except Exception:
+            pass
+
 @max_dp.message_callback()
-async def handle_callback(event, payload):
-    if not payload:
-        return
+async def handle_unknown_callback(callback_event, callback_payload_text):
+    for schema in (MenuAction, OrderAction):
+        try:
+            schema.unpack(callback_payload_text)
+            log(f"[CALLBACK] known schema {schema.__name__} — skip unknown handler")
+            return
+        except Exception:
+            pass
 
-    # В maxapi-sdk ответ на callback отправляется через event.answer()
-    # с параметром message (обновление сообщения) или notification (всплывашка)
-    if payload == "menu_choose_order":
-        await event.answer(
-            message={"text": "Выберите заказ из списка:"},
-            keyboard=get_orders_menu()
-        )
-    elif payload == "menu_update_gps":
-        asyncio.create_task(update_all_coords())
-        await event.answer(
-            message={"text": "⏳ Запускаю обновление GPS в фоне. Это может занять минуту..."},
+    log(f"[CALLBACK] UNKNOWN payload={callback_payload_text!r}")
+    try:
+        await callback_event.answer(
+            message={"text": "ℹ️ Эта кнопка устарела. Главное меню:"},
             keyboard=get_main_menu()
         )
-    elif payload == "menu_help":
-        help_text = (
-            "👋 **Помощь**\n\n"
-            "🔍 **Как искать:**\n"
-            "• Введите **4 цифры** номера заказа (например, `1668`).\n"
-            "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
-            "🗺️ **Что я умею:**\n"
-            "• Показывать адрес, перевозчика, машину и статус.\n"
-            "• Отправлять точку на карте (если есть GPS).\n"
-            "• Показывать примечания (если GPS нет)."
-        )
-        await event.answer(message={"text": help_text}, keyboard=get_main_menu())
-    elif payload == "menu_back":
-        await event.answer(message={"text": "👋 Главное меню:"}, keyboard=get_main_menu())
-    elif payload.startswith("order_"):
-        order_id = payload.replace("order_", "", 1)
-        if order_id in DB:
-            response, builder = build_order_card(DB[order_id])
-            await event.answer(message={"text": response}, keyboard=builder)
-        else:
-            await event.answer(notification="Заказ не найден.")
-    else:
-        await event.answer()
+    except Exception as e:
+        log(f"[CALLBACK] fallback error: {e!r}")
+        try:
+            await callback_event.answer()
+        except Exception:
+            pass
+
 async def run_max_bot():
     try:
         await max_bot.delete_webhook()
     except Exception as e:
-        print(f"⚠️ delete_webhook: {e}")
-    try:
-        await max_dp.start_polling(max_bot)
-    except Exception as e:
-        import traceback
-        print(f"❌ MAX polling упал: {e}")
-        traceback.print_exc()
+        log(f"⚠️ delete_webhook: {e}")
+    while True:
+        try:
+            log("[BOT] start_polling")
+            await max_dp.start_polling(max_bot)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"❌ MAX polling упал: {e!r}")
+            traceback.print_exc()
+            await asyncio.sleep(10)
 
 @app.on_event("startup")
 async def startup():
@@ -268,9 +458,9 @@ async def startup():
     if os.path.exists("shipments.json"):
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
-        asyncio.create_task(update_all_coords())
+        spawn(update_all_coords())
     
-    asyncio.create_task(run_max_bot())
+    spawn(run_max_bot())
     print("✅ MAX-бот запущен")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
