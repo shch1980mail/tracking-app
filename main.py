@@ -9,7 +9,7 @@ import openpyxl
 
 # === ИМПОРТЫ ДЛЯ MAXAPI-SDK (БЕЗ ПРОБЛЕМНЫХ КЛАССОВ) ===
 from maxapi import Bot, Dispatcher, Command
-from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
+from maxapi import InlineKeyboardBuilder
 from maxapi.types import LinkButton, CallbackButton
 
 app = FastAPI(title="ТПК Отслеживание")
