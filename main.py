@@ -134,6 +134,28 @@ async def update_all_coords():
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
+# === ФУНКЦИЯ ДЛЯ МЕНЮ ===
+def get_main_menu():
+    return {
+        "type": "inline_keyboard",
+        "payload": {
+            "buttons": [
+                [{"type": "callback", "text": "📋 Выбрать заказ", "payload": "menu_choose_order"}],
+                [{"type": "callback", "text": "🔄 Обновить GPS", "payload": "menu_update_gps"}],
+                [{"type": "callback", "text": "❓ Помощь", "payload": "menu_help"}]
+            ]
+        }
+    }
+
+def get_orders_menu():
+    active_orders = [o for o in DB.values() if o.get("status") == "в пути"][:10]
+    buttons = []
+    for o in active_orders:
+        gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
+        buttons.append([{"type": "callback", "text": f"{gps_mark} {o['order_id']}", "payload": f"order_{o['order_id']}"}])
+    buttons.append([{"type": "callback", "text": "🔙 Назад в меню", "payload": "menu_back"}])
+    return {"type": "inline_keyboard", "payload": {"buttons": buttons}}
+
 # === ЛОГИКА БОТА MAX ===
 @max_dp.message_created()
 async def handle_message(event):
@@ -142,36 +164,15 @@ async def handle_message(event):
 
     text = event.message.body.text.strip()
 
-    if text.lower() in ["/start", "привет", "меню", "начать", "/help"]:
+    # 1. Приветствие и меню
+    if text.lower() in ["/start", "привет", "меню", "начать"]:
         await event.message.answer(
-            "👋 **Добро пожаловать в бот ТПК!**\n\n"
-            "🔍 **Как искать:** Введите **4 цифры** номера заказа (например, `1668`).\n\n"
-            "📋 **Доступные действия:**\n"
-            "• Напишите **📋 Выбрать заказ**, чтобы увидеть список.\n"
-            "• Напишите **🔄 Обновить GPS**, чтобы обновить координаты.\n\n"
-            "👇 Просто отправьте номер или команду."
+            text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
+            attachments=[get_main_menu()]
         )
         return
 
-    if text == "📋 Выбрать заказ":
-        active_orders = [o for o in DB.values() if o.get("status") == "в пути"]
-        if not active_orders:
-            await event.message.answer("Нет активных заказов в пути.")
-            return
-        
-        response = "Выберите заказ (введите 4 цифры):\n\n"
-        for o in active_orders[:15]:
-            gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
-            response += f"{gps_mark} {o['order_id']} ({o.get('address', '—')})\n"
-        
-        await event.message.answer(response)
-        return
-
-    if text == "🔄 Обновить GPS":
-        await event.message.answer("⏳ Запускаю обновление GPS в фоне. Это может занять минуту...")
-        asyncio.create_task(update_all_coords())
-        return
-
+    # 2. Поиск по номеру (если пользователь ввел текст)
     found_order = None
     search_query = text.upper()
     
@@ -201,35 +202,91 @@ async def handle_message(event):
             map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
             await event.message.answer(
                 text=response,
-                buttons=[[{"type": "link", "text": "🗺️ Открыть карту", "url": map_url}]]
+                buttons=[[{"type": "link", "text": "🗺️ Открыть карту", "url": map_url}], [{"type": "callback", "text": "🔙 Назад в меню", "payload": "menu_back"}]]
             )
         elif o.get("gps_link"):
             await event.message.answer(
-                text=response + "\n\n🗺️ **Координаты ещё не загружены.** Нажмите кнопку ниже, чтобы запросить GPS в фоне.",
-                buttons=[[{"type": "callback", "text": "🗺️ Загрузить GPS (в фоне)", "payload": f"load_gps_{o['order_id']}"}]]
+                text=response,
+                buttons=[[{"type": "link", "text": "🗺️ Открыть карту BaltGPS", "url": o['gps_link']}], [{"type": "callback", "text": "🔙 Назад в меню", "payload": "menu_back"}]]
             )
         else:
-            response += "\n🗺️ GPS недоступен. Ориентируйтесь на примечание."
-            await event.message.answer(response)
+            response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+            await event.message.answer(
+                text=response,
+                buttons=[[{"type": "callback", "text": "🔙 Назад в меню", "payload": "menu_back"}]]
+            )
     else:
-        await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или напишите «Выбрать заказ».")
+        await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Попробуйте снова или выберите действие из меню.")
 
+# === ОБРАБОТКА НАЖАТИЙ КНОПОК ===
 @max_dp.message_callback()
 async def handle_callback(event):
     if not event.callback or not event.callback.payload:
         return
 
     payload = event.callback.payload
-    if payload.startswith("load_gps_"):
-        order_id = payload.replace("load_gps_", "")
+
+    if payload == "menu_choose_order":
+        await event.message.edit(
+            text="Выберите заказ из списка:",
+            attachments=[get_orders_menu()]
+        )
+    elif payload == "menu_update_gps":
+        await event.message.edit(
+            text="⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
+            attachments=[get_main_menu()]
+        )
+        asyncio.create_task(update_all_coords())
+    elif payload == "menu_help":
+        help_text = (
+            "👋 **Помощь**\n\n"
+            "🔍 **Как искать:**\n"
+            "• Введите **4 цифры** номера заказа (например, `1668`).\n"
+            "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
+            "🗺️ **Что я умею:**\n"
+            "• Показывать адрес, перевозчика, машину и статус.\n"
+            "• Отправлять точку на карте (если есть GPS).\n"
+            "• Показывать примечания (если GPS нет).\n\n"
+            "🔄 **Обновление GPS:**\n"
+            "• Нажмите **🔄 Обновить GPS**, чтобы обновить координаты."
+        )
+        await event.message.edit(text=help_text, attachments=[get_main_menu()])
+    elif payload == "menu_back":
+        await event.message.edit(
+            text="👋 Главное меню:",
+            attachments=[get_main_menu()]
+        )
+    elif payload.startswith("order_"):
+        order_id = payload.replace("order_", "")
         if order_id in DB:
             o = DB[order_id]
-            loop = asyncio.get_event_loop()
-            asyncio.create_task(loop.run_in_executor(None, fetch_single_order_coords, order_id, o))
-            
-            await event.message.edit(
-                text="⏳ Запрос GPS отправлен в фоновом режиме. Пожалуйста, подождите 5-10 секунд и откройте заказ снова."
+            response = (
+                f"📦 **Заказ:** {o['order_id']}\n"
+                f"📍 **Адрес:** {o.get('address') or '—'}\n"
+                f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+                f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+                f"📊 **Статус:** {o.get('status') or '—'}\n"
             )
+            if o.get('comment'):
+                response += f"📝 **Примечание:** {o['comment']}\n"
+            
+            if o.get("current_lat") and o.get("current_lng"):
+                map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+                await event.message.edit(
+                    text=response,
+                    buttons=[[{"type": "link", "text": "🗺️ Открыть карту", "url": map_url}], [{"type": "callback", "text": "🔙 Назад в меню", "payload": "menu_back"}]]
+                )
+            elif o.get("gps_link"):
+                await event.message.edit(
+                    text=response,
+                    buttons=[[{"type": "link", "text": "🗺️ Открыть карту BaltGPS", "url": o['gps_link']}], [{"type": "callback", "text": "🔙 Назад в меню", "payload": "menu_back"}]]
+                )
+            else:
+                response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+                await event.message.edit(
+                    text=response,
+                    buttons=[[{"type": "callback", "text": "🔙 Назад в меню", "payload": "menu_back"}]]
+                )
         else:
             await event.message.answer("Заказ не найден.")
 
