@@ -7,10 +7,8 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ MAXAPI-SDK (БЕЗ ПРОБЛЕМНЫХ КЛАССОВ) ===
-from maxapi import Bot, Dispatcher, Command
-from maxapi import InlineKeyboardBuilder
-from maxapi.types import LinkButton, CallbackButton
+# === ИМПОРТЫ ДЛЯ MAXAPI-SDK ===
+from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -134,29 +132,29 @@ async def update_all_coords():
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
-# === ФУНКЦИИ ДЛЯ КЛАВИАТУР ===
+# === ФУНКЦИИ ДЛЯ КЛАВИАТУР (maxapi-sdk) ===
 def get_main_menu():
     builder = InlineKeyboardBuilder()
-    builder.row(CallbackButton(text="📋 Выбрать заказ", payload="menu_choose_order"))
-    builder.row(CallbackButton(text="🔄 Обновить GPS", payload="menu_update_gps"))
-    builder.row(CallbackButton(text="❓ Помощь", payload="menu_help"))
-    return builder.as_markup()
+    builder.callback("📋 Выбрать заказ", "menu_choose_order")
+    builder.callback("🔄 Обновить GPS", "menu_update_gps")
+    builder.callback("❓ Помощь", "menu_help")
+    return builder
 
 def get_orders_menu():
     active_orders = [o for o in DB.values() if o.get("status") == "в пути"][:10]
     builder = InlineKeyboardBuilder()
     for o in active_orders:
         gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
-        builder.row(CallbackButton(text=f"{gps_mark} {o['order_id']}", payload=f"order_{o['order_id']}"))
-    builder.row(CallbackButton(text="🔙 Назад в меню", payload="menu_back"))
-    return builder.as_markup()
+        builder.callback(f"{gps_mark} {o['order_id']}", f"order_{o['order_id']}")
+    builder.callback("🔙 Назад в меню", "menu_back")
+    return builder
 
-# === ЛОГИКА БОТА (БЕЗ АННОТАЦИЙ ТИПОВ) ===
+# === ЛОГИКА БОТА MAX ===
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
     await event.message.answer(
         text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
-        attachments=[get_main_menu()]
+        keyboard=get_main_menu()
     )
 
 @max_dp.message_created()
@@ -165,7 +163,6 @@ async def handle_message(event):
         return
 
     text = event.message.body.text.strip()
-    
     if text.startswith("/"):
         return
 
@@ -196,19 +193,20 @@ async def handle_message(event):
         builder = InlineKeyboardBuilder()
         if o.get("current_lat") and o.get("current_lng"):
             map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-            builder.row(LinkButton(text="🗺️ Открыть карту", url=map_url))
+            builder.link("🗺️ Открыть карту", map_url)
         elif o.get("gps_link"):
-            builder.row(LinkButton(text="🗺️ Открыть карту BaltGPS", url=o['gps_link']))
+            builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
         else:
             response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
         
-        builder.row(CallbackButton(text="🔙 Назад в меню", payload="menu_back"))
+        builder.callback("🔙 Назад в меню", "menu_back")
         
-        await event.message.answer(text=response, attachments=[builder.as_markup()])
+        await event.message.answer(text=response, keyboard=builder)
     else:
         await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню.")
 
-@max_dp.callback_query()
+# === ОБРАБОТКА НАЖАТИЙ КНОПОК ===
+@max_dp.message_callback()
 async def handle_callback(event):
     if not event.callback or not event.callback.payload:
         return
@@ -219,12 +217,12 @@ async def handle_callback(event):
     if payload == "menu_choose_order":
         await event.message.edit(
             text="Выберите заказ из списка:",
-            attachments=[get_orders_menu()]
+            keyboard=get_orders_menu()
         )
     elif payload == "menu_update_gps":
         await event.message.edit(
             text="⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
-            attachments=[get_main_menu()]
+            keyboard=get_main_menu()
         )
         asyncio.create_task(update_all_coords())
     elif payload == "menu_help":
@@ -238,11 +236,11 @@ async def handle_callback(event):
             "• Отправлять точку на карте (если есть GPS).\n"
             "• Показывать примечания (если GPS нет)."
         )
-        await event.message.edit(text=help_text, attachments=[get_main_menu()])
+        await event.message.edit(text=help_text, keyboard=get_main_menu())
     elif payload == "menu_back":
         await event.message.edit(
             text="👋 Главное меню:",
-            attachments=[get_main_menu()]
+            keyboard=get_main_menu()
         )
     elif payload.startswith("order_"):
         order_id = payload.replace("order_", "")
@@ -261,14 +259,14 @@ async def handle_callback(event):
             builder = InlineKeyboardBuilder()
             if o.get("current_lat") and o.get("current_lng"):
                 map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-                builder.row(LinkButton(text="🗺️ Открыть карту", url=map_url))
+                builder.link("🗺️ Открыть карту", map_url)
             elif o.get("gps_link"):
-                builder.row(LinkButton(text="🗺️ Открыть карту BaltGPS", url=o['gps_link']))
+                builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
             else:
                 response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
             
-            builder.row(CallbackButton(text="🔙 Назад в меню", payload="menu_back"))
-            await event.message.edit(text=response, attachments=[builder.as_markup()])
+            builder.callback("🔙 Назад в меню", "menu_back")
+            await event.message.edit(text=response, keyboard=builder)
         else:
             await event.message.answer("Заказ не найден.")
 
