@@ -7,9 +7,8 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ БОТА MAX (ПРАВИЛЬНЫЕ) ===
+# === ИМПОРТЫ ДЛЯ MAXAPI-SDK (БЕЗ ПРОБЛЕМНЫХ КЛАССОВ) ===
 from maxapi import Bot, Dispatcher, Command
-from maxapi.types import MessageCreated, CallbackQuery
 from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 from maxapi.types import LinkButton, CallbackButton
 
@@ -38,7 +37,7 @@ def save_settings():
 DB = {}
 
 # === НАСТРОЙКА БОТА MAX ===
-MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
+MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr"
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
@@ -135,7 +134,7 @@ async def update_all_coords():
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
-# === ФУНКЦИИ ДЛЯ КЛАВИАТУР (ПРАВИЛЬНЫЙ СИНТАКСИС) ===
+# === ФУНКЦИИ ДЛЯ КЛАВИАТУР ===
 def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.row(CallbackButton(text="📋 Выбрать заказ", payload="menu_choose_order"))
@@ -152,23 +151,21 @@ def get_orders_menu():
     builder.row(CallbackButton(text="🔙 Назад в меню", payload="menu_back"))
     return builder.as_markup()
 
-# === ЛОГИКА БОТА MAX (ПРАВИЛЬНЫЕ ОБРАБОТЧИКИ) ===
+# === ЛОГИКА БОТА (БЕЗ АННОТАЦИЙ ТИПОВ) ===
 @max_dp.message_created(Command("start"))
-async def handle_start(event: MessageCreated):
+async def handle_start(event):
     await event.message.answer(
         text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
         attachments=[get_main_menu()]
     )
 
-# Обработка текстовых сообщений (поиск по номеру)
 @max_dp.message_created()
-async def handle_message(event: MessageCreated):
+async def handle_message(event):
     if not event.message or not event.message.body or not event.message.body.text:
         return
 
     text = event.message.body.text.strip()
     
-    # Игнорируем команды, если они пришли не через /start (на всякий случай)
     if text.startswith("/"):
         return
 
@@ -211,14 +208,13 @@ async def handle_message(event: MessageCreated):
     else:
         await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню.")
 
-# === ОБРАБОТКА НАЖАТИЙ КНОПОК (CALLBACK) ===
 @max_dp.callback_query()
-async def handle_callback(event: CallbackQuery):
+async def handle_callback(event):
     if not event.callback or not event.callback.payload:
         return
 
     payload = event.callback.payload
-    await event.answer() # Обязательно отвечаем на callback, чтобы убрать "часики"
+    await event.answer()
 
     if payload == "menu_choose_order":
         await event.message.edit(
@@ -277,8 +273,7 @@ async def handle_callback(event: CallbackQuery):
             await event.message.answer("Заказ не найден.")
 
 async def run_max_bot():
-    # Удаляем вебхук, если он был установлен, чтобы polling работал корректно [citation:3][citation:5]
-    await max_bot.delete_webhook() 
+    await max_bot.delete_webhook()
     await max_dp.start_polling(max_bot)
 
 @app.on_event("startup")
@@ -297,7 +292,7 @@ def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# === API ДЛЯ САЙТА (без изменений) ===
+# === API ДЛЯ САЙТА ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
@@ -508,7 +503,6 @@ async def user_portal():
 <body>
     <div class="header"><h1>📍 ТПК — Отслеживание</h1><button class="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button></div>
 
-    <!-- Блок с QR-кодом -->
     <div style="max-width: 1100px; margin: 0 auto 32px; background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.5); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 30px; color: white;">
         <div style="flex: 1; min-width: 280px;">
             <h2 style="margin-bottom: 12px; font-size: 24px; font-weight: 700; display: flex; align-items: center; gap: 10px;">
