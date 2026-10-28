@@ -35,7 +35,7 @@ def save_settings():
 DB = {}
 
 # === НАСТРОЙКА БОТА MAX ===
-MAX_BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ" 
+MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
