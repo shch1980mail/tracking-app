@@ -193,7 +193,6 @@ async def update_all_coords(force=False):
 # ============================================================================
 HTML_FMT = TextFormat.HTML
 
-# Картинки из переменных окружения
 CAR_IMAGE_URL = os.environ.get("CAR_IMAGE_URL", "").strip()
 WAIT_IMAGE_URL = os.environ.get("WAIT_IMAGE_URL", "").strip()
 CAR_IMAGE_PATH = os.environ.get("CAR_IMAGE_PATH", "truck.png")
@@ -649,7 +648,7 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
 
 # ============================================================================
-# ГЛАВНАЯ СТРАНИЦА
+# ГЛАВНАЯ СТРАНИЦА (САЙТ)
 # ============================================================================
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
