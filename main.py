@@ -197,7 +197,7 @@ class OrderAction(CallbackPayloadSchema):
     prefix = "order"
     order_id: str
 
-# === ФУНКЦИИ ДЛЯ КЛАВИАТУР (КОРОТКИЕ КНОПКИ) ===
+# === КЛАВИАТУРЫ ===
 def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.callback("📋 Выбрать заказ", MenuAction(action="choose_order").pack())
@@ -224,8 +224,6 @@ def get_choice_menu(orders):
     return builder
 
 def build_order_card(o):
-    """Строит карточку БЕЗ синхронного парсинга GPS. Если координат нет — пишет «GPS загружается»."""
-    log(f"[CARD] build for {o['order_id']}")
     response = (
         f"📦 **Заказ:** {o['order_id']}\n"
         f"📍 **Адрес:** {o.get('address') or '—'}\n"
@@ -241,7 +239,7 @@ def build_order_card(o):
         map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
         builder.link("🗺️ Открыть карту", map_url)
     elif o.get("gps_link"):
-        response += "\n⏳ **GPS загружается…** Откройте карточку снова через 5–10 секунд или нажмите «Обновить GPS»."
+        response += "\n🔍 **Ищу машину на карте…**"
         builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
     else:
         response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
@@ -295,7 +293,7 @@ async def error_guard(handler, event, data):
 
 max_dp.use(error_guard)
 
-# === ЛОГИКА БОТА MAX ===
+# === ЛОГИКА БОТА ===
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
     try:
@@ -306,6 +304,34 @@ async def handle_start(event):
     except Exception as e:
         log(f"[START] ошибка: {e!r}")
         traceback.print_exc()
+
+async def send_map_later(event, order_id: str):
+    """Через 2 секунды после «Ищу машину…» отправляет «Машина найдена!» с картой."""
+    await asyncio.sleep(2)
+    o = DB.get(order_id)
+    if not o:
+        return
+    if o.get("current_lat") and o.get("current_lng"):
+        map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+        response = (
+            f"✅ **Машина найдена!**\n"
+            f"📦 **Заказ:** {o['order_id']}\n"
+            f"📍 **Адрес:** {o.get('address') or '—'}\n"
+            f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+            f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+        )
+        builder = InlineKeyboardBuilder()
+        builder.link("🗺️ Открыть карту", map_url)
+        builder.callback("🔙 Назад", MenuAction(action="back").pack())
+        try:
+            await event.message.answer(text=response, keyboard=builder)
+        except Exception as e:
+            log(f"[MAP] ошибка отправки: {e!r}")
+    else:
+        try:
+            await event.message.answer(text=f"❌ Не удалось найти машину для {order_id}. Попробуйте «Обновить GPS».")
+        except Exception as e:
+            log(f"[MAP] ошибка: {e!r}")
 
 @max_dp.message_created()
 async def handle_message(event):
@@ -320,13 +346,16 @@ async def handle_message(event):
         found = find_orders(text)
         if len(found) == 1:
             o = found[0]
-            # Фоновый парсинг, если координат нет — НЕ блокируем ответ
             if o.get("gps_link") and not (o.get("current_lat") and o.get("current_lng")):
-                if not gps_update_running():
-                    spawn(fetch_single_order_coords(o["order_id"], o, force=True))
-                    log(f"[GPS] фоновый парсинг для {o['order_id']} запущен")
-            response, builder = build_order_card(o)
-            await event.message.answer(text=response, keyboard=builder)
+                await event.message.answer(
+                    text=f"📦 **Заказ:** {o['order_id']}\n\n🔍 **Ищу машину на карте…**",
+                    keyboard=get_main_menu()
+                )
+                spawn(fetch_single_order_coords(o["order_id"], o, force=True))
+                spawn(send_map_later(event, o["order_id"]))
+            else:
+                response, builder = build_order_card(o)
+                await event.message.answer(text=response, keyboard=builder)
         elif len(found) > 1:
             await event.message.answer(
                 text=f"🔎 Найдено заказов: {len(found)}. Выберите нужный:",
@@ -338,9 +367,6 @@ async def handle_message(event):
         log(f"[MESSAGE] ошибка: {e!r}")
         traceback.print_exc()
 
-# ============================================================================
-# ОБРАБОТКА НАЖАТИЙ КНОПОК
-# ============================================================================
 HELP_TEXT = (
     "👋 **Помощь**\n\n"
     "🔍 **Как искать:**\n"
@@ -359,7 +385,7 @@ async def handle_menu_callback(callback_event, callback_payload_text):
         try:
             parsed = callback_event.unpack(MenuAction)
         except Exception as e:
-            log(f"[CALLBACK] menu unpack failed: {e!r}, payload={callback_payload_text!r}")
+            log(f"[CALLBACK] menu unpack failed: {e!r}")
             await callback_event.answer()
             return
 
@@ -372,13 +398,13 @@ async def handle_menu_callback(callback_event, callback_payload_text):
         elif action == "update_gps":
             if gps_update_running():
                 await callback_event.answer(
-                    message={"text": "⏳ GPS уже обновляется, подождите..."},
+                    message={"text": "⏳ GPS уже обновляется…"},
                     keyboard=get_main_menu()
                 )
             else:
                 spawn(update_all_coords(force=True))
                 await callback_event.answer(
-                    message={"text": "⏳ Запускаю обновление GPS..."},
+                    message={"text": "⏳ Запускаю обновление GPS…"},
                     keyboard=get_main_menu()
                 )
         elif action == "help":
@@ -386,7 +412,6 @@ async def handle_menu_callback(callback_event, callback_payload_text):
         elif action == "back":
             await callback_event.answer(message={"text": "👋 Главное меню:"}, keyboard=get_main_menu())
         else:
-            log(f"[CALLBACK] неизвестное menu action: {action!r}")
             await callback_event.answer()
     except Exception as e:
         log(f"[CALLBACK] menu handler error: {e!r}")
@@ -403,7 +428,7 @@ async def handle_order_callback(callback_event, callback_payload_text):
         try:
             parsed = callback_event.unpack(OrderAction)
         except Exception as e:
-            log(f"[CALLBACK] order unpack failed: {e!r}, payload={callback_payload_text!r}")
+            log(f"[CALLBACK] order unpack failed: {e!r}")
             await callback_event.answer()
             return
 
@@ -413,14 +438,16 @@ async def handle_order_callback(callback_event, callback_payload_text):
             await callback_event.answer(notification="Заказ не найден.")
             return
 
-        # Фоновый парсинг, если координат нет — НЕ блокируем ответ
         if o.get("gps_link") and not (o.get("current_lat") and o.get("current_lng")):
-            if not gps_update_running():
-                spawn(fetch_single_order_coords(order_id, o, force=True))
-                log(f"[GPS] фоновый парсинг для {order_id} запущен")
-
-        response, builder = build_order_card(o)
-        await callback_event.answer(message={"text": response}, keyboard=builder)
+            await callback_event.answer(
+                message={"text": f"📦 **Заказ:** {o['order_id']}\n\n🔍 **Ищу машину на карте…**"},
+                keyboard=get_main_menu()
+            )
+            spawn(fetch_single_order_coords(order_id, o, force=True))
+            spawn(send_map_later(callback_event, order_id))
+        else:
+            response, builder = build_order_card(o)
+            await callback_event.answer(message={"text": response}, keyboard=builder)
     except Exception as e:
         log(f"[CALLBACK] order handler error: {e!r}")
         traceback.print_exc()
@@ -434,25 +461,21 @@ async def handle_unknown_callback(callback_event, callback_payload_text):
     for schema in (MenuAction, OrderAction):
         try:
             schema.unpack(callback_payload_text)
-            log(f"[CALLBACK] known schema {schema.__name__} — skip unknown handler")
             return
         except Exception:
             pass
-
     log(f"[CALLBACK] UNKNOWN payload={callback_payload_text!r}")
     try:
         await callback_event.answer(
             message={"text": "ℹ️ Эта кнопка устарела. Главное меню:"},
             keyboard=get_main_menu()
         )
-    except Exception as e:
-        log(f"[CALLBACK] fallback error: {e!r}")
+    except Exception:
         try:
             await callback_event.answer()
         except Exception:
             pass
 
-# === ЗАПУСК POLLING (БЕЗ delete_webhook) ===
 async def run_max_bot():
     while True:
         try:
@@ -473,7 +496,6 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         spawn(update_all_coords())
-    
     spawn(run_max_bot())
     print("✅ MAX-бот запущен (Polling режим)")
 
@@ -498,7 +520,6 @@ async def set_tabs(s: dict, user=Depends(check_admin)):
 async def list_shipments(status: Optional[str] = None, search: Optional[str] = None, sort_by: str = "gps", force_refresh: bool = False):
     if force_refresh:
         asyncio.create_task(update_all_coords())
-
     result = []
     for o in DB.values():
         s = str(o.get("status", "")).lower()
@@ -506,23 +527,19 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
         if status == "delivered" and s not in ['завершено', 'выгружено']: continue
         if status == "with_gps":
             if not o.get("current_lat"): continue
-        
         if search:
             q = search.lower()
             if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower():
                 continue
         result.append(o)
-    
     def sort_key(x):
         is_valid = 1 if x.get("current_lat") else 0
         order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
-        
         if sort_by == "gps": return (not is_valid, order_id)
         elif sort_by == "order_id": return order_id
         elif sort_by == "city": return (city == "", city, order_id)
         return (not is_valid, order_id)
-
     result.sort(key=sort_key)
     return result
 
@@ -530,7 +547,6 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
 async def get_online_coords(order_id: str):
     if order_id not in DB: raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
-    
     if o.get("gps_link"):
         lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
@@ -544,7 +560,6 @@ async def get_online_coords(order_id: str):
                 raise HTTPException(400, "Ссылка на GPS устарела")
             elif status == "error":
                 raise HTTPException(503, "Спутник не отвечает")
-    
     if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
     raise HTTPException(404, "GPS недоступен")
 
@@ -575,44 +590,34 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         wb = openpyxl.load_workbook(io.BytesIO(contents))
         if "Исх.логистика" not in wb.sheetnames:
             raise HTTPException(400, "В файле нет листа 'Исх.логистика'")
-            
         ws = wb["Исх.логистика"]
         for row_idx in range(1, ws.max_row + 1):
             if ws.row_dimensions[row_idx].hidden:
                 ws.row_dimensions[row_idx].hidden = False
-                
         output = io.BytesIO()
         wb.save(output)
         output.seek(0)
-        
         df = pd.read_excel(output, sheet_name="Исх.логистика", dtype=str)
-        
         new_db = {}
         skipped = 0
         last_orders = []
-        
         for _, row in df.iterrows():
             raw_order = row.get('Заказ')
             if pd.isna(raw_order) or str(raw_order).strip() == '' or str(raw_order).strip().lower() == 'nan':
                 skipped += 1
                 continue
-                
             order_id = str(raw_order).strip()
             last_orders.append(order_id)
             if len(last_orders) > 5: last_orders.pop(0)
-            
             def fmt_date(val):
                 if pd.isna(val) or str(val).strip() == '': return None
                 try: return pd.to_datetime(val).strftime('%Y-%m-%d')
                 except: return str(val)[:10]
-
             def safe_float(val):
                 if pd.isna(val) or str(val).strip() == '': return None
                 try: return float(str(val).replace(',', '.').strip())
                 except: return None
-
             gps = str(row.get('ссылка')).strip() if not pd.isna(row.get('ссылка')) else None
-            
             new_db[order_id] = {
                 "order_id": order_id,
                 "address": str(row.get('Адрес доставки')).strip() if not pd.isna(row.get('Адрес доставки')) else None,
@@ -626,15 +631,14 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
                 "status": str(row.get('статус доставки')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
                 "has_valid_gps": None
             }
-            
         DB = new_db
         save_db()
         asyncio.create_task(update_all_coords())
-        
         debug_msg = ", ".join(last_orders)
         return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}. Последние: {debug_msg}"}
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
+
 
 # ============ ГЛАВНАЯ СТРАНИЦА ============
 # HTML-код для @app.get("/") и @app.get("/admin") — вставьте из вашего текущего файла без изменений.
