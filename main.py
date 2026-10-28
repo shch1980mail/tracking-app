@@ -7,7 +7,7 @@ import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ БОТА MAX (ТОЛЬКО БАЗОВЫЕ) ===
+# === ИМПОРТЫ ДЛЯ БОТА MAX ===
 from maxapi import Bot, Dispatcher
 
 app = FastAPI(title="ТПК Отслеживание")
@@ -119,22 +119,31 @@ async def update_all_coords():
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
-# === ЛОГИКА БОТА MAX (БЕЗ АННОТАЦИЙ ТИПОВ) ===
+# === ЛОГИКА БОТА MAX ===
 @max_dp.message_created()
 async def handle_message(event):
-    # Проверка, что это текстовое сообщение
     if not event.message or not event.message.body or not event.message.body.text:
         return
 
     text = event.message.body.text.strip()
 
-    # 1. Приветствие и меню
-    if text.lower() in ["/start", "привет", "меню", "начать"]:
-        await event.message.answer(
-            "👋 Я бот для отслеживания заказов ТПК.\n\n"
-            "Введите **4 цифры** номера заказа (например, `1668`), чтобы получить информацию.\n"
-            "Или нажмите кнопку ниже, чтобы увидеть список активных заказов."
+    # 1. Помощник
+    if text.lower() in ["/start", "/help", "помощь", "привет", "меню", "начать"]:
+        help_text = (
+            "👋 **Привет! Я бот для отслеживания заказов ТПК.**\n\n"
+            "🔍 **Как искать:**\n"
+            "• Введите **4 цифры** номера заказа (например, `1668`).\n"
+            "• Или напишите полный номер (например, `ТПК00001668`).\n"
+            "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список активных заказов.\n\n"
+            "🗺️ **Что я умею:**\n"
+            "• Показывать адрес, перевозчика, машину и статус.\n"
+            "• Отправлять точку на карте (если есть GPS).\n"
+            "• Показывать примечания (если GPS нет).\n\n"
+            "🔄 **Обновление GPS:**\n"
+            "• Напишите **🔄 Обновить GPS**, чтобы принудительно обновить координаты для всех заказов.\n\n"
+            "💡 **Совет:** Если заказ не найден, проверьте, правильно ли вы ввели цифры."
         )
+        await event.message.answer(help_text)
         return
 
     # 2. Кнопка "Выбрать заказ"
@@ -152,7 +161,13 @@ async def handle_message(event):
         await event.message.answer(response)
         return
 
-    # 3. Поиск по номеру или 4 цифрам
+    # 3. Принудительное обновление GPS
+    if text == "🔄 Обновить GPS":
+        await event.message.answer("⏳ Запускаю обновление GPS в фоне. Это может занять минуту...")
+        asyncio.create_task(update_all_coords())
+        return
+
+    # 4. Поиск по номеру или 4 цифрам
     found_order = None
     search_query = text.upper()
     
@@ -168,12 +183,6 @@ async def handle_message(event):
     if found_order:
         o = found_order
         
-        if not o.get("current_lat") and o.get("gps_link"):
-            lat, lng, status = get_coords_from_baltgps(o["gps_link"])
-            if lat:
-                o["current_lat"], o["current_lng"] = lat, lng
-                o["has_valid_gps"] = True
-
         response = (
             f"📦 **Заказ:** {o['order_id']}\n"
             f"📍 **Адрес:** {o.get('address') or '—'}\n"
@@ -184,14 +193,21 @@ async def handle_message(event):
         if o.get('comment'):
             response += f"📝 **Примечание:** {o['comment']}\n"
         
+        # Добавляем кнопку с картой (если есть координаты или ссылка)
         if o.get("current_lat") and o.get("current_lng"):
-            response += f"\n🗺️ [Точка на карте](https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12)"
+            map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+            await event.message.answer(
+                text=response,
+                buttons=[[{"type": "link", "text": "🗺️ Открыть карту", "url": map_url}]]
+            )
         elif o.get("gps_link"):
-            response += f"\n🗺️ [Открыть карту BaltGPS]({o['gps_link']})"
+            await event.message.answer(
+                text=response,
+                buttons=[[{"type": "link", "text": "🗺️ Открыть карту BaltGPS", "url": o['gps_link']}]]
+            )
         else:
-            response += "\n🗺️ GPS недоступен."
-            
-        await event.message.answer(response)
+            response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+            await event.message.answer(response)
     else:
         await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или напишите «Выбрать заказ».")
 
