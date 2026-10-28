@@ -149,6 +149,30 @@ def get_orders_menu():
     builder.callback("🔙 Назад в меню", "menu_back")
     return builder
 
+def build_order_card(o):
+    """Текст + клавиатура карточки заказа (с картой Яндекс / BaltGPS)."""
+    response = (
+        f"📦 **Заказ:** {o['order_id']}\n"
+        f"📍 **Адрес:** {o.get('address') or '—'}\n"
+        f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+        f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+        f"📊 **Статус:** {o.get('status') or '—'}\n"
+    )
+    if o.get('comment'):
+        response += f"📝 **Примечание:** {o['comment']}\n"
+
+    builder = InlineKeyboardBuilder()
+    if o.get("current_lat") and o.get("current_lng"):
+        map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+        builder.link("🗺️ Открыть карту", map_url)
+    elif o.get("gps_link"):
+        builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
+    else:
+        response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+
+    builder.callback("🔙 Назад в меню", "menu_back")
+    return response, builder
+
 # === ЛОГИКА БОТА MAX ===
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
@@ -179,28 +203,7 @@ async def handle_message(event):
             found_order = DB[search_query]
 
     if found_order:
-        o = found_order
-        response = (
-            f"📦 **Заказ:** {o['order_id']}\n"
-            f"📍 **Адрес:** {o.get('address') or '—'}\n"
-            f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
-            f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
-            f"📊 **Статус:** {o.get('status') or '—'}\n"
-        )
-        if o.get('comment'):
-            response += f"📝 **Примечание:** {o['comment']}\n"
-        
-        builder = InlineKeyboardBuilder()
-        if o.get("current_lat") and o.get("current_lng"):
-            map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-            builder.link("🗺️ Открыть карту", map_url)
-        elif o.get("gps_link"):
-            builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
-        else:
-            response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
-        
-        builder.callback("🔙 Назад в меню", "menu_back")
-        
+        response, builder = build_order_card(found_order)
         await event.message.answer(text=response, keyboard=builder)
     else:
         await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню.")
@@ -208,23 +211,20 @@ async def handle_message(event):
 # === ОБРАБОТКА НАЖАТИЙ КНОПОК ===
 @max_dp.message_callback()
 async def handle_callback(event):
-    if not event.callback or not event.callback.payload:
+    payload = event.payload_text  # строка payload из .callback(...)
+    if not payload:
         return
 
-    payload = event.callback.payload
-    await event.answer()
+    # В maxapi-sdk у Message нет .edit(): сообщение с кнопкой
+    # обновляется через event.answer(message={...}, keyboard=...)
+    async def update(text, keyboard):
+        await event.answer(message={"text": text}, keyboard=keyboard)
 
     if payload == "menu_choose_order":
-        await event.message.edit(
-            text="Выберите заказ из списка:",
-            keyboard=get_orders_menu()
-        )
+        await update("Выберите заказ из списка:", get_orders_menu())
     elif payload == "menu_update_gps":
-        await event.message.edit(
-            text="⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
-            keyboard=get_main_menu()
-        )
         asyncio.create_task(update_all_coords())
+        await update("⏳ Запускаю обновление GPS в фоне. Это может занять минуту...", get_main_menu())
     elif payload == "menu_help":
         help_text = (
             "👋 **Помощь**\n\n"
@@ -236,43 +236,30 @@ async def handle_callback(event):
             "• Отправлять точку на карте (если есть GPS).\n"
             "• Показывать примечания (если GPS нет)."
         )
-        await event.message.edit(text=help_text, keyboard=get_main_menu())
+        await update(help_text, get_main_menu())
     elif payload == "menu_back":
-        await event.message.edit(
-            text="👋 Главное меню:",
-            keyboard=get_main_menu()
-        )
+        await update("👋 Главное меню:", get_main_menu())
     elif payload.startswith("order_"):
-        order_id = payload.replace("order_", "")
+        order_id = payload.replace("order_", "", 1)
         if order_id in DB:
-            o = DB[order_id]
-            response = (
-                f"📦 **Заказ:** {o['order_id']}\n"
-                f"📍 **Адрес:** {o.get('address') or '—'}\n"
-                f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
-                f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
-                f"📊 **Статус:** {o.get('status') or '—'}\n"
-            )
-            if o.get('comment'):
-                response += f"📝 **Примечание:** {o['comment']}\n"
-            
-            builder = InlineKeyboardBuilder()
-            if o.get("current_lat") and o.get("current_lng"):
-                map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-                builder.link("🗺️ Открыть карту", map_url)
-            elif o.get("gps_link"):
-                builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
-            else:
-                response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
-            
-            builder.callback("🔙 Назад в меню", "menu_back")
-            await event.message.edit(text=response, keyboard=builder)
+            response, builder = build_order_card(DB[order_id])
+            await update(response, builder)
         else:
-            await event.message.answer("Заказ не найден.")
+            await event.answer(notification="Заказ не найден.")
+    else:
+        await event.answer()
 
 async def run_max_bot():
-    await max_bot.delete_webhook()
-    await max_dp.start_polling(max_bot)
+    try:
+        await max_bot.delete_webhook()
+    except Exception as e:
+        print(f"⚠️ delete_webhook: {e}")
+    try:
+        await max_dp.start_polling(max_bot)
+    except Exception as e:
+        import traceback
+        print(f"❌ MAX polling упал: {e}")
+        traceback.print_exc()
 
 @app.on_event("startup")
 async def startup():
