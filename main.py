@@ -77,6 +77,7 @@ def get_coords_from_baltgps(gps_link: str):
         unit_id = items[0]
         sid = data.get("eid")
         
+        # Пробуем unit/calc_last
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "unit/calc_last", "params": json.dumps([unit_id]), "sid": sid
         }, timeout=(3.0, 5.0))
@@ -91,6 +92,7 @@ def get_coords_from_baltgps(gps_link: str):
             if "y" in pos and "x" in pos:
                 return float(pos["y"]), float(pos["x"]), "ok"
         
+        # Пробуем search_item
         r3 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
         }, timeout=(3.0, 5.0))
@@ -222,11 +224,9 @@ async def handle_callback(event):
         order_id = payload.replace("load_gps_", "")
         if order_id in DB:
             o = DB[order_id]
-            # Запускаем фоновое обновление
             loop = asyncio.get_event_loop()
             asyncio.create_task(loop.run_in_executor(None, fetch_single_order_coords, order_id, o))
             
-            # Мгновенно сообщаем, что процесс запущен
             await event.message.edit(
                 text="⏳ Запрос GPS отправлен в фоновом режиме. Пожалуйста, подождите 5-10 секунд и откройте заказ снова."
             )
@@ -462,6 +462,24 @@ async def user_portal():
 </head>
 <body>
     <div class="header"><h1>📍 ТПК — Отслеживание</h1><button class="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button></div>
+
+    <!-- Блок с QR-кодом и ссылкой на бота -->
+    <div style="max-width: 1100px; margin: 0 auto 24px; background: var(--card); padding: 20px; border-radius: 12px; box-shadow: var(--shadow); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 20px;">
+        <div style="flex: 1; min-width: 250px;">
+            <h3 style="margin-bottom: 8px;">🤖 Узнайте статус груза в MAX</h3>
+            <p style="color: var(--text-sec); font-size: 14px; margin-bottom: 16px;">
+                Наш бот в мессенджере MAX покажет местоположение машины и статус заказа. Просто напишите ему номер заказа (например, <b>1668</b>).
+            </p>
+            <a href="https://max.ru/se14795631_bot" target="_blank" style="background: var(--primary); color: white; padding: 12px 24px; text-decoration: none; border-radius: 8px; font-weight: bold; display: inline-block;">
+                🚀 Открыть бота в MAX
+            </a>
+        </div>
+        <div style="text-align: center;">
+            <img src="/qr.png" alt="QR-код бота MAX" style="width: 120px; height: 120px; border-radius: 8px;">
+            <p style="font-size: 11px; color: var(--text-sec); margin-top: 8px;">Наведите камеру телефона</p>
+        </div>
+    </div>
+
     <div class="controls">
         <div class="search-box"><input id="searchInput" placeholder="Поиск по номеру, городу или машине..." oninput="debounceSearch()"></div>
         <select class="sort-select" id="sortSelect" onchange="loadOrders()">
