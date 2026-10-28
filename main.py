@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
@@ -9,6 +9,7 @@ import openpyxl
 
 # === ИМПОРТЫ ДЛЯ MAXAPI-SDK ===
 from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder, CallbackPayloadSchema
+from maxapi.methods.types.getted_updates import process_update_webhook
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -197,7 +198,7 @@ class OrderAction(CallbackPayloadSchema):
     prefix = "order"
     order_id: str
 
-# === ФУНКЦИИ ДЛЯ КЛАВИАТУР ===
+# === ФУНКЦИИ ДЛЯ КЛАВИАТУР (КОРОТКИЕ КНОПКИ) ===
 def get_main_menu():
     builder = InlineKeyboardBuilder()
     builder.callback("📋 Выбрать заказ", MenuAction(action="choose_order").pack())
@@ -210,15 +211,18 @@ def get_orders_menu():
     builder = InlineKeyboardBuilder()
     for o in active_orders:
         gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
-        builder.callback(f"{gps_mark} {o['order_id']}", OrderAction(order_id=o["order_id"]).pack())
-    builder.callback("🔙 Назад в меню", MenuAction(action="back").pack())
+        # Оставляем только последние 4 цифры, чтобы текст помещался
+        short_id = o['order_id'][-4:]
+        builder.callback(f"{gps_mark} {short_id}", OrderAction(order_id=o["order_id"]).pack())
+    builder.callback("🔙 Назад", MenuAction(action="back").pack())
     return builder
 
 def get_choice_menu(orders):
     builder = InlineKeyboardBuilder()
     for o in orders[:10]:
-        builder.callback(f"📦 {o['order_id']}", OrderAction(order_id=o["order_id"]).pack())
-    builder.callback("🔙 Назад в меню", MenuAction(action="back").pack())
+        short_id = o['order_id'][-4:]
+        builder.callback(f"📦 {short_id}", OrderAction(order_id=o["order_id"]).pack())
+    builder.callback("🔙 Назад", MenuAction(action="back").pack())
     return builder
 
 def build_order_card(o):
@@ -242,7 +246,7 @@ def build_order_card(o):
     else:
         response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
 
-    builder.callback("🔙 Назад в меню", MenuAction(action="back").pack())
+    builder.callback("🔙 Назад", MenuAction(action="back").pack())
     return response, builder
 
 # === ПОИСК ЗАКАЗОВ ===
@@ -435,22 +439,18 @@ async def handle_unknown_callback(callback_event, callback_payload_text):
         except Exception:
             pass
 
-async def run_max_bot():
+# === WEBHOOK (ВМЕСТО POLLING) ===
+@app.post("/webhook")
+async def webhook_handler(request: Request):
     try:
-        await max_bot.delete_webhook()
+        event_json = await request.json()
+        event_object = await process_update_webhook(event_json=event_json, bot=max_bot)
+        await max_dp.handle(event_object)
+        return JSONResponse(content={"ok": True}, status_code=200)
     except Exception as e:
-        log(f"⚠️ delete_webhook: {e}")
-    while True:
-        try:
-            log("[BOT] start_polling")
-            await max_dp.start_polling(max_bot)
-            break
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            log(f"❌ MAX polling упал: {e!r}")
-            traceback.print_exc()
-            await asyncio.sleep(10)
+        log(f"[WEBHOOK] ошибка: {e!r}")
+        traceback.print_exc()
+        return JSONResponse(content={"ok": False}, status_code=500)
 
 @app.on_event("startup")
 async def startup():
@@ -460,8 +460,13 @@ async def startup():
             DB = json.load(f)
         spawn(update_all_coords())
     
-    spawn(run_max_bot())
-    print("✅ MAX-бот запущен")
+    # Удаляем вебхук, если он был установлен ранее (на случай переключения)
+    try:
+        await max_bot.delete_webhook()
+    except Exception as e:
+        log(f"⚠️ delete_webhook: {e}")
+    
+    print("✅ MAX-бот запущен (Webhook режим)")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
@@ -621,6 +626,8 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}. Последние: {debug_msg}"}
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
+
+
 
 # ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
