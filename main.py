@@ -16,20 +16,8 @@ security = HTTPBasic()
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
-# === ЗАГРУЗКА НАСТРОЕК ===
 DB = {}
-SETTINGS_FILE = "settings.json"
-DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
-
-if os.path.exists(SETTINGS_FILE):
-    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-        SETTINGS = json.load(f)
-else:
-    SETTINGS = DEFAULT_SETTINGS.copy()
-
-def save_settings():
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
+SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": True}
 
 # === НАСТРОЙКА БОТА MAX ===
 MAX_BOT_TOKEN = "f9LHodD0cOIHWVUEeUjaeOllavxyObEdNp002Yd8vSyhrc-Rps9Z-_TyWuR5q-52_M2fEgPoLmdptzjzMWCr" 
@@ -131,7 +119,7 @@ async def update_all_coords():
     await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
-# === ЛОГИКА БОТА MAX ===
+# === ЛОГИКА БОТА MAX (С МЕНЮ) ===
 @max_dp.message_created()
 async def handle_message(event):
     if not event.message or not event.message.body or not event.message.body.text:
@@ -139,22 +127,16 @@ async def handle_message(event):
 
     text = event.message.body.text.strip()
 
-    # 1. Помощник
-    if text.lower() in ["/start", "/help", "помощь", "привет", "меню", "начать"]:
-        help_text = (
-            "👋 **Привет! Я бот для отслеживания заказов ТПК.**\n\n"
-            "🔍 **Как искать:**\n"
-            "• Введите **4 цифры** номера заказа (например, `1668`).\n"
-            "• Или напишите полный номер (например, `ТПК00001668`).\n"
-            "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список активных заказов.\n\n"
-            "🗺️ **Что я умею:**\n"
-            "• Показывать адрес, перевозчика, машину и статус.\n"
-            "• Отправлять точку на карте (если есть GPS).\n"
-            "• Показывать примечания (если GPS нет).\n\n"
-            "🔄 **Обновление GPS:**\n"
-            "• Напишите **🔄 Обновить GPS**, чтобы принудительно обновить координаты для всех заказов."
+    # 1. Приветствие и меню
+    if text.lower() in ["/start", "привет", "меню", "начать", "/help"]:
+        await event.message.answer(
+            "👋 **Добро пожаловать в бот ТПК!**\n\n"
+            "🔍 **Как искать:** Введите **4 цифры** номера заказа (например, `1668`).\n\n"
+            "📋 **Доступные действия:**\n"
+            "• Напишите **📋 Выбрать заказ**, чтобы увидеть список.\n"
+            "• Напишите **🔄 Обновить GPS**, чтобы обновить координаты.\n\n"
+            "👇 Просто отправьте номер или команду."
         )
-        await event.message.answer(help_text)
         return
 
     # 2. Кнопка "Выбрать заказ"
@@ -164,7 +146,7 @@ async def handle_message(event):
             await event.message.answer("Нет активных заказов в пути.")
             return
         
-        response = "Выберите заказ (нажмите на номер или введите 4 цифры):\n\n"
+        response = "Выберите заказ (введите 4 цифры):\n\n"
         for o in active_orders[:15]:
             gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
             response += f"{gps_mark} {o['order_id']} ({o.get('address', '—')})\n"
@@ -249,7 +231,6 @@ async def get_tabs():
 async def set_tabs(s: dict, user=Depends(check_admin)):
     global SETTINGS
     SETTINGS.update(s)
-    save_settings()
     return {"ok": True}
 
 @app.get("/api/shipments")
