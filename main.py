@@ -439,10 +439,8 @@ async def handle_unknown_callback(callback_event, callback_payload_text):
 
 # === ЗАПУСК POLLING ===
 async def run_max_bot():
-    try:
-        await max_bot.delete_webhook()
-    except Exception as e:
-        log(f"⚠️ delete_webhook: {e}")
+    # delete_webhook() не вызываем: в maxapi-sdk он требует url и падает с 400.
+    # При polling это не нужно — вебхук просто не установлен.
     while True:
         try:
             log("[BOT] start_polling")
