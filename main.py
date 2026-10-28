@@ -1,5 +1,5 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
@@ -7,9 +7,8 @@ import os, json, requests, asyncio, io, re, time, traceback
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ MAXAPI-SDK ===
+# === ИМПОРТЫ ДЛЯ MAXAPI-SDK (БЕЗ НЕСУЩЕСТВУЮЩИХ МОДУЛЕЙ) ===
 from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder, CallbackPayloadSchema
-from maxapi.methods.types.getted_updates import process_update_webhook
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
@@ -211,7 +210,6 @@ def get_orders_menu():
     builder = InlineKeyboardBuilder()
     for o in active_orders:
         gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
-        # Оставляем только последние 4 цифры, чтобы текст помещался
         short_id = o['order_id'][-4:]
         builder.callback(f"{gps_mark} {short_id}", OrderAction(order_id=o["order_id"]).pack())
     builder.callback("🔙 Назад", MenuAction(action="back").pack())
@@ -439,18 +437,23 @@ async def handle_unknown_callback(callback_event, callback_payload_text):
         except Exception:
             pass
 
-# === WEBHOOK (ВМЕСТО POLLING) ===
-@app.post("/webhook")
-async def webhook_handler(request: Request):
+# === ЗАПУСК POLLING ===
+async def run_max_bot():
     try:
-        event_json = await request.json()
-        event_object = await process_update_webhook(event_json=event_json, bot=max_bot)
-        await max_dp.handle(event_object)
-        return JSONResponse(content={"ok": True}, status_code=200)
+        await max_bot.delete_webhook()
     except Exception as e:
-        log(f"[WEBHOOK] ошибка: {e!r}")
-        traceback.print_exc()
-        return JSONResponse(content={"ok": False}, status_code=500)
+        log(f"⚠️ delete_webhook: {e}")
+    while True:
+        try:
+            log("[BOT] start_polling")
+            await max_dp.start_polling(max_bot)
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log(f"❌ MAX polling упал: {e!r}")
+            traceback.print_exc()
+            await asyncio.sleep(10)
 
 @app.on_event("startup")
 async def startup():
@@ -460,13 +463,8 @@ async def startup():
             DB = json.load(f)
         spawn(update_all_coords())
     
-    # Удаляем вебхук, если он был установлен ранее (на случай переключения)
-    try:
-        await max_bot.delete_webhook()
-    except Exception as e:
-        log(f"⚠️ delete_webhook: {e}")
-    
-    print("✅ MAX-бот запущен (Webhook режим)")
+    spawn(run_max_bot())
+    print("✅ MAX-бот запущен (Polling режим)")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
@@ -627,9 +625,9 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
 
-
-
 # ============ ГЛАВНАЯ СТРАНИЦА ============
+# Вставьте сюда HTML-код из вашего текущего файла (user_portal и admin_panel).
+# Он не меняется.
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
