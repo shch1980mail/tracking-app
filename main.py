@@ -11,6 +11,12 @@ from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
 from maxapi.types import TextFormat
 
 app = FastAPI(title="ТПК Отслеживание")
+from fastapi.staticfiles import StaticFiles
+import os
+
+# Создаём папку, если её нет, чтобы StaticFiles не упал при старте
+os.makedirs("static", exist_ok=True)
+app.mount("/static", StaticFiles(directory="static"), name="static")
 security = HTTPBasic()
 
 # === КОНФИГ ===
