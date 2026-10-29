@@ -5,7 +5,7 @@ from pydantic import BaseModel
 from typing import Optional
 import os, json, requests, asyncio, io, time, traceback, secrets, shutil
 import pandas as pd
-import openpyxl
+import openpyxl 
 
 from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
 from maxapi.types import TextFormat
