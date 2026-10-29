@@ -99,7 +99,9 @@ def save_settings():
 DB = {}
 
 # === НАСТРОЙКА БОТА MAX ===
-MAX_BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN")
+if not MAX_BOT_TOKEN:
+    raise ValueError("❌ Переменная окружения MAX_BOT_TOKEN не задана! Добавьте её в Layero → Переменные окружения.")
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
