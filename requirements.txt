@@ -1,8 +1,6 @@
-fastapi
-uvicorn
-requests
-pydantic
+fastapi>=0.100.0
+uvicorn>=0.23.0
+maxapi[fastapi]>=1.2.3
 pandas
 openpyxl
-python-multipart
-maxapi-sdk
+requests
