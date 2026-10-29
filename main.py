@@ -1,49 +1,89 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel
 from typing import Optional
-import os, json, requests, asyncio, io, time, traceback
+import os, json, requests, asyncio, io, time, traceback, secrets, shutil
 import pandas as pd
 import openpyxl
 
-# === ИМПОРТЫ ДЛЯ MAXAPI-SDK ===
 from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
+from maxapi.types import TextFormat
 
 app = FastAPI(title="ТПК Отслеживание")
 security = HTTPBasic()
 
-ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
-ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
+# === КОНФИГ ===
+DATA_DIR = os.environ.get("DATA_DIR", ".").strip() or "."
+DB_FILE = os.path.join(DATA_DIR, "shipments.json")
+SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
-# === НАСТРОЙКИ ===
-SETTINGS_FILE = "settings.json"
-DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": False, "show_with_gps": False}
+ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
+ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
+if not ADMIN_USER or len(ADMIN_PASS) < 12:
+    raise RuntimeError("ADMIN_USER и ADMIN_PASS (>=12 символов) должны быть заданы в Layero")
 
-if os.path.exists(SETTINGS_FILE):
-    with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-        SETTINGS = json.load(f)
-else:
-    SETTINGS = DEFAULT_SETTINGS.copy()
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
-
-def save_settings():
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
-
-DB = {}
-
-# === НАСТРОЙКА БОТА MAX ===
-# ИЗМЕНЕНО: токен берётся из переменной окружения Layero (MAX_BOT_TOKEN),
-# а не хардкодится. Layero прокидывает env vars в runtime-контейнер.
 MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN", "").strip()
 if not MAX_BOT_TOKEN:
-    raise RuntimeError("MAX_BOT_TOKEN не задан в переменных окружения Layero")
+    raise RuntimeError("MAX_BOT_TOKEN не задан в Layero")
+
+GPS_CACHE_TTL = 120
+GPS_ERROR_TTL = 30
+GPS_REFRESH_INTERVAL = int(os.environ.get("GPS_REFRESH_INTERVAL", "300"))
+MANUAL_REFRESH_COOLDOWN = 60
+MAX_UPLOAD = 10 * 1024 * 1024
+FINAL_STATUSES = {"завершено", "выгружено"}
+
+DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": False, "show_with_gps": False}
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
 
+# === ЛОГИ ===
+def log(*args):
+    print(*args, flush=True)
+
+def safe_repr(e) -> str:
+    return repr(e).replace(MAX_BOT_TOKEN, "***")
+
+# === ЗАГРУЗКА / ЗАПИСЬ JSON ===
+def load_json(path, default):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return default
+    except Exception as e:
+        bad = f"{path}.corrupt-{int(time.time())}"
+        try:
+            shutil.move(path, bad)
+        except OSError:
+            pass
+        log(f"[DB] {path} повреждён ({type(e).__name__}), сохранён как {bad}, старт с дефолтом")
+        return default
+
+def atomic_write(path, text):
+    tmp = f"{path}.{os.getpid()}.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+DB = load_json(DB_FILE, {})
+SETTINGS = {**DEFAULT_SETTINGS, **load_json(SETTINGS_FILE, {})}
+
+def save_settings():
+    atomic_write(SETTINGS_FILE, json.dumps(SETTINGS, ensure_ascii=False, indent=2))
+
+_save_lock = asyncio.Lock()
+
+async def save_db_async():
+    async with _save_lock:
+        payload = json.dumps(DB, ensure_ascii=False)
+        await asyncio.to_thread(atomic_write, DB_FILE, payload)
+
+# === МОДЕЛИ ===
 class Shipment(BaseModel):
     order_id: str
     direction: Optional[str] = None
@@ -58,18 +98,26 @@ class Shipment(BaseModel):
     comment: Optional[str] = None
     status: Optional[str] = None
 
-def save_db():
-    with open("shipments.json", "w", encoding="utf-8") as f:
-        json.dump(DB, f, ensure_ascii=False, indent=2)
+class TabsSettings(BaseModel):
+    show_in_transit: Optional[bool] = None
+    show_delivered: Optional[bool] = None
+    show_with_gps: Optional[bool] = None
 
-def log(*args):
-    print(*args, flush=True)
+PUBLIC_FIELDS = ("order_id", "address", "weight", "plan_arrival", "carrier",
+                 "vehicle", "status", "comment", "current_lat", "current_lng",
+                 "gps_updated_at", "gps_status")
 
-# === КЭШ И БЛОКИРОВКИ GPS ===
-GPS_CACHE_TTL = 120
+def public_view(o: dict) -> dict:
+    d = {k: o.get(k) for k in PUBLIC_FIELDS}
+    d["can_refresh"] = bool(o.get("gps_link"))
+    return d
+
+# === GPS ===
 GPS_CACHE = {}
 _gps_locks = {}
 _update_lock = None
+_last_manual_refresh = 0.0
+_session = requests.Session()
 
 def _order_lock(order_id):
     lock = _gps_locks.get(order_id)
@@ -77,39 +125,39 @@ def _order_lock(order_id):
         lock = _gps_locks[order_id] = asyncio.Lock()
     return lock
 
-def _apply_coords(o, lat, lng):
-    if lat and lng:
+def _apply_coords(o, lat, lng, status="ok"):
+    if lat is not None and lng is not None:
         o["current_lat"] = lat
         o["current_lng"] = lng
         o["has_valid_gps"] = True
+        o["gps_status"] = "ok"
+        o["gps_updated_at"] = int(time.time())
     else:
-        o["current_lat"] = None
-        o["current_lng"] = None
-        o["has_valid_gps"] = False
+        o["gps_status"] = status
+        if status not in ("error", "timeout", "no_data"):
+            o["current_lat"] = None
+            o["current_lng"] = None
+            o["has_valid_gps"] = False
 
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None, "no_link"
     try:
         token = gps_link.split("?t=")[-1]
-        r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
+        r = _session.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
         }, timeout=(2.0, 3.0))
-
         data = r.json()
         if "error" in data: return None, None, "invalid_token"
         if "token" not in data: return None, None, "invalid_token"
-
         unit_info = json.loads(data["token"])
         items = unit_info.get("items", [])
         if not items: return None, None, "no_units"
         unit_id = items[0]
         sid = data.get("eid")
-
-        r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
+        r2 = _session.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "unit/calc_last", "params": json.dumps([unit_id]), "sid": sid
         }, timeout=(2.0, 3.0))
-
         pos_data = r2.json()
         if isinstance(pos_data, list) and len(pos_data) > 0:
             pos = pos_data[0]
@@ -119,368 +167,362 @@ def get_coords_from_baltgps(gps_link: str):
             pos = pos_data.get(str(unit_id), {})
             if "y" in pos and "x" in pos:
                 return float(pos["y"]), float(pos["x"]), "ok"
-
-        r3 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
+        r3 = _session.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
         }, timeout=(2.0, 3.0))
-
         pos = r3.json().get("item", {}).get("pos", {})
         if pos and "x" in pos and "y" in pos:
             return float(pos["y"]), float(pos["x"]), "ok"
-
         return None, None, "no_data"
-    except Exception:
+    except requests.Timeout:
+        return None, None, "timeout"
+    except Exception as e:
+        log(f"[GPS] ошибка запроса: {type(e).__name__}")
         return None, None, "error"
 
 async def fetch_single_order_coords(order_id, o, force=False):
     async with _order_lock(order_id):
         c = GPS_CACHE.get(order_id)
-        fresh = c and c.get("link") == o.get("gps_link") and (time.time() - c["ts"]) < GPS_CACHE_TTL
-        if fresh and not force:
-            _apply_coords(o, c["lat"], c["lng"])
+        ttl = GPS_CACHE_TTL if (c and c.get("status") == "ok") else GPS_ERROR_TTL
+        if c and not force and c.get("link") == o.get("gps_link") and time.time() - c["ts"] < ttl:
+            _apply_coords(o, c["lat"], c["lng"], c["status"])
             return
         loop = asyncio.get_running_loop()
-        # GPS-запрос в отдельном потоке, чтобы не блокировать event loop
-        lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
-        GPS_CACHE[order_id] = {"ts": time.time(), "link": o.get("gps_link"), "lat": lat, "lng": lng}
-        _apply_coords(o, lat, lng)
+        lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o.get("gps_link"))
+        GPS_CACHE[order_id] = {"ts": time.time(), "link": o.get("gps_link"),
+                               "lat": lat, "lng": lng, "status": status}
+        _apply_coords(o, lat, lng, status)
+
+async def _update_pass(force):
+    sem = asyncio.Semaphore(10)
+    async def one(oid, o):
+        async with sem:
+            await fetch_single_order_coords(oid, o, force=force)
+    items = [(oid, o) for oid, o in list(DB.items())
+             if o.get("gps_link") and str(o.get("status") or "").lower() not in FINAL_STATUSES]
+    results = await asyncio.gather(*(one(*it) for it in items), return_exceptions=True)
+    for (oid, _), r in zip(items, results):
+        if isinstance(r, Exception):
+            log(f"[GPS] {oid}: {type(r).__name__}")
+    await save_db_async()
+    log(f"[GPS] проход завершён, заказов: {len(items)}")
 
 async def update_all_coords(force=False):
     global _update_lock
     if _update_lock is None:
         _update_lock = asyncio.Lock()
     if _update_lock.locked():
-        log("[GPS] обновление уже выполняется — повторный запуск пропущен")
+        log("[GPS] обновление уже выполняется — пропуск")
         return False
     async with _update_lock:
-        for o in DB.values():
-            if o.get("has_valid_gps") is False:
-                o["current_lat"] = None
-                o["current_lng"] = None
-
-        semaphore = asyncio.Semaphore(10)
-        async def limited(order_id, o):
-            async with semaphore:
-                await fetch_single_order_coords(order_id, o, force=force)
-
-        items = [(oid, o) for oid, o in DB.items() if o.get("gps_link")]
-        results = await asyncio.gather(*(limited(oid, o) for oid, o in items), return_exceptions=True)
-        for (oid, _), r in zip(items, results):
-            if isinstance(r, Exception):
-                log(f"[GPS] {oid}: ошибка {r!r}")
-        save_db()
-        log(f"[GPS] обновлено заказов: {len(items)}")
+        await _update_pass(force)
         return True
 
-# === ФУНКЦИИ ДЛЯ КЛАВИАТУР (maxapi-sdk) ===
+async def gps_refresher():
+    while True:
+        try:
+            await update_all_coords()
+        except Exception as e:
+            log(f"[GPS] refresher: {type(e).__name__}")
+        await asyncio.sleep(GPS_REFRESH_INTERVAL)
+
+def allow_manual_refresh() -> bool:
+    global _last_manual_refresh
+    now = time.time()
+    if now - _last_manual_refresh < MANUAL_REFRESH_COOLDOWN:
+        return False
+    _last_manual_refresh = now
+    return True
+
+# === ФОНОВЫЕ ЗАДАЧИ ===
+_bg_tasks = set()
+
+def spawn(coro, name=None):
+    t = asyncio.create_task(coro, name=name)
+    _bg_tasks.add(t)
+    def _done(t):
+        _bg_tasks.discard(t)
+        if not t.cancelled() and t.exception():
+            log(f"[TASK {t.get_name()}] упала: {type(t.exception()).__name__}")
+    t.add_done_callback(_done)
+    return t
+
+# === БОТ MAX ===
+HTML_FMT = TextFormat.HTML
+
+def esc_md(v):
+    if v in (None, ""):
+        return "—"
+    return str(v).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
 def get_main_menu():
-    builder = InlineKeyboardBuilder()
-    builder.callback("📋 Выбрать заказ", "menu_choose_order")
-    builder.callback("🔄 Обновить GPS", "menu_update_gps")
-    builder.callback("❓ Помощь", "menu_help")
-    return builder
+    b = InlineKeyboardBuilder()
+    b.callback("📋 Выбрать заказ", "menu_choose_order")
+    b.callback("🔄 Обновить GPS", "menu_update_gps")
+    b.callback("❓ Помощь", "menu_help")
+    return b
 
 def get_orders_menu():
-    active_orders = [o for o in DB.values() if o.get("status") == "в пути"][:10]
-    builder = InlineKeyboardBuilder()
-    for o in active_orders:
-        gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
-        builder.callback(f"{gps_mark} {o['order_id']}", f"order_{o['order_id']}")
-    builder.callback("🔙 Назад в меню", "menu_back")
-    return builder
+    active = [o for o in DB.values()
+              if str(o.get("status") or "").lower() in ("в пути", "планируется")][:10]
+    b = InlineKeyboardBuilder()
+    for o in active:
+        mark = "🟢" if o.get("has_valid_gps") else "🔴"
+        b.callback(f"{mark} {o['order_id']}", f"order_{o['order_id']}")
+    b.callback("🔙 Назад в меню", "menu_back")
+    return b
 
-# === ЛОГИКА БОТА MAX ===
+def render_order_card(o):
+    text = (
+        f"📦 <b>Заказ:</b> {esc_md(o.get('order_id'))}\n"
+        f"📍 <b>Адрес:</b> {esc_md(o.get('address'))}\n"
+        f"🚚 <b>Перевозчик:</b> {esc_md(o.get('carrier'))}\n"
+        f"🚛 <b>Машина:</b> {esc_md(o.get('vehicle'))}\n"
+        f"📊 <b>Статус:</b> {esc_md(o.get('status'))}\n"
+    )
+    if o.get("comment"):
+        text += f"📝 <b>Примечание:</b> {esc_md(o['comment'])}\n"
+    kb = InlineKeyboardBuilder()
+    if o.get("current_lat") is not None and o.get("current_lng") is not None:
+        kb.link("🗺️ Открыть карту",
+                f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12")
+        if o.get("gps_updated_at"):
+            text += f"🕒 Обновлено: {time.strftime('%d.%m %H:%M', time.localtime(o['gps_updated_at']))}\n"
+    else:
+        text += "\n🗺️ GPS недоступен. Попробуйте «🔄 Обновить GPS»."
+    kb.callback("🔙 Назад в меню", "menu_back")
+    return text, kb
+
+def find_orders(query: str):
+    q = query.strip().upper()
+    exact = [o for oid, o in DB.items() if oid.upper() == q]
+    if exact:
+        return exact
+    if q.isdigit() and len(q) == 4:
+        return [o for oid, o in DB.items() if oid.upper().endswith(q)]
+    return []
+
+async def safe_send(coro, tag, timeout=10.0):
+    try:
+        return await asyncio.wait_for(coro, timeout)
+    except asyncio.TimeoutError:
+        log(f"[{tag}] таймаут")
+    except Exception as e:
+        log(f"[{tag}] ошибка: {safe_repr(e)}")
+
+def _is_fatal_token_error(e) -> bool:
+    s = str(e).lower()
+    return "invalid access_token" in s or "неверный токен" in s or "invalidtoken" in s
+
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
-    try:
-        await asyncio.wait_for(
-            event.message.answer(
-                text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
-                keyboard=get_main_menu()
-            ),
-            timeout=10.0
+    await safe_send(
+        event.message.answer(text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
+                             keyboard=get_main_menu(), format=HTML_FMT),
+        "START"
+    )
+
+# ИЗМЕНЕНО: bot_started — первый запуск бота в MAX
+try:
+    @max_dp.bot_started()
+    async def handle_bot_started(event):
+        chat_id = getattr(event, "chat_id", None)
+        if chat_id is None:
+            return
+        await safe_send(
+            max_bot.send_message(chat_id=chat_id,
+                                 text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
+                                 keyboard=get_main_menu(), format=HTML_FMT),
+            "BOT_STARTED"
         )
-    except asyncio.TimeoutError:
-        log("[START] таймаут отправки")
-    except Exception as e:
-        log(f"[START] ошибка: {e!r}")
+except Exception:
+    # если в вашей версии maxapi нет bot_started — молча пропускаем
+    pass
 
 @max_dp.message_created()
 async def handle_message(event):
     if not event.message or not event.message.body or not event.message.body.text:
         return
-
-    text = event.message.body.text.strip()
-    if text.startswith("/"):
+    text = event.message.body.text.strip()[:100]
+    if not text or text.startswith("/"):
         return
-
-    found_order = None
-    search_query = text.upper()
-
-    if search_query.isdigit() and len(search_query) == 4:
-        for o in DB.values():
-            if o["order_id"].endswith(search_query):
-                found_order = o
-                break
-    else:
-        if search_query in DB:
-            found_order = DB[search_query]
-
-    if found_order:
-        o = found_order
-        response = (
-            f"📦 **Заказ:** {o['order_id']}\n"
-            f"📍 **Адрес:** {o.get('address') or '—'}\n"
-            f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
-            f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
-            f"📊 **Статус:** {o.get('status') or '—'}\n"
+    found = find_orders(text)
+    if len(found) == 1:
+        t, kb = render_order_card(found[0])
+        await safe_send(event.message.answer(text=t, keyboard=kb, format=HTML_FMT), "MESSAGE")
+    elif len(found) > 1:
+        kb = InlineKeyboardBuilder()
+        for o in found[:10]:
+            kb.callback(o["order_id"], f"order_{o['order_id']}")
+        await safe_send(
+            event.message.answer(text=f"🔎 Найдено {len(found)}. Выберите:", keyboard=kb, format=HTML_FMT),
+            "MESSAGE"
         )
-        if o.get('comment'):
-            response += f"📝 **Примечание:** {o['comment']}\n"
-
-        builder = InlineKeyboardBuilder()
-        if o.get("current_lat") and o.get("current_lng"):
-            map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-            builder.link("🗺️ Открыть карту", map_url)
-        elif o.get("gps_link"):
-            builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
-        else:
-            response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
-
-        builder.callback("🔙 Назад в меню", "menu_back")
-
-        try:
-            # ИЗМЕНЕНО: wait_for защищает от зависания, если MAX API не отвечает
-            await asyncio.wait_for(
-                event.message.answer(text=response, keyboard=builder),
-                timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            log("[MESSAGE] таймаут отправки карточки заказа")
-        except Exception as e:
-            log(f"[MESSAGE] ошибка отправки: {e!r}")
     else:
-        try:
-            await asyncio.wait_for(
-                event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню."),
-                timeout=10.0
-            )
-        except asyncio.TimeoutError:
-            log("[MESSAGE] таймаут отправки 'не найден'")
-        except Exception as e:
-            log(f"[MESSAGE] ошибка: {e!r}")
+        await safe_send(
+            event.message.answer(f"❌ Заказ по запросу «{text}» не найден.", format=HTML_FMT),
+            "MESSAGE"
+        )
 
-# === ОБРАБОТКА НАЖАТИЙ КНОПОК ===
 @max_dp.message_callback()
 async def handle_callback(event):
     if not event.callback or not event.callback.payload:
         return
-
     payload = event.callback.payload
     try:
         await asyncio.wait_for(event.answer(), timeout=5.0)
     except Exception:
         pass
 
-    try:
-        if payload == "menu_choose_order":
-            await asyncio.wait_for(
-                event.message.edit(text="Выберите заказ из списка:", keyboard=get_orders_menu()),
-                timeout=10.0
-            )
-        elif payload == "menu_update_gps":
-            await asyncio.wait_for(
-                event.message.edit(
-                    text="⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
-                    keyboard=get_main_menu()
-                ),
-                timeout=10.0
-            )
-            asyncio.create_task(update_all_coords(force=True))
-        elif payload == "menu_help":
-            help_text = (
-                "👋 **Помощь**\n\n"
-                "🔍 **Как искать:**\n"
-                "• Введите **4 цифры** номера заказа (например, `1668`).\n"
-                "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
-                "🗺️ **Что я умею:**\n"
-                "• Показывать адрес, перевозчика, машину и статус.\n"
-                "• Отправлять точку на карте (если есть GPS).\n"
-                "• Показывать примечания (если GPS нет)."
-            )
-            await asyncio.wait_for(
-                event.message.edit(text=help_text, keyboard=get_main_menu()),
-                timeout=10.0
-            )
-        elif payload == "menu_back":
-            await asyncio.wait_for(
-                event.message.edit(text="👋 Главное меню:", keyboard=get_main_menu()),
-                timeout=10.0
-            )
-        elif payload.startswith("order_"):
-            order_id = payload.replace("order_", "")
-            if order_id in DB:
-                o = DB[order_id]
-                response = (
-                    f"📦 **Заказ:** {o['order_id']}\n"
-                    f"📍 **Адрес:** {o.get('address') or '—'}\n"
-                    f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
-                    f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
-                    f"📊 **Статус:** {o.get('status') or '—'}\n"
-                )
-                if o.get('comment'):
-                    response += f"📝 **Примечание:** {o['comment']}\n"
+    if payload == "menu_choose_order":
+        await safe_send(event.message.edit(text="Выберите заказ:", keyboard=get_orders_menu(), format=HTML_FMT), "CALLBACK")
+    elif payload == "menu_update_gps":
+        if allow_manual_refresh():
+            spawn(update_all_coords(force=True), "gps-bot")
+            txt = "⏳ Обновляю GPS в фоне (до минуты). Откройте заказ снова."
+        else:
+            txt = "ℹ️ GPS обновлялся меньше минуты назад."
+        await safe_send(event.message.edit(text=txt, keyboard=get_main_menu(), format=HTML_FMT), "CALLBACK")
+    elif payload == "menu_help":
+        help_text = (
+            "👋 <b>Помощь</b>\n\n"
+            "🔍 <b>Как искать:</b>\n"
+            "• Введите 4 цифры номера заказа (например, 1668).\n"
+            "• Или нажмите «📋 Выбрать заказ».\n\n"
+            "🗺️ <b>Что я умею:</b>\n"
+            "• Показывать адрес, перевозчика, машину и статус.\n"
+            "• Отправлять точку на карте (если есть GPS).\n"
+            "• Показывать примечания (если GPS нет)."
+        )
+        await safe_send(event.message.edit(text=help_text, keyboard=get_main_menu(), format=HTML_FMT), "CALLBACK")
+    elif payload == "menu_back":
+        await safe_send(event.message.edit(text="👋 Главное меню:", keyboard=get_main_menu(), format=HTML_FMT), "CALLBACK")
+    elif payload.startswith("order_"):
+        order_id = payload.removeprefix("order_")
+        o = DB.get(order_id)
+        if not o:
+            await safe_send(event.message.answer("Заказ не найден.", format=HTML_FMT), "CALLBACK")
+            return
+        t, kb = render_order_card(o)
+        await safe_send(event.message.edit(text=t, keyboard=kb, format=HTML_FMT), "CALLBACK")
 
-                builder = InlineKeyboardBuilder()
-                if o.get("current_lat") and o.get("current_lng"):
-                    map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-                    builder.link("🗺️ Открыть карту", map_url)
-                elif o.get("gps_link"):
-                    builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
-                else:
-                    response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
-
-                builder.callback("🔙 Назад в меню", "menu_back")
-                await asyncio.wait_for(
-                    event.message.edit(text=response, keyboard=builder),
-                    timeout=10.0
-                )
-            else:
-                await asyncio.wait_for(
-                    event.message.answer("Заказ не найден."),
-                    timeout=10.0
-                )
-    except asyncio.TimeoutError:
-        log(f"[CALLBACK] таймаут обработки payload={payload!r}")
-    except Exception as e:
-        log(f"[CALLBACK] ошибка payload={payload!r}: {e!r}")
-
-# === WATCHDOG ДЛЯ POLLING ===
-_last_event_time = time.time()
-
-async def polling_watchdog():
-    global _last_event_time
-    while True:
-        await asyncio.sleep(60)
-        idle = time.time() - _last_event_time
-        if idle > 300:
-            log(f"[WATCHDOG] polling не получал событий {idle:.0f} сек — перезапускаю")
-            try:
-                await max_dp.stop_polling()
-            except Exception:
-                pass
-            _last_event_time = time.time()
-
-async def update_event_time(handler, event, data):
-    global _last_event_time
-    _last_event_time = time.time()
-    return await handler(event, data)
-
-max_dp.use(update_event_time)
+# === СУПЕРВИЗОР POLLING ===
+_polling_task = None
 
 async def run_max_bot():
-    # ИЗМЕНЕНО: при InvalidToken бот останавливается, а не крутит бесконечный цикл.
-    # Для остальных ошибок — перезапуск с задержкой.
+    global _polling_task
     while True:
+        _polling_task = asyncio.create_task(max_dp.start_polling(max_bot), name="max-polling")
         try:
-            await max_bot.delete_webhook()
-            log("[BOT] start_polling")
-            await max_dp.start_polling(max_bot)
-            break
+            await asyncio.wait({_polling_task})
         except asyncio.CancelledError:
+            _polling_task.cancel()
             raise
+        if _polling_task.cancelled():
+            log("[BOT] polling отменён — перезапуск")
+        elif (exc := _polling_task.exception()) is None:
+            log("[BOT] polling завершился штатно — перезапуск")
+        elif _is_fatal_token_error(exc):
+            log(f"❌ Фатальная ошибка токена MAX: {safe_repr(exc)}. Бот остановлен.")
+            return
+        else:
+            log(f"❌ MAX polling упал: {safe_repr(exc)}")
+        await asyncio.sleep(5)
+
+async def polling_watchdog():
+    fails = 0
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.wait_for(max_bot.get_me(), timeout=15)
+            fails = 0
         except Exception as e:
-            err_str = str(e).lower()
-            if "invalid access_token" in err_str or "неверный токен" in err_str or "invalidtoken" in err_str:
-                log(f"❌ Фатальная ошибка токена MAX: {e}. Бот остановлен. Проверьте MAX_BOT_TOKEN в Layero.")
-                raise
-            log(f"❌ MAX polling упал: {e!r}")
-            traceback.print_exc()
-            await asyncio.sleep(10)
+            fails += 1
+            log(f"[WATCHDOG] проверка API не прошла ({fails}/3): {type(e).__name__}")
+            if fails >= 3 and _polling_task and not _polling_task.done():
+                log("[WATCHDOG] перезапускаю polling")
+                _polling_task.cancel()
+                fails = 0
 
 @app.on_event("startup")
 async def startup():
     global DB
-    if os.path.exists("shipments.json"):
-        with open("shipments.json", "r", encoding="utf-8") as f:
-            DB = json.load(f)
-        asyncio.create_task(update_all_coords())
+    DB = load_json(DB_FILE, {})
+    spawn(run_max_bot(), "max-bot")
+    spawn(polling_watchdog(), "watchdog")
+    spawn(gps_refresher(), "gps-refresher")
 
-    asyncio.create_task(run_max_bot())
-    asyncio.create_task(polling_watchdog())
-    print("✅ MAX-бот запущен")
+# === АДМИН-ДОСТУП ===
+_fail = {}
 
-def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
-        raise HTTPException(401, "Неверный логин/пароль")
+def check_admin(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    ip = request.client.host if request.client else "?"
+    cnt, ts = _fail.get(ip, (0, time.time()))
+    if time.time() - ts > 600:
+        cnt, ts = 0, time.time()
+    if cnt >= 5:
+        raise HTTPException(429, "Слишком много попыток, подождите")
+    ok = (secrets.compare_digest(credentials.username.encode(), ADMIN_USER.encode())
+          & secrets.compare_digest(credentials.password.encode(), ADMIN_PASS.encode()))
+    if not ok:
+        _fail[ip] = (cnt + 1, ts)
+        raise HTTPException(401, "Неверный логин/пароль", headers={"WWW-Authenticate": "Basic"})
+    _fail.pop(ip, None)
     return credentials.username
 
-# === API ДЛЯ САЙТА ===
+# === API ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
 
 @app.post("/api/admin/settings/tabs")
-async def set_tabs(s: dict, user=Depends(check_admin)):
-    global SETTINGS
-    SETTINGS.update(s)
+async def set_tabs(s: TabsSettings, user=Depends(check_admin)):
+    SETTINGS.update(s.model_dump(exclude_none=True))
     save_settings()
     return {"ok": True}
 
 @app.get("/api/shipments")
-async def list_shipments(status: Optional[str] = None, search: Optional[str] = None, sort_by: str = "gps", force_refresh: bool = False):
-    if force_refresh:
-        asyncio.create_task(update_all_coords())
-
+async def list_shipments(status: Optional[str] = None, search: Optional[str] = None,
+                         sort_by: str = "gps", force_refresh: bool = False):
+    if force_refresh and allow_manual_refresh():
+        spawn(update_all_coords(), "manual-refresh")
     result = []
     for o in DB.values():
-        s = str(o.get("status", "")).lower()
-        if status == "in_transit" and s not in ['в пути', 'планируется']: continue
-        if status == "delivered" and s not in ['завершено', 'выгружено']: continue
-        if status == "with_gps":
-            if not o.get("current_lat"): continue
-
+        s = str(o.get("status") or "").lower()
+        if status == "in_transit" and s not in ("в пути", "планируется"): continue
+        if status == "delivered" and s not in ("завершено", "выгружено"): continue
+        if status == "with_gps" and o.get("current_lat") is None: continue
         if search:
             q = search.lower()
-            if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower():
+            hay = " ".join(str(o.get(k) or "") for k in
+                           ("order_id", "address", "vehicle", "carrier")).lower()
+            if q not in hay:
                 continue
-        result.append(o)
-
+        result.append(public_view(o))
     def sort_key(x):
-        is_valid = 1 if x.get("current_lat") else 0
+        is_valid = 1 if x.get("current_lat") is not None else 0
         order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
-
         if sort_by == "gps": return (not is_valid, order_id)
         elif sort_by == "order_id": return order_id
         elif sort_by == "city": return (city == "", city, order_id)
         return (not is_valid, order_id)
-
     result.sort(key=sort_key)
     return result
 
 @app.get("/api/coords/{order_id}")
 async def get_online_coords(order_id: str):
-    if order_id not in DB: raise HTTPException(404, "Заказ не найден")
-    o = DB[order_id]
-
+    o = DB.get(order_id)
+    if not o:
+        raise HTTPException(404, "Заказ не найден")
     if o.get("gps_link"):
-        loop = asyncio.get_running_loop()
-        lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
-        if lat and lng:
-            o["current_lat"] = lat
-            o["current_lng"] = lng
-            o["has_valid_gps"] = True
-            GPS_CACHE[order_id] = {"ts": time.time(), "link": o.get("gps_link"), "lat": lat, "lng": lng}
-            save_db()
-            return {"lat": lat, "lng": lng}
-        else:
-            if status == "invalid_token":
-                raise HTTPException(400, "Ссылка на GPS устарела")
-            elif status == "error":
-                raise HTTPException(503, "Спутник не отвечает")
-
-    if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
+        await fetch_single_order_coords(order_id, o)
+        if o.get("current_lat") is not None:
+            spawn(save_db_async(), "save")
+            return {"lat": o["current_lat"], "lng": o["current_lng"],
+                    "updated_at": o.get("gps_updated_at")}
+        if o.get("gps_status") == "invalid_token":
+            raise HTTPException(400, "Ссылка на GPS устарела")
     raise HTTPException(404, "GPS недоступен")
 
 @app.get("/api/admin/shipments")
@@ -489,88 +531,108 @@ async def admin_list(user=Depends(check_admin)):
 
 @app.post("/api/admin/shipments")
 async def admin_create(s: Shipment, user=Depends(check_admin)):
-    DB[s.order_id] = s.model_dump()
-    DB[s.order_id]["has_valid_gps"] = None
-    save_db()
-    asyncio.create_task(update_all_coords())
+    oid = s.order_id.strip()
+    if not oid:
+        raise HTTPException(422, "Пустой номер заказа")
+    old = DB.get(oid, {})
+    rec = {**old, **s.model_dump(exclude_unset=True), "order_id": oid}
+    if rec.get("gps_link") != old.get("gps_link"):
+        rec.update(current_lat=None, current_lng=None, has_valid_gps=None, gps_status=None)
+    DB[oid] = rec
+    await save_db_async()
+    if rec.get("gps_link"):
+        spawn(fetch_single_order_coords(oid, rec, force=True), f"gps-{oid}")
     return {"ok": True}
 
 @app.delete("/api/admin/shipments/{order_id}")
 async def admin_delete(order_id: str, user=Depends(check_admin)):
     if order_id in DB:
         del DB[order_id]
-        save_db()
+        await save_db_async()
     return {"ok": True}
+
+# === EXCEL ===
+class UploadError(ValueError):
+    pass
+
+SHEET = "Исх.логистика"
+REQUIRED_COLS = {"Заказ", "Адрес доставки", "Перевозчик", "Машина", "статус доставки"}
+
+def _s(v):
+    return None if pd.isna(v) or str(v).strip() in ("", "nan") else str(v).strip()
+
+def _fmt_date(v):
+    s = _s(v)
+    if s is None: return None
+    try: return pd.to_datetime(s, dayfirst=True).strftime("%Y-%m-%d")
+    except Exception: return s[:10]
+
+def _safe_float(v):
+    s = _s(v)
+    if s is None: return None
+    try: return float(s.replace(",", "."))
+    except ValueError: return None
+
+def parse_excel(contents: bytes):
+    try:
+        xl = pd.ExcelFile(io.BytesIO(contents), engine="openpyxl")
+    except Exception:
+        raise UploadError("Не удалось открыть файл. Нужен .xlsx")
+    if SHEET not in xl.sheet_names:
+        raise UploadError(f"В файле нет листа '{SHEET}'")
+    df = xl.parse(SHEET, dtype=str)
+    missing = REQUIRED_COLS - set(df.columns)
+    if missing:
+        raise UploadError(f"Нет колонок: {', '.join(sorted(missing))}")
+    new_db, skipped, dups = {}, 0, []
+    for _, row in df.iterrows():
+        oid = _s(row.get("Заказ"))
+        if not oid:
+            skipped += 1
+            continue
+        if oid in new_db:
+            dups.append(oid)
+        new_db[oid] = {
+            "order_id": oid,
+            "address": _s(row.get("Адрес доставки")),
+            "weight": _safe_float(row.get("вес")),
+            "plan_arrival": _fmt_date(row.get("Дата прибытия")),
+            "carrier": _s(row.get("Перевозчик")),
+            "vehicle": _s(row.get("Машина")),
+            "driver": _s(row.get("Водитель")),
+            "gps_link": _s(row.get("ссылка")),
+            "comment": _s(row.get("Примечания")),
+            "status": (_s(row.get("статус доставки")) or "").lower(),
+            "has_valid_gps": None,
+        }
+    return new_db, skipped, dups
 
 @app.post("/api/admin/upload")
 async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_admin)):
     global DB
+    contents = await file.read(MAX_UPLOAD + 1)
+    if len(contents) > MAX_UPLOAD:
+        raise HTTPException(413, "Файл больше 10 МБ")
     try:
-        contents = await file.read()
-        wb = openpyxl.load_workbook(io.BytesIO(contents))
-        if "Исх.логистика" not in wb.sheetnames:
-            raise HTTPException(400, "В файле нет листа 'Исх.логистика'")
-
-        ws = wb["Исх.логистика"]
-        for row_idx in range(1, ws.max_row + 1):
-            if ws.row_dimensions[row_idx].hidden:
-                ws.row_dimensions[row_idx].hidden = False
-
-        output = io.BytesIO()
-        wb.save(output)
-        output.seek(0)
-
-        df = pd.read_excel(output, sheet_name="Исх.логистика", dtype=str)
-
-        new_db = {}
-        skipped = 0
-        last_orders = []
-
-        for _, row in df.iterrows():
-            raw_order = row.get('Заказ')
-            if pd.isna(raw_order) or str(raw_order).strip() == '' or str(raw_order).strip().lower() == 'nan':
-                skipped += 1
-                continue
-
-            order_id = str(raw_order).strip()
-            last_orders.append(order_id)
-            if len(last_orders) > 5: last_orders.pop(0)
-
-            def fmt_date(val):
-                if pd.isna(val) or str(val).strip() == '': return None
-                try: return pd.to_datetime(val).strftime('%Y-%m-%d')
-                except: return str(val)[:10]
-
-            def safe_float(val):
-                if pd.isna(val) or str(val).strip() == '': return None
-                try: return float(str(val).replace(',', '.').strip())
-                except: return None
-
-            gps = str(row.get('ссылка')).strip() if not pd.isna(row.get('ссылка')) else None
-
-            new_db[order_id] = {
-                "order_id": order_id,
-                "address": str(row.get('Адрес доставки')).strip() if not pd.isna(row.get('Адрес доставки')) else None,
-                "weight": safe_float(row.get('вес')),
-                "plan_arrival": fmt_date(row.get('Дата прибытия')),
-                "carrier": str(row.get('Перевозчик')).strip() if not pd.isna(row.get('Перевозчик')) else None,
-                "vehicle": str(row.get('Машина')).strip() if not pd.isna(row.get('Машина')) else None,
-                "driver": str(row.get('Водитель')).strip() if not pd.isna(row.get('Водитель')) else None,
-                "gps_link": gps,
-                "comment": str(row.get('Примечания')).strip() if not pd.isna(row.get('Примечания')) else None,
-                "status": str(row.get('статус доставки')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
-                "has_valid_gps": None
-            }
-
-        DB = new_db
-        save_db()
-        asyncio.create_task(update_all_coords())
-
-        debug_msg = ", ".join(last_orders)
-        return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}. Последние: {debug_msg}"}
-    except Exception as e:
-        raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
-        # ============ ГЛАВНАЯ СТРАНИЦА ============
+        new_db, skipped, dups = await asyncio.to_thread(parse_excel, contents)
+    except UploadError as e:
+        raise HTTPException(400, str(e))
+    except Exception:
+        log(f"[UPLOAD] {traceback.format_exc(limit=3)}")
+        raise HTTPException(500, "Ошибка разбора файла (подробности в логах)")
+    for oid, o in new_db.items():
+        old = DB.get(oid)
+        if old and old.get("gps_link") == o.get("gps_link"):
+            for k in ("current_lat", "current_lng", "has_valid_gps", "gps_updated_at", "gps_status"):
+                o[k] = old.get(k)
+    DB = new_db
+    await save_db_async()
+    spawn(update_all_coords(), "gps-after-upload")
+    msg = f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}."
+    if dups:
+        msg += f" Дубли (взята последняя): {', '.join(dups[:10])}"
+    return {"ok": True, "message": msg}
+    # ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -622,6 +684,7 @@ async def user_portal():
     .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin-bottom: 10px; }
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     .btn-reload { padding: 10px 20px; background: var(--primary); color: white; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; text-decoration: none; display: inline-block; }
+    .stale { color: #b45309; font-size: 12px; margin-top: 8px; }
 </style>
 </head>
 <body>
@@ -662,9 +725,26 @@ async def user_portal():
     <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
     <div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
     <script>
-    let currentTab = 'in_transit'; let map = null;
-    function toggleTheme() { const isDark = document.documentElement.getAttribute('data-theme') === 'dark'; document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark'); localStorage.setItem('theme', isDark ? 'light' : 'dark'); }
+    let currentTab = 'in_transit'; let map = null; let ORDERS = [];
+    const esc = s => String(s ?? '').replace(/[&<>"']/g,
+        c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+    function toggleTheme() {
+        const isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+        document.documentElement.setAttribute('data-theme', isDark ? 'light' : 'dark');
+        localStorage.setItem('theme', isDark ? 'light' : 'dark');
+    }
     document.documentElement.setAttribute('data-theme', localStorage.getItem('theme') || 'light');
+
+    function relTime(ts) {
+        if (!ts) return '—';
+        const diff = Math.floor(Date.now()/1000) - ts;
+        if (diff < 60) return 'только что';
+        if (diff < 3600) return `${Math.floor(diff/60)} мин назад`;
+        if (diff < 86400) return `${Math.floor(diff/3600)} ч назад`;
+        return `${Math.floor(diff/86400)} дн назад`;
+    }
+    function isStale(ts) { return ts && (Date.now()/1000 - ts) > 1800; }
 
     async function loadTabs() {
         const res = await fetch('/api/settings/tabs');
@@ -674,97 +754,102 @@ async def user_portal():
             const key = 'show_' + status;
             if (settings[key] !== false) { tab.classList.add('visible'); } else { tab.classList.remove('visible'); }
         });
-        const activeTab = document.querySelector('.tab.active');
-        if (activeTab && !activeTab.classList.contains('visible')) {
-            const firstVisible = document.querySelector('.tab.visible');
-            if (firstVisible) setTab(firstVisible.dataset.status);
-        }
     }
 
-    function setTab(s) { currentTab = s; document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active')); document.querySelector(`.tab[data-status="${s}"]`).classList.add('active'); loadOrders(); }
+    function setTab(s) {
+        currentTab = s;
+        document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+        const el = document.querySelector(`.tab[data-status="${s}"]`);
+        if (el) el.classList.add('active');
+        loadOrders();
+    }
     function debounceSearch() { clearTimeout(window.searchTimeout); window.searchTimeout = setTimeout(loadOrders, 300); }
 
     async function loadOrders(force_refresh = false) {
         const search = document.getElementById('searchInput').value.trim();
         const sort = document.getElementById('sortSelect').value;
         document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;">Загрузка...</div>';
-
         const cacheParam = force_refresh ? `&force_refresh=true&_t=${Date.now()}` : '';
-        const url = `/api/shipments?status=${currentTab}&sort_by=${sort}${search ? '&search='+search : ''}${cacheParam}`;
-
+        const url = `/api/shipments?status=${currentTab}&sort_by=${sort}${search ? '&search='+encodeURIComponent(search) : ''}${cacheParam}`;
         try {
             const res = await fetch(url, { cache: force_refresh ? "no-store" : "default" });
             const orders = await res.json();
+            ORDERS = orders;
             const grid = document.getElementById('ordersGrid');
             if (!orders.length) { grid.innerHTML = '<div style="text-align:center;width:100%;">Нет заказов</div>'; return; }
-            grid.innerHTML = orders.map(o => {
-                let badge = o.status === 'в пути' ? '<span class="order-status in-transit">В пути</span>' : (o.status === 'завершено' ? '<span class="order-status delivered">Выгружено</span>' : '');
-                let loc = o.comment ? `<div class="loc-info">📝 ${o.comment}</div>` : '';
-                return `<div class="order-card ${o.status === 'завершено' ? 'delivered' : ''}" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
-                    <div style="display:flex; justify-content:space-between; margin-bottom:10px;"><span class="order-id">${o.order_id}</span>${badge}</div>
-                    <div class="order-row"><strong>Адрес:</strong> ${o.address || '—'}</div>
-                    <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier || '—'}</div>
-                    <div class="order-row"><strong>Машина:</strong> ${o.vehicle || '—'}</div>
-                    <div class="order-row"><strong>Вес:</strong> ${o.weight ? o.weight + ' кг' : '—'}</div>
-                    ${loc}
+            grid.innerHTML = orders.map((o, i) => {
+                const done = ['завершено', 'выгружено'].includes(o.status);
+                let badge = done
+                    ? '<span class="order-status delivered">Выгружено</span>'
+                    : (o.status === 'в пути' ? '<span class="order-status in-transit">В пути</span>' : '');
+                let loc = o.comment ? `<div class="loc-info">📝 ${esc(o.comment)}</div>` : '';
+                let stale = isStale(o.gps_updated_at) ? `<div class="stale">⚠️ Данные GPS устарели (${relTime(o.gps_updated_at)})</div>` : '';
+                return `<div class="order-card ${done ? 'delivered' : ''}" onclick="openOrder(${i})">
+                    <div style="display:flex; justify-content:space-between; margin-bottom:10px;"><span class="order-id">${esc(o.order_id)}</span>${badge}</div>
+                    <div class="order-row"><strong>Адрес:</strong> ${esc(o.address) || '—'}</div>
+                    <div class="order-row"><strong>Перевозчик:</strong> ${esc(o.carrier) || '—'}</div>
+                    <div class="order-row"><strong>Машина:</strong> ${esc(o.vehicle) || '—'}</div>
+                    <div class="order-row"><strong>Вес:</strong> ${o.weight ? esc(o.weight) + ' кг' : '—'}</div>
+                    ${loc}${stale}
                 </div>`;
             }).join('');
-        } catch(e) { document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;color:red;">Ошибка загрузки</div>'; }
+        } catch(e) {
+            document.getElementById('ordersGrid').innerHTML = '<div style="text-align:center;width:100%;color:red;">Ошибка загрузки</div>';
+        }
     }
 
     function refreshData() {
         const btn = document.getElementById('refreshBtn');
         btn.innerHTML = '⏳ Загрузка...';
         btn.disabled = true;
-        loadOrders(true).finally(() => {
+        loadOrders(true).then(async () => {
+            await new Promise(r => setTimeout(r, 15000));
+            await loadOrders();
+        }).finally(() => {
             btn.innerHTML = '🔄 Обновить';
             btn.disabled = false;
         });
     }
 
-    async function openOrder(o) {
+    async function openOrder(i) {
+        const o = ORDERS[i];
         document.getElementById('modal').classList.add('open');
-        document.getElementById('modalContent').innerHTML = `<h2>📦 ${o.order_id}</h2>
+        const updated = o.gps_updated_at ? `🕒 GPS: ${relTime(o.gps_updated_at)}` : '';
+        document.getElementById('modalContent').innerHTML = `<h2>📦 ${esc(o.order_id)}</h2>
             <div class="modal-info">
-                <div><strong>Адрес</strong>${o.address || '—'}</div>
-                <div><strong>Перевозчик</strong>${o.carrier || '—'}</div>
-                <div><strong>Машина</strong>${o.vehicle || '—'}</div>
-                <div><strong>Водитель</strong>${o.driver || '—'}</div>
-                <div><strong>Вес</strong>${o.weight ? o.weight + ' кг' : '—'}</div>
-                <div><strong>Прибытие</strong>${o.plan_arrival || '—'}</div>
+                <div><strong>Адрес</strong>${esc(o.address) || '—'}</div>
+                <div><strong>Перевозчик</strong>${esc(o.carrier) || '—'}</div>
+                <div><strong>Машина</strong>${esc(o.vehicle) || '—'}</div>
+                <div><strong>Вес</strong>${o.weight ? esc(o.weight) + ' кг' : '—'}</div>
+                <div><strong>Прибытие</strong>${esc(o.plan_arrival) || '—'}</div>
+                <div><strong>GPS</strong>${updated || '—'}</div>
             </div>
-            ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>` : ''}
+            ${o.comment ? `<div style="margin-top:20px; padding:12px; background:rgba(0,0,0,0.05); border-radius:8px;"><strong>Примечание:</strong> ${esc(o.comment)}</div>` : ''}
             <div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
 
-        if (o.current_lat && o.current_lng) {
+        if (o.current_lat != null && o.current_lng != null) {
             renderMap(o.current_lat, o.current_lng);
-        } else if (o.gps_link) {
-            loadCoords(o.order_id, o.gps_link);
+        } else if (o.can_refresh) {
+            loadCoords(o.order_id);
         } else {
-            document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>';
+            document.getElementById('map').innerHTML = '<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует.</div>';
         }
     }
 
-    async function loadCoords(orderId, gpsLink) {
+    async function loadCoords(orderId) {
         const mapDiv = document.getElementById('map');
         mapDiv.innerHTML = '<div class="spinner"></div><div>Запрос к спутнику...</div>';
         try {
-            const res = await fetch(`/api/coords/${orderId}`);
+            const res = await fetch(`/api/coords/${encodeURIComponent(orderId)}`);
             if (res.ok) {
                 const data = await res.json();
                 renderMap(data.lat, data.lng);
             } else {
                 const errorData = await res.json();
-                mapDiv.innerHTML = `<div style="text-align:center;padding:20px;color:#888;">
-                    ${errorData.detail || 'GPS недоступен'}<br><br>
-                    <a href="${gpsLink}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a>
-                </div>`;
+                mapDiv.innerHTML = `<div style="text-align:center;padding:20px;color:#888;">${esc(errorData.detail) || 'GPS недоступен'}</div>`;
             }
         } catch(e) {
-            mapDiv.innerHTML = `<div style="text-align:center;padding:20px;color:#888;">
-                Ошибка сети<br><br>
-                <a href="${gpsLink}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a>
-            </div>`;
+            mapDiv.innerHTML = `<div style="text-align:center;padding:20px;color:#888;">Ошибка сети</div>`;
         }
     }
 
@@ -777,7 +862,10 @@ async def user_portal():
     }
     function closeModal() { document.getElementById('modal').classList.remove('open'); if(map){map.remove(); map=null;} }
 
-    loadTabs().then(() => loadOrders());
+    loadTabs().then(() => {
+        const first = document.querySelector('.tab.visible');
+        setTab(first ? first.dataset.status : 'in_transit');
+    });
     </script>
 </body>
 </html>
@@ -834,14 +922,14 @@ async def admin_panel(user=Depends(check_admin)):
         <div class="panel">
             <h3>📥 Загрузка данных из Excel</h3>
             <div class="upload-box">
-                <input type="file" id="excelFile" accept=".xlsx, .xls">
+                <input type="file" id="excelFile" accept=".xlsx">
                 <button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
                 <span id="uploadStatus"></span>
             </div>
-            <p style="font-size: 12px; color: #666; margin-top: 10px;">Берется лист <b>"Исх.логистика"</b>. Предыдущая база полностью заменяется.</p>
+            <p style="font-size: 12px; color: #666; margin-top: 10px;">Лист <b>"Исх.логистика"</b>. Предыдущая база заменяется. Максимум 10 МБ.</p>
         </div>
 
-        <input id="filter" placeholder="Поиск по номеру или адресу..." oninput="renderTable()"/>
+        <input id="filter" placeholder="Поиск по номеру, адресу, машине..." oninput="renderTable()"/>
         <table id="shipments">
             <thead><tr><th>Заказ</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Действия</th></tr></thead>
             <tbody></tbody>
@@ -873,7 +961,10 @@ async def admin_panel(user=Depends(check_admin)):
             </div>
         </div>
         <script>
-        let allData=[];
+        let allData = []; let VIEW = [];
+        const esc = s => String(s ?? '').replace(/[&<>"']/g,
+            c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
         async function loadSettings() {
             const res = await fetch('/api/settings/tabs');
             const s = await res.json();
@@ -890,47 +981,51 @@ async def admin_panel(user=Depends(check_admin)):
             await fetch('/api/admin/settings/tabs', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
         }
 
-        async function load(){
-            const res = await fetch('/api/admin/shipments'); allData = await res.json();
+        async function load() {
+            const res = await fetch('/api/admin/shipments');
+            allData = await res.json();
             renderTable();
         }
-        function renderTable(){
+        function renderTable() {
             const q = document.getElementById('filter').value.toLowerCase();
-            let filtered = allData.filter(s => (s.order_id||'').toLowerCase().includes(q) || (s.address||'').toLowerCase().includes(q));
-            document.querySelector('#shipments tbody').innerHTML = filtered.map(s=>`
+            VIEW = allData.filter(s => {
+                const hay = [s.order_id, s.address, s.vehicle, s.carrier].map(x => String(x || '')).join(' ').toLowerCase();
+                return hay.includes(q);
+            });
+            document.querySelector('#shipments tbody').innerHTML = VIEW.map((s, i) => `
                 <tr>
-                    <td><b>${s.order_id}</b></td>
-                    <td>${s.address||''}</td>
-                    <td>${s.carrier||''}</td>
-                    <td>${s.vehicle||''}</td>
-                    <td>${s.status||'—'}</td>
+                    <td><b>${esc(s.order_id)}</b></td>
+                    <td>${esc(s.address) || ''}</td>
+                    <td>${esc(s.carrier) || ''}</td>
+                    <td>${esc(s.vehicle) || ''}</td>
+                    <td>${esc(s.status) || '—'}</td>
                     <td>
-                        <button class="btn btn-blue" style="padding:4px 8px;" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
-                        <button class="btn btn-red" style="padding:4px 8px;" onclick="del('${s.order_id}')">🗑</button>
+                        <button class="btn btn-blue" style="padding:4px 8px;" onclick="openEdit(VIEW[${i}])">✏️</button>
+                        <button class="btn btn-red" style="padding:4px 8px;" onclick="del(VIEW[${i}].order_id)">🗑</button>
                     </td>
                 </tr>
             `).join('');
         }
-        function openAdd(){
-            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f=>document.getElementById('f_'+f).value='');
-            document.getElementById('f_order_id').disabled=false;
-            document.getElementById('f_status').value='';
-            document.getElementById('modalTitle').innerText='Добавить заказ';
-            document.getElementById('modal').style.display='block';
+        function openAdd() {
+            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f => document.getElementById('f_'+f).value = '');
+            document.getElementById('f_order_id').disabled = false;
+            document.getElementById('f_status').value = '';
+            document.getElementById('modalTitle').innerText = 'Добавить заказ';
+            document.getElementById('modal').style.display = 'block';
         }
-        function openEdit(s){
-            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f=>document.getElementById('f_'+f).value=s[f]||'');
-            document.getElementById('f_order_id').disabled=true;
-            document.getElementById('f_status').value=s.status||'';
-            document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id;
-            document.getElementById('modal').style.display='block';
+        function openEdit(s) {
+            ['order_id','address','weight','carrier','vehicle','driver','gps_link','comment','plan_arrival'].forEach(f => document.getElementById('f_'+f).value = s[f] || '');
+            document.getElementById('f_order_id').disabled = true;
+            document.getElementById('f_status').value = s.status || '';
+            document.getElementById('modalTitle').innerText = 'Редактировать: ' + s.order_id;
+            document.getElementById('modal').style.display = 'block';
         }
-        function closeModal(){ document.getElementById('modal').style.display='none'; }
-        async function saveOrder(){
+        function closeModal() { document.getElementById('modal').style.display = 'none'; }
+        async function saveOrder() {
             const payload = {
                 order_id: document.getElementById('f_order_id').value,
                 address: document.getElementById('f_address').value,
-                weight: parseFloat(document.getElementById('f_weight').value)||null,
+                weight: parseFloat(document.getElementById('f_weight').value) || null,
                 carrier: document.getElementById('f_carrier').value,
                 vehicle: document.getElementById('f_vehicle').value,
                 driver: document.getElementById('f_driver').value,
@@ -939,29 +1034,26 @@ async def admin_panel(user=Depends(check_admin)):
                 plan_arrival: document.getElementById('f_plan_arrival').value,
                 status: document.getElementById('f_status').value
             };
-            await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+            await fetch('/api/admin/shipments', { method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload) });
             closeModal(); load();
         }
-        async function del(order_id){
-            if(!confirm('Удалить '+order_id+'?')) return;
-            await fetch('/api/admin/shipments/'+order_id,{method:'DELETE'}); load();
+        async function del(order_id) {
+            if (!confirm('Удалить ' + order_id + '?')) return;
+            await fetch('/api/admin/shipments/' + encodeURIComponent(order_id), { method: 'DELETE' });
+            load();
         }
 
         async function uploadExcel() {
             const fileInput = document.getElementById('excelFile');
             if (!fileInput.files.length) { alert("Выберите файл!"); return; }
-
             const formData = new FormData();
             formData.append("file", fileInput.files[0]);
-
             const btn = document.getElementById('uploadBtn');
             const status = document.getElementById('uploadStatus');
-
             btn.disabled = true;
             btn.innerText = "⏳ Обработка...";
             status.innerText = "Пожалуйста, подождите...";
             status.style.color = "blue";
-
             try {
                 const res = await fetch('/api/admin/upload', { method: 'POST', body: formData });
                 const data = await res.json();
@@ -970,7 +1062,7 @@ async def admin_panel(user=Depends(check_admin)):
                     status.style.color = "green";
                     load();
                 } else {
-                    status.innerText = "❌ Ошибка: " + data.detail;
+                    status.innerText = "❌ Ошибка: " + (data.detail || 'неизвестно');
                     status.style.color = "red";
                 }
             } catch(e) {
