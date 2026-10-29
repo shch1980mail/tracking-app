@@ -35,7 +35,11 @@ def save_settings():
 DB = {}
 
 # === НАСТРОЙКА БОТА MAX ===
-MAX_BOT_TOKEN = "ВАШ_ТОКЕН_ЗДЕСЬ"
+# ИЗМЕНЕНО: токен берётся из переменной окружения Layero (MAX_BOT_TOKEN),
+# а не хардкодится. Layero прокидывает env vars в runtime-контейнер.
+MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN", "").strip()
+if not MAX_BOT_TOKEN:
+    raise RuntimeError("MAX_BOT_TOKEN не задан в переменных окружения Layero")
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
@@ -62,7 +66,6 @@ def log(*args):
     print(*args, flush=True)
 
 # === КЭШ И БЛОКИРОВКИ GPS ===
-# ИЗМЕНЕНО: добавлен кэш и блокировки, чтобы не дёргать Wialon лишний раз
 GPS_CACHE_TTL = 120
 GPS_CACHE = {}
 _gps_locks = {}
@@ -89,7 +92,6 @@ def get_coords_from_baltgps(gps_link: str):
         return None, None, "no_link"
     try:
         token = gps_link.split("?t=")[-1]
-        # ИЗМЕНЕНО: таймауты (3.0, 5.0) -> (2.0, 3.0)
         r = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "token/login", "params": json.dumps({"token": token})
         }, timeout=(2.0, 3.0))
@@ -104,7 +106,6 @@ def get_coords_from_baltgps(gps_link: str):
         unit_id = items[0]
         sid = data.get("eid")
 
-        # ИЗМЕНЕНО: таймауты (3.0, 5.0) -> (2.0, 3.0)
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "unit/calc_last", "params": json.dumps([unit_id]), "sid": sid
         }, timeout=(2.0, 3.0))
@@ -119,7 +120,6 @@ def get_coords_from_baltgps(gps_link: str):
             if "y" in pos and "x" in pos:
                 return float(pos["y"]), float(pos["x"]), "ok"
 
-        # ИЗМЕНЕНО: таймауты (3.0, 5.0) -> (2.0, 3.0)
         r3 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
             "svc": "core/search_item", "params": json.dumps({"id": unit_id, "flags": 1025}), "sid": sid
         }, timeout=(2.0, 3.0))
@@ -133,7 +133,6 @@ def get_coords_from_baltgps(gps_link: str):
         return None, None, "error"
 
 async def fetch_single_order_coords(order_id, o, force=False):
-    # ИЗМЕНЕНО: добавлен кэш (TTL) и блокировка на заказ, чтобы не было гонок
     async with _order_lock(order_id):
         c = GPS_CACHE.get(order_id)
         fresh = c and c.get("link") == o.get("gps_link") and (time.time() - c["ts"]) < GPS_CACHE_TTL
@@ -141,13 +140,12 @@ async def fetch_single_order_coords(order_id, o, force=False):
             _apply_coords(o, c["lat"], c["lng"])
             return
         loop = asyncio.get_running_loop()
-        # run_in_executor уже был — сохраняем, чтобы не блокировать event loop
+        # GPS-запрос в отдельном потоке, чтобы не блокировать event loop
         lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
         GPS_CACHE[order_id] = {"ts": time.time(), "link": o.get("gps_link"), "lat": lat, "lng": lng}
         _apply_coords(o, lat, lng)
 
 async def update_all_coords(force=False):
-    # ИЗМЕНЕНО: защита от параллельного запуска через _update_lock
     global _update_lock
     if _update_lock is None:
         _update_lock = asyncio.Lock()
@@ -194,10 +192,18 @@ def get_orders_menu():
 # === ЛОГИКА БОТА MAX ===
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
-    await event.message.answer(
-        text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
-        keyboard=get_main_menu()
-    )
+    try:
+        await asyncio.wait_for(
+            event.message.answer(
+                text="👋 Добро пожаловать в бот ТПК! Выберите действие:",
+                keyboard=get_main_menu()
+            ),
+            timeout=10.0
+        )
+    except asyncio.TimeoutError:
+        log("[START] таймаут отправки")
+    except Exception as e:
+        log(f"[START] ошибка: {e!r}")
 
 @max_dp.message_created()
 async def handle_message(event):
@@ -243,9 +249,26 @@ async def handle_message(event):
 
         builder.callback("🔙 Назад в меню", "menu_back")
 
-        await event.message.answer(text=response, keyboard=builder)
+        try:
+            # ИЗМЕНЕНО: wait_for защищает от зависания, если MAX API не отвечает
+            await asyncio.wait_for(
+                event.message.answer(text=response, keyboard=builder),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            log("[MESSAGE] таймаут отправки карточки заказа")
+        except Exception as e:
+            log(f"[MESSAGE] ошибка отправки: {e!r}")
     else:
-        await event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню.")
+        try:
+            await asyncio.wait_for(
+                event.message.answer(f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню."),
+                timeout=10.0
+            )
+        except asyncio.TimeoutError:
+            log("[MESSAGE] таймаут отправки 'не найден'")
+        except Exception as e:
+            log(f"[MESSAGE] ошибка: {e!r}")
 
 # === ОБРАБОТКА НАЖАТИЙ КНОПОК ===
 @max_dp.message_callback()
@@ -254,67 +277,85 @@ async def handle_callback(event):
         return
 
     payload = event.callback.payload
-    await event.answer()
+    try:
+        await asyncio.wait_for(event.answer(), timeout=5.0)
+    except Exception:
+        pass
 
-    if payload == "menu_choose_order":
-        await event.message.edit(
-            text="Выберите заказ из списка:",
-            keyboard=get_orders_menu()
-        )
-    elif payload == "menu_update_gps":
-        await event.message.edit(
-            text="⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
-            keyboard=get_main_menu()
-        )
-        # ИЗМЕНЕНО: force=True, чтобы принудительно обновить, но с защитой от параллельного запуска внутри
-        asyncio.create_task(update_all_coords(force=True))
-    elif payload == "menu_help":
-        help_text = (
-            "👋 **Помощь**\n\n"
-            "🔍 **Как искать:**\n"
-            "• Введите **4 цифры** номера заказа (например, `1668`).\n"
-            "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
-            "🗺️ **Что я умею:**\n"
-            "• Показывать адрес, перевозчика, машину и статус.\n"
-            "• Отправлять точку на карте (если есть GPS).\n"
-            "• Показывать примечания (если GPS нет)."
-        )
-        await event.message.edit(text=help_text, keyboard=get_main_menu())
-    elif payload == "menu_back":
-        await event.message.edit(
-            text="👋 Главное меню:",
-            keyboard=get_main_menu()
-        )
-    elif payload.startswith("order_"):
-        order_id = payload.replace("order_", "")
-        if order_id in DB:
-            o = DB[order_id]
-            response = (
-                f"📦 **Заказ:** {o['order_id']}\n"
-                f"📍 **Адрес:** {o.get('address') or '—'}\n"
-                f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
-                f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
-                f"📊 **Статус:** {o.get('status') or '—'}\n"
+    try:
+        if payload == "menu_choose_order":
+            await asyncio.wait_for(
+                event.message.edit(text="Выберите заказ из списка:", keyboard=get_orders_menu()),
+                timeout=10.0
             )
-            if o.get('comment'):
-                response += f"📝 **Примечание:** {o['comment']}\n"
+        elif payload == "menu_update_gps":
+            await asyncio.wait_for(
+                event.message.edit(
+                    text="⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
+                    keyboard=get_main_menu()
+                ),
+                timeout=10.0
+            )
+            asyncio.create_task(update_all_coords(force=True))
+        elif payload == "menu_help":
+            help_text = (
+                "👋 **Помощь**\n\n"
+                "🔍 **Как искать:**\n"
+                "• Введите **4 цифры** номера заказа (например, `1668`).\n"
+                "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
+                "🗺️ **Что я умею:**\n"
+                "• Показывать адрес, перевозчика, машину и статус.\n"
+                "• Отправлять точку на карте (если есть GPS).\n"
+                "• Показывать примечания (если GPS нет)."
+            )
+            await asyncio.wait_for(
+                event.message.edit(text=help_text, keyboard=get_main_menu()),
+                timeout=10.0
+            )
+        elif payload == "menu_back":
+            await asyncio.wait_for(
+                event.message.edit(text="👋 Главное меню:", keyboard=get_main_menu()),
+                timeout=10.0
+            )
+        elif payload.startswith("order_"):
+            order_id = payload.replace("order_", "")
+            if order_id in DB:
+                o = DB[order_id]
+                response = (
+                    f"📦 **Заказ:** {o['order_id']}\n"
+                    f"📍 **Адрес:** {o.get('address') or '—'}\n"
+                    f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+                    f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+                    f"📊 **Статус:** {o.get('status') or '—'}\n"
+                )
+                if o.get('comment'):
+                    response += f"📝 **Примечание:** {o['comment']}\n"
 
-            builder = InlineKeyboardBuilder()
-            if o.get("current_lat") and o.get("current_lng"):
-                map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-                builder.link("🗺️ Открыть карту", map_url)
-            elif o.get("gps_link"):
-                builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
+                builder = InlineKeyboardBuilder()
+                if o.get("current_lat") and o.get("current_lng"):
+                    map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+                    builder.link("🗺️ Открыть карту", map_url)
+                elif o.get("gps_link"):
+                    builder.link("🗺️ Открыть карту BaltGPS", o['gps_link'])
+                else:
+                    response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+
+                builder.callback("🔙 Назад в меню", "menu_back")
+                await asyncio.wait_for(
+                    event.message.edit(text=response, keyboard=builder),
+                    timeout=10.0
+                )
             else:
-                response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
-
-            builder.callback("🔙 Назад в меню", "menu_back")
-            await event.message.edit(text=response, keyboard=builder)
-        else:
-            await event.message.answer("Заказ не найден.")
+                await asyncio.wait_for(
+                    event.message.answer("Заказ не найден."),
+                    timeout=10.0
+                )
+    except asyncio.TimeoutError:
+        log(f"[CALLBACK] таймаут обработки payload={payload!r}")
+    except Exception as e:
+        log(f"[CALLBACK] ошибка payload={payload!r}: {e!r}")
 
 # === WATCHDOG ДЛЯ POLLING ===
-# ИЗМЕНЕНО: добавлен watchdog и middleware, обновляющее время последнего события
 _last_event_time = time.time()
 
 async def polling_watchdog():
@@ -338,7 +379,8 @@ async def update_event_time(handler, event, data):
 max_dp.use(update_event_time)
 
 async def run_max_bot():
-    # ИЗМЕНЕНО: перезапуск polling при падении + защита от вечного зависания
+    # ИЗМЕНЕНО: при InvalidToken бот останавливается, а не крутит бесконечный цикл.
+    # Для остальных ошибок — перезапуск с задержкой.
     while True:
         try:
             await max_bot.delete_webhook()
@@ -348,6 +390,10 @@ async def run_max_bot():
         except asyncio.CancelledError:
             raise
         except Exception as e:
+            err_str = str(e).lower()
+            if "invalid access_token" in err_str or "неверный токен" in err_str or "invalidtoken" in err_str:
+                log(f"❌ Фатальная ошибка токена MAX: {e}. Бот остановлен. Проверьте MAX_BOT_TOKEN в Layero.")
+                raise
             log(f"❌ MAX polling упал: {e!r}")
             traceback.print_exc()
             await asyncio.sleep(10)
@@ -361,7 +407,7 @@ async def startup():
         asyncio.create_task(update_all_coords())
 
     asyncio.create_task(run_max_bot())
-    asyncio.create_task(polling_watchdog())  # ИЗМЕНЕНО: запускаем watchdog
+    asyncio.create_task(polling_watchdog())
     print("✅ MAX-бот запущен")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
@@ -419,7 +465,6 @@ async def get_online_coords(order_id: str):
     o = DB[order_id]
 
     if o.get("gps_link"):
-        # ИЗМЕНЕНО: запрос к Wialon в отдельном потоке, чтобы не блокировать event loop
         loop = asyncio.get_running_loop()
         lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
         if lat and lng:
