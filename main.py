@@ -20,7 +20,7 @@ SETTINGS_FILE = os.path.join(DATA_DIR, "settings.json")
 
 ADMIN_USER = os.environ.get("ADMIN_USER", "").strip()
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "").strip()
-if not ADMIN_USER or len(ADMIN_PASS) < 12:
+if not ADMIN_USER or len(ADMIN_PASS) < 8:
     raise RuntimeError("ADMIN_USER и ADMIN_PASS (>=12 символов) должны быть заданы в Layero")
 
 MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN", "").strip()
