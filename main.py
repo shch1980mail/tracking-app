@@ -20,9 +20,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 # === MAX API ===
-from maxapi import Bot, Dispatcher, InlineKeyboardBuilder
+from maxapi import Bot, Dispatcher
 from maxapi.types import TextFormat
 from maxapi.filters.command import Command
+from maxapi.utils.inline_keyboard import InlineKeyboardBuilder
 from maxapi.webhook.fastapi import FastAPIMaxWebhook
 
 # ============================================================================
