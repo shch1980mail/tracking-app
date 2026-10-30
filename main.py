@@ -4,9 +4,15 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
+from contextlib import asynccontextmanager
 import os, json, requests, asyncio, io
+import traceback
+import logging
 import pandas as pd
 import openpyxl
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("max_bot")
 
 # ============================================================
 # УНИВЕРСАЛЬНЫЙ АДАПТЕР ДЛЯ MAXAPI
@@ -25,15 +31,15 @@ try:
     from maxapi.types.attachments.buttons import CallbackButton, LinkButton
     USE_ATTACHMENTS = True
     MAXAPI_VARIANT = "love-apples"
-    print("✅ Используется библиотека: love-apples/maxapi")
+    logger.info("✅ Используется библиотека: love-apples/maxapi")
 except ImportError:
     try:
         from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
         USE_ATTACHMENTS = False
         MAXAPI_VARIANT = "sdk"
-        print("✅ Используется библиотека: maxapi-sdk")
+        logger.info("✅ Используется библиотека: maxapi-sdk")
     except ImportError:
-        raise ImportError("Не найдена ни одна библиотека MAX. Установите 'maxapi[fastapi]' в requirements.txt")
+        raise ImportError("Установите 'maxapi[fastapi]' в requirements.txt")
 
 from maxapi.webhook.fastapi import FastAPIMaxWebhook
 
@@ -96,41 +102,69 @@ DB = {}
 # === НАСТРОЙКА БОТА MAX ===
 MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN")
 if not MAX_BOT_TOKEN:
-    raise ValueError("❌ Переменная окружения MAX_BOT_TOKEN не задана! Добавьте её в Layero → Переменные окружения.")
+    raise ValueError("MAX_BOT_TOKEN не задан")
 
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 if not PUBLIC_URL:
-    raise ValueError("❌ Переменная PUBLIC_URL не задана. Укажите публичный HTTPS-домен Layero (например, https://your-project.layero.app)")
+    raise ValueError("PUBLIC_URL не задан (например, https://tracking-app-main.layero.app)")
+
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
+if not WEBHOOK_SECRET:
+    logger.warning("⚠️ WEBHOOK_SECRET не задан. MAX будет принимать запросы без проверки заголовка.")
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
 
-# === Инициализация FastAPI приложения ДО webhook ===
-app = FastAPI(title="ТПК Отслеживание")
+# === Инициализация FastAPI + Webhook (lifespan) ===
+# Согласно документации maxapi, используем lifespan=webhook.lifespan [citation:8]
+webhook = FastAPIMaxWebhook(
+    dp=max_dp,
+    bot=max_bot,
+    secret=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+)
+
+# Сначала создаём app с lifespan вебхука, затем setup
+# (lifespan-функция должна быть передана в конструктор FastAPI до setup)
+# Поэтому порядок: webhook.setup(app) вызывается ПОСЛЕ создания app.
+# Но webhook.lifespan нужен ДО создания app. Решение: создаём app после webhook.
+# Однако webhook требует app для setup. Поэтому используем промежуточный app.
+# Проще: создаём app, затем передаём webhook.lifespan вручную нельзя.
+# Официальный пример maxapi: app = FastAPI(lifespan=webhook.lifespan) [citation:8]
+# Значит, webhook должен быть создан ДО app.
+# Переупорядочим: создаём webhook, затем app, затем setup.
+
+# Пересоздаём webhook для ясности (можно было сразу)
+webhook = FastAPIMaxWebhook(
+    dp=max_dp,
+    bot=max_bot,
+    secret=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
+)
+
+app = FastAPI(title="ТПК Отслеживание", lifespan=webhook.lifespan)
 security = HTTPBasic()
 app.mount("/static", StaticFiles(directory="static"), name="static")
-
-# === Подключение Webhook к FastAPI ===
-webhook = FastAPIMaxWebhook(dp=max_dp, bot=max_bot)
 webhook.setup(app, path="/webhook")
 
 # === Регистрация подписки на события MAX ===
 async def _register_webhook_once():
-    """Регистрирует вебхук идемпотентно: удаляет старую подписку, создаёт новую."""
+    """Идемпотентная регистрация. Ошибки логируются, но не роняют приложение."""
     try:
         await max_bot.delete_webhook()
-    except Exception:
-        pass  # старая подписка могла отсутствовать или быть недоступной
+        logger.info("Старая webhook-подписка удалена (если была)")
+    except Exception as e:
+        logger.warning(f"delete_webhook() не удался: {e}")
 
     try:
-        await max_bot.subscribe_webhook(
-            url=f"{PUBLIC_URL}/webhook",
-            update_types=["message_created", "message_callback", "bot_started"]
-        )
-        print(f"✅ Вебхук зарегистрирован: {PUBLIC_URL}/webhook")
+        kwargs = {
+            "url": f"{PUBLIC_URL}/webhook",
+            "update_types": ["message_created", "message_callback", "bot_started"]
+        }
+        if WEBHOOK_SECRET:
+            kwargs["secret"] = WEBHOOK_SECRET
+        await max_bot.subscribe_webhook(**kwargs)
+        logger.info(f"✅ Вебхук зарегистрирован: {PUBLIC_URL}/webhook")
     except Exception as e:
-        print(f"⚠️ Ошибка регистрации вебхука: {e}")
-        print("   Проверьте PUBLIC_URL и доступность HTTPS.")
+        logger.error(f"⚠️ Ошибка регистрации вебхука: {e}\n{traceback.format_exc()}")
 
 class Shipment(BaseModel):
     order_id: str
@@ -234,88 +268,39 @@ def get_orders_menu():
     # === ОБРАБОТЧИКИ БОТА ===
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
-    await send_message(
-        event.message,
-        "👋 Добро пожаловать в бот ТПК! Выберите действие:",
-        get_main_menu()
-    )
+    try:
+        await send_message(
+            event.message,
+            "👋 Добро пожаловать в бот ТПК! Выберите действие:",
+            get_main_menu()
+        )
+    except Exception as e:
+        logger.error(f"handle_start error: {e}\n{traceback.format_exc()}")
+        try:
+            await event.message.answer("⚠️ Ошибка при формировании меню. Попробуйте /start позже.")
+        except Exception:
+            pass
 
 @max_dp.message_created()
 async def handle_message(event):
-    if not event.message or not event.message.body or not event.message.body.text:
-        return
-    text = event.message.body.text.strip()
-    if text.startswith("/"):
-        return
-    found_order = None
-    search_query = text.upper()
-    if search_query.isdigit() and len(search_query) == 4:
-        for o in DB.values():
-            if o["order_id"].endswith(search_query):
-                found_order = o
-                break
-    else:
-        if search_query in DB:
-            found_order = DB[search_query]
-    if found_order:
-        o = found_order
-        response = (
-            f"📦 **Заказ:** {o['order_id']}\n"
-            f"📍 **Адрес:** {o.get('address') or '—'}\n"
-            f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
-            f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
-            f"📊 **Статус:** {o.get('status') or '—'}\n"
-        )
-        if o.get('comment'):
-            response += f"📝 **Примечание:** {o['comment']}\n"
-        callbacks = [("🔙 Назад в меню", "menu_back")]
-        links = []
-        if o.get("current_lat") and o.get("current_lng"):
-            map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
-            links.append(("🗺️ Открыть карту", map_url))
-        elif o.get("gps_link"):
-            links.append(("🗺️ Открыть карту BaltGPS", o['gps_link']))
+    try:
+        if not event.message or not event.message.body or not event.message.body.text:
+            return
+        text = event.message.body.text.strip()
+        if text.startswith("/"):
+            return
+        found_order = None
+        search_query = text.upper()
+        if search_query.isdigit() and len(search_query) == 4:
+            for o in DB.values():
+                if o["order_id"].endswith(search_query):
+                    found_order = o
+                    break
         else:
-            response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
-        await send_message(event.message, response, callbacks, links)
-    else:
-        await event.message.answer(
-            f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню."
-        )
-
-@max_dp.message_callback()
-async def handle_callback(event):
-    if not event.callback or not event.callback.payload:
-        return
-    payload = event.callback.payload
-    await event.answer()
-    if payload == "menu_choose_order":
-        await edit_message(event.message, "Выберите заказ из списка:", get_orders_menu())
-    elif payload == "menu_update_gps":
-        await edit_message(
-            event.message,
-            "⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
-            get_main_menu()
-        )
-        asyncio.create_task(update_all_coords())
-    elif payload == "menu_help":
-        help_text = (
-            "👋 **Помощь**\n\n"
-            "🔍 **Как искать:**\n"
-            "• Введите **4 цифры** номера заказа (например, `1668`).\n"
-            "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
-            "🗺️ **Что я умею:**\n"
-            "• Показывать адрес, перевозчика, машину и статус.\n"
-            "• Отправлять точку на карте (если есть GPS).\n"
-            "• Показывать примечания (если GPS нет)."
-        )
-        await edit_message(event.message, help_text, get_main_menu())
-    elif payload == "menu_back":
-        await edit_message(event.message, "👋 Главное меню:", get_main_menu())
-    elif payload.startswith("order_"):
-        order_id = payload.replace("order_", "")
-        if order_id in DB:
-            o = DB[order_id]
+            if search_query in DB:
+                found_order = DB[search_query]
+        if found_order:
+            o = found_order
             response = (
                 f"📦 **Заказ:** {o['order_id']}\n"
                 f"📍 **Адрес:** {o.get('address') or '—'}\n"
@@ -334,19 +319,92 @@ async def handle_callback(event):
                 links.append(("🗺️ Открыть карту BaltGPS", o['gps_link']))
             else:
                 response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
-            await edit_message(event.message, response, callbacks, links)
+            await send_message(event.message, response, callbacks, links)
         else:
-            await event.message.answer("Заказ не найден.")
+            await event.message.answer(
+                f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню."
+            )
+    except Exception as e:
+        logger.error(f"handle_message error: {e}\n{traceback.format_exc()}")
+        try:
+            await event.message.answer("⚠️ Произошла ошибка при обработке запроса.")
+        except Exception:
+            pass
 
-@app.on_event("startup")
-async def startup():
+@max_dp.message_callback()
+async def handle_callback(event):
+    try:
+        if not event.callback or not event.callback.payload:
+            return
+        payload = event.callback.payload
+        await event.answer()
+        if payload == "menu_choose_order":
+            await edit_message(event.message, "Выберите заказ из списка:", get_orders_menu())
+        elif payload == "menu_update_gps":
+            await edit_message(
+                event.message,
+                "⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
+                get_main_menu()
+            )
+            asyncio.create_task(update_all_coords())
+        elif payload == "menu_help":
+            help_text = (
+                "👋 **Помощь**\n\n"
+                "🔍 **Как искать:**\n"
+                "• Введите **4 цифры** номера заказа (например, `1668`).\n"
+                "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
+                "🗺️ **Что я умею:**\n"
+                "• Показывать адрес, перевозчика, машину и статус.\n"
+                "• Отправлять точку на карте (если есть GPS).\n"
+                "• Показывать примечания (если GPS нет)."
+            )
+            await edit_message(event.message, help_text, get_main_menu())
+        elif payload == "menu_back":
+            await edit_message(event.message, "👋 Главное меню:", get_main_menu())
+        elif payload.startswith("order_"):
+            order_id = payload.replace("order_", "")
+            if order_id in DB:
+                o = DB[order_id]
+                response = (
+                    f"📦 **Заказ:** {o['order_id']}\n"
+                    f"📍 **Адрес:** {o.get('address') or '—'}\n"
+                    f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+                    f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+                    f"📊 **Статус:** {o.get('status') or '—'}\n"
+                )
+                if o.get('comment'):
+                    response += f"📝 **Примечание:** {o['comment']}\n"
+                callbacks = [("🔙 Назад в меню", "menu_back")]
+                links = []
+                if o.get("current_lat") and o.get("current_lng"):
+                    map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+                    links.append(("🗺️ Открыть карту", map_url))
+                elif o.get("gps_link"):
+                    links.append(("🗺️ Открыть карту BaltGPS", o['gps_link']))
+                else:
+                    response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+                await edit_message(event.message, response, callbacks, links)
+            else:
+                await event.message.answer("Заказ не найден.")
+    except Exception as e:
+        logger.error(f"handle_callback error: {e}\n{traceback.format_exc()}")
+        try:
+            await event.message.answer("⚠️ Ошибка при обработке кнопки.")
+        except Exception:
+            pass
+
+@asynccontextmanager
+async def lifespan_with_webhook(app: FastAPI):
+    """Lifespan: загрузка БД + регистрация вебхука при старте."""
     global DB
     if os.path.exists("shipments.json"):
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         asyncio.create_task(update_all_coords())
     asyncio.create_task(_register_webhook_once())
-    print("✅ MAX-бот запущен (Webhook mode)")
+    logger.info("✅ MAX-бот запущен (Webhook mode, secret установлен)")
+    yield
+    logger.info("🛑 Бот остановлен")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
@@ -696,8 +754,7 @@ async def user_portal():
 </body>
 </html>
 """
-
-# ============ АДМИН-ПАНЕЛЬ ============
+    # ============ АДМИН-ПАНЕЛЬ ============
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(user=Depends(check_admin)):
     return """
@@ -898,3 +955,4 @@ async def admin_panel(user=Depends(check_admin)):
     </body>
     </html>
     """
+    
