@@ -4,7 +4,6 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
-from contextlib import asynccontextmanager
 import os, json, requests, asyncio, io
 import traceback
 import logging
@@ -115,31 +114,14 @@ if not WEBHOOK_SECRET:
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
 
-# === Инициализация FastAPI + Webhook (lifespan) ===
-# Согласно документации maxapi, используем lifespan=webhook.lifespan [citation:8]
+# === Webhook (создаём ДО app, чтобы взять его lifespan) ===
 webhook = FastAPIMaxWebhook(
     dp=max_dp,
     bot=max_bot,
     secret=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
 )
 
-# Сначала создаём app с lifespan вебхука, затем setup
-# (lifespan-функция должна быть передана в конструктор FastAPI до setup)
-# Поэтому порядок: webhook.setup(app) вызывается ПОСЛЕ создания app.
-# Но webhook.lifespan нужен ДО создания app. Решение: создаём app после webhook.
-# Однако webhook требует app для setup. Поэтому используем промежуточный app.
-# Проще: создаём app, затем передаём webhook.lifespan вручную нельзя.
-# Официальный пример maxapi: app = FastAPI(lifespan=webhook.lifespan) [citation:8]
-# Значит, webhook должен быть создан ДО app.
-# Переупорядочим: создаём webhook, затем app, затем setup.
-
-# Пересоздаём webhook для ясности (можно было сразу)
-webhook = FastAPIMaxWebhook(
-    dp=max_dp,
-    bot=max_bot,
-    secret=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
-)
-
+# === FastAPI: lifespan берём у вебхука (официальный способ) ===
 app = FastAPI(title="ТПК Отслеживание", lifespan=webhook.lifespan)
 security = HTTPBasic()
 app.mount("/static", StaticFiles(directory="static"), name="static")
@@ -393,9 +375,8 @@ async def handle_callback(event):
         except Exception:
             pass
 
-@asynccontextmanager
-async def lifespan_with_webhook(app: FastAPI):
-    """Lifespan: загрузка БД + регистрация вебхука при старте."""
+@app.on_event("startup")
+async def startup():
     global DB
     if os.path.exists("shipments.json"):
         with open("shipments.json", "r", encoding="utf-8") as f:
@@ -403,8 +384,6 @@ async def lifespan_with_webhook(app: FastAPI):
         asyncio.create_task(update_all_coords())
     asyncio.create_task(_register_webhook_once())
     logger.info("✅ MAX-бот запущен (Webhook mode, secret установлен)")
-    yield
-    logger.info("🛑 Бот остановлен")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
@@ -601,7 +580,6 @@ async def user_portal():
 <body>
     <div class="header"><h1>📍 ТПК — Отслеживание</h1><button class="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button></div>
 
-    <!-- Блок с ботом MAX и QR-кодом -->
     <div style="max-width: 1100px; margin: 0 auto 32px; background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.5); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 30px; color: white;">
         <div style="flex: 1; min-width: 280px;">
             <h2 style="margin-bottom: 12px; font-size: 24px; font-weight: 700; display: flex; align-items: center; gap: 10px;">
@@ -955,4 +933,3 @@ async def admin_panel(user=Depends(check_admin)):
     </body>
     </html>
     """
-    
