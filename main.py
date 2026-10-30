@@ -4,19 +4,12 @@ from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
-from contextlib import asynccontextmanager
 import os, json, requests, asyncio, io
-import traceback
-import logging
-import secrets
 import pandas as pd
 import openpyxl
 
-logging.basicConfig(level=logging.INFO, force=True)
-logger = logging.getLogger("max_bot")
-
 # ============================================================
-# АДАПТЕР MAXAPI
+# УНИВЕРСАЛЬНЫЙ АДАПТЕР ДЛЯ MAXAPI
 # ============================================================
 MAXAPI_VARIANT = None
 Bot = Dispatcher = None
@@ -32,53 +25,65 @@ try:
     from maxapi.types.attachments.buttons import CallbackButton, LinkButton
     USE_ATTACHMENTS = True
     MAXAPI_VARIANT = "love-apples"
-    logger.info("✅ love-apples/maxapi")
+    print("✅ Используется библиотека: love-apples/maxapi")
 except ImportError:
-    from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
-    USE_ATTACHMENTS = False
-    MAXAPI_VARIANT = "sdk"
-    logger.info("✅ maxapi-sdk")
-
-from maxapi.webhook.fastapi import FastAPIMaxWebhook
+    try:
+        from maxapi import Bot, Dispatcher, Command, InlineKeyboardBuilder
+        USE_ATTACHMENTS = False
+        MAXAPI_VARIANT = "sdk"
+        print("✅ Используется библиотека: maxapi-sdk")
+    except ImportError:
+        raise ImportError("Не найдена ни одна библиотека MAX. Установите 'maxapi' в requirements.txt")
 
 def make_keyboard(callbacks: list, links: list = None):
-    builder = InlineKeyboardBuilder()
-    for text, payload in callbacks:
-        builder.row(CallbackButton(text=text, payload=payload))
-    for text, url in (links or []):
-        builder.row(LinkButton(text=text, url=url))
-    return builder.as_markup()
+    if MAXAPI_VARIANT == "love-apples":
+        builder = InlineKeyboardBuilder()
+        for text, payload in callbacks:
+            builder.row(CallbackButton(text=text, payload=payload))
+        if links:
+            for text, url in links:
+                builder.row(LinkButton(text=text, url=url))
+        return builder.as_markup()
+    else:
+        builder = InlineKeyboardBuilder()
+        for text, payload in callbacks:
+            builder.callback(text, payload)
+        if links:
+            for text, url in links:
+                builder.link(text, url)
+        return builder
 
 async def send_message(message, text: str, callbacks: list = None, links: list = None):
     if callbacks or links:
-        try:
-            kb = make_keyboard(callbacks or [], links)
-            if USE_ATTACHMENTS:
-                return await message.answer(text=text, attachments=[kb])
-            return await message.answer(text=text, keyboard=kb)
-        except Exception:
-            logger.error("send with keyboard failed:\n%s", traceback.format_exc())
+        kb = make_keyboard(callbacks or [], links)
+        if USE_ATTACHMENTS:
+            return await message.answer(text=text, attachments=[kb])
+        return await message.answer(text=text, keyboard=kb)
     return await message.answer(text=text)
 
 async def edit_message(message, text: str, callbacks: list = None, links: list = None):
     if callbacks or links:
-        try:
-            kb = make_keyboard(callbacks or [], links)
-            if USE_ATTACHMENTS:
-                return await message.edit(text=text, attachments=[kb])
-            return await message.edit(text=text, keyboard=kb)
-        except Exception:
-            logger.error("edit with keyboard failed:\n%s", traceback.format_exc())
+        kb = make_keyboard(callbacks or [], links)
+        if USE_ATTACHMENTS:
+            return await message.edit(text=text, attachments=[kb])
+        return await message.edit(text=text, keyboard=kb)
     return await message.edit(text=text)
 
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
+app = FastAPI(title="ТПК Отслеживание")
+security = HTTPBasic()
+
+# Раздаём статику (qr.png лежит в папке static/)
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
 SETTINGS_FILE = "settings.json"
 DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": False, "show_with_gps": False}
+
 if os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
         SETTINGS = json.load(f)
@@ -93,66 +98,13 @@ def save_settings():
 
 DB = {}
 
+# === НАСТРОЙКА БОТА MAX ===
 MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN")
 if not MAX_BOT_TOKEN:
-    raise ValueError("MAX_BOT_TOKEN не задан")
-
-PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
-if not PUBLIC_URL:
-    raise ValueError("PUBLIC_URL не задан")
-
-WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "").strip()
-if WEBHOOK_SECRET and not (5 <= len(WEBHOOK_SECRET) <= 256 and all(c.isalnum() or c in "_-" for c in WEBHOOK_SECRET)):
-    raise ValueError("WEBHOOK_SECRET: 5-256 символов, только A-Za-z0-9_-")
-if not WEBHOOK_SECRET:
-    logger.warning("⚠️ WEBHOOK_SECRET не задан")
+    raise ValueError("❌ Переменная окружения MAX_BOT_TOKEN не задана! Добавьте её в Layero → Переменные окружения.")
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
-
-webhook = FastAPIMaxWebhook(
-    dp=max_dp,
-    bot=max_bot,
-    secret=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
-)
-
-# ============================================================
-# LIFESPAN
-# ============================================================
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global DB
-    if os.path.exists("shipments.json"):
-        with open("shipments.json", "r", encoding="utf-8") as f:
-            DB = json.load(f)
-        logger.info("DB loaded: %d orders", len(DB))
-    async with webhook.lifespan(app):
-        asyncio.create_task(_register_webhook_once())
-        asyncio.create_task(update_all_coords())
-        logger.info("✅ MAX-бот запущен (Webhook mode)")
-        yield
-    logger.info("🛑 Бот остановлен")
-
-app = FastAPI(title="ТПК Отслеживание", lifespan=lifespan)
-security = HTTPBasic()
-os.makedirs("static", exist_ok=True)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-webhook.setup(app, path="/webhook")
-
-async def _register_webhook_once():
-    try:
-        await max_bot.delete_webhook()
-        logger.info("Старая подписка удалена")
-    except Exception as e:
-        logger.warning("delete_webhook: %s", e)
-    try:
-        kwargs = {"url": f"{PUBLIC_URL}/webhook", "update_types": ["message_created", "message_callback", "bot_started"]}
-        if WEBHOOK_SECRET:
-            kwargs["secret"] = WEBHOOK_SECRET
-        await max_bot.subscribe_webhook(**kwargs)
-        logger.info("✅ Вебхук зарегистрирован: %s/webhook", PUBLIC_URL)
-    except Exception as e:
-        logger.error("⚠️ Ошибка регистрации вебхука: %s\n%s", e, traceback.format_exc())
 
 class Shipment(BaseModel):
     order_id: str
@@ -172,9 +124,7 @@ def save_db():
     with open("shipments.json", "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
 
-# ============================================================
-# GPS
-# ============================================================
+# === GPS ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None, "no_link"
@@ -184,14 +134,11 @@ def get_coords_from_baltgps(gps_link: str):
             "svc": "token/login", "params": json.dumps({"token": token})
         }, timeout=(3.0, 5.0))
         data = r.json()
-        if "error" in data:
-            return None, None, "invalid_token"
-        if "token" not in data:
-            return None, None, "invalid_token"
+        if "error" in data: return None, None, "invalid_token"
+        if "token" not in data: return None, None, "invalid_token"
         unit_info = json.loads(data["token"])
         items = unit_info.get("items", [])
-        if not items:
-            return None, None, "no_units"
+        if not items: return None, None, "no_units"
         unit_id = items[0]
         sid = data.get("eid")
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
@@ -217,7 +164,7 @@ def get_coords_from_baltgps(gps_link: str):
         return None, None, "error"
 
 async def fetch_single_order_coords(order_id, o):
-    loop = asyncio.get_running_loop()
+    loop = asyncio.get_event_loop()
     lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
     if lat and lng:
         o["current_lat"] = lat
@@ -233,151 +180,160 @@ async def update_all_coords():
         if o.get("has_valid_gps") is False:
             o["current_lat"] = None
             o["current_lng"] = None
-    tasks = [fetch_single_order_coords(oid, o) for oid, o in DB.items() if o.get("gps_link")]
+    tasks = []
+    for order_id, o in DB.items():
+        if o.get("gps_link"):
+            tasks.append(fetch_single_order_coords(order_id, o))
     semaphore = asyncio.Semaphore(10)
-    async def limited(t):
-        async with semaphore:
-            await t
-    await asyncio.gather(*(limited(t) for t in tasks))
+    async def limited_task(task):
+        async with semaphore: await task
+    await asyncio.gather(*(limited_task(t) for t in tasks))
     save_db()
 
-# ============================================================
-# МЕНЮ
-# ============================================================
+# === МЕНЮ ===
 def get_main_menu():
     return [
         ("📋 Выбрать заказ", "menu_choose_order"),
         ("🔄 Обновить GPS", "menu_update_gps"),
-        ("❓ Помощь", "menu_help")
+        ("❓ Помощь", "menu_help"),
     ]
 
 def get_orders_menu():
-    active = [o for o in DB.values() if o.get("status") == "в пути"][:10]
-    items = [(f"{'🟢' if o.get('has_valid_gps') else '🔴'} {o['order_id']}", f"order_{o['order_id']}") for o in active]
+    active_orders = [o for o in DB.values() if o.get("status") == "в пути"][:10]
+    items = []
+    for o in active_orders:
+        gps_mark = "🟢" if o.get("has_valid_gps") else "🔴"
+        items.append((f"{gps_mark} {o['order_id']}", f"order_{o['order_id']}"))
     items.append(("🔙 Назад в меню", "menu_back"))
     return items
 
-# ============================================================
-# ОБРАБОТЧИКИ БОТА
-# ============================================================
-@max_dp.bot_started()
-async def handle_bot_started(event):
-    try:
-        await event.bot.send_message(
-            chat_id=event.chat_id,
-            text="👋 Добро пожаловать в бот ТПК! Отправьте номер заказа или выберите действие.",
-        )
-    except Exception:
-        logger.error("bot_started error:\n%s", traceback.format_exc())
-
+# === ОБРАБОТЧИКИ БОТА ===
 @max_dp.message_created(Command("start"))
 async def handle_start(event):
-    try:
-        await send_message(event.message, "👋 Добро пожаловать в бот ТПК! Выберите действие:", get_main_menu())
-    except Exception:
-        logger.error("handle_start error:\n%s", traceback.format_exc())
-        try:
-            await event.message.answer("⚠️ Ошибка меню. Отправьте номер заказа.")
-        except Exception:
-            logger.error("fallback answer failed:\n%s", traceback.format_exc())
+    await send_message(
+        event.message,
+        "👋 Добро пожаловать в бот ТПК! Выберите действие:",
+        get_main_menu()
+    )
 
 @max_dp.message_created()
 async def handle_message(event):
-    try:
-        if not event.message or not event.message.body or not event.message.body.text:
-            return
-        text = event.message.body.text.strip()
-        if text.startswith("/"):
-            return
-        found = None
-        q = text.upper()
-        if q.isdigit() and len(q) == 4:
-            for o in DB.values():
-                if o["order_id"].endswith(q):
-                    found = o
-                    break
-        elif q in DB:
-            found = DB[q]
-        if found:
-            o = found
-            resp = f"📦 Заказ: {o['order_id']}\n📍 Адрес: {o.get('address') or '—'}\n🚚 Перевозчик: {o.get('carrier') or '—'}\n🚛 Машина: {o.get('vehicle') or '—'}\n📊 Статус: {o.get('status') or '—'}\n"
-            if o.get('comment'):
-                resp += f"📝 Примечание: {o['comment']}\n"
-            callbacks = [("🔙 Назад в меню", "menu_back")]
-            links = []
-            if o.get("current_lat") and o.get("current_lng"):
-                links.append(("🗺️ Открыть карту", f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"))
-            elif o.get("gps_link"):
-                links.append(("🗺️ Открыть карту BaltGPS", o['gps_link']))
-            else:
-                resp += "\n🗺️ GPS недоступен. Попробуйте Обновить GPS."
-            await send_message(event.message, resp, callbacks, links)
+    if not event.message or not event.message.body or not event.message.body.text:
+        return
+    text = event.message.body.text.strip()
+    if text.startswith("/"):
+        return
+    found_order = None
+    search_query = text.upper()
+    if search_query.isdigit() and len(search_query) == 4:
+        for o in DB.values():
+            if o["order_id"].endswith(search_query):
+                found_order = o
+                break
+    else:
+        if search_query in DB:
+            found_order = DB[search_query]
+    if found_order:
+        o = found_order
+        response = (
+            f"📦 **Заказ:** {o['order_id']}\n"
+            f"📍 **Адрес:** {o.get('address') or '—'}\n"
+            f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+            f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+            f"📊 **Статус:** {o.get('status') or '—'}\n"
+        )
+        if o.get('comment'):
+            response += f"📝 **Примечание:** {o['comment']}\n"
+        callbacks = [("🔙 Назад в меню", "menu_back")]
+        links = []
+        if o.get("current_lat") and o.get("current_lng"):
+            map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+            links.append(("🗺️ Открыть карту", map_url))
+        elif o.get("gps_link"):
+            links.append(("🗺️ Открыть карту BaltGPS", o['gps_link']))
         else:
-            await event.message.answer(f"❌ Заказ «{text}» не найден.")
-    except Exception:
-        logger.error("handle_message error:\n%s", traceback.format_exc())
-        try:
-            await event.message.answer("⚠️ Ошибка обработки.")
-        except Exception:
-            pass
+            response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+        await send_message(event.message, response, callbacks, links)
+    else:
+        await event.message.answer(
+            f"❌ Заказ по запросу «{text}» не найден. Проверьте номер или выберите действие из меню."
+        )
 
 @max_dp.message_callback()
 async def handle_callback(event):
-    try:
-        if not event.callback or not event.callback.payload:
-            return
-        payload = event.callback.payload
-    except Exception:
-        logger.error("callback parse error:\n%s", traceback.format_exc())
+    if not event.callback or not event.callback.payload:
         return
-    try:
-        await event.answer()
-    except Exception:
-        logger.error("event.answer failed:\n%s", traceback.format_exc())
-    try:
-        if payload == "menu_choose_order":
-            await edit_message(event.message, "Выберите заказ:", get_orders_menu())
-        elif payload == "menu_update_gps":
-            await edit_message(event.message, "⏳ Обновление GPS...", get_main_menu())
-            asyncio.create_task(update_all_coords())
-        elif payload == "menu_help":
-            help_text = "👋 Помощь\n\n🔍 Введите 4 цифры номера заказа.\n🗺️ Бот покажет статус и карту (если есть GPS)."
-            await edit_message(event.message, help_text, get_main_menu())
-        elif payload == "menu_back":
-            await edit_message(event.message, "👋 Главное меню:", get_main_menu())
-        elif payload.startswith("order_"):
-            oid = payload.replace("order_", "")
-            if oid in DB:
-                o = DB[oid]
-                resp = f"📦 Заказ: {o['order_id']}\n📍 Адрес: {o.get('address') or '—'}\n🚚 Перевозчик: {o.get('carrier') or '—'}\n🚛 Машина: {o.get('vehicle') or '—'}\n📊 Статус: {o.get('status') or '—'}\n"
-                if o.get('comment'):
-                    resp += f"📝 Примечание: {o['comment']}\n"
-                callbacks = [("🔙 Назад в меню", "menu_back")]
-                links = []
-                if o.get("current_lat") and o.get("current_lng"):
-                    links.append(("🗺️ Открыть карту", f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"))
-                elif o.get("gps_link"):
-                    links.append(("🗺️ Открыть карту BaltGPS", o['gps_link']))
-                else:
-                    resp += "\n🗺️ GPS недоступен."
-                await edit_message(event.message, resp, callbacks, links)
+    payload = event.callback.payload
+    await event.answer()
+    if payload == "menu_choose_order":
+        await edit_message(event.message, "Выберите заказ из списка:", get_orders_menu())
+    elif payload == "menu_update_gps":
+        await edit_message(
+            event.message,
+            "⏳ Запускаю обновление GPS в фоне. Это может занять минуту...",
+            get_main_menu()
+        )
+        asyncio.create_task(update_all_coords())
+    elif payload == "menu_help":
+        help_text = (
+            "👋 **Помощь**\n\n"
+            "🔍 **Как искать:**\n"
+            "• Введите **4 цифры** номера заказа (например, `1668`).\n"
+            "• Или нажмите **📋 Выбрать заказ**, чтобы увидеть список.\n\n"
+            "🗺️ **Что я умею:**\n"
+            "• Показывать адрес, перевозчика, машину и статус.\n"
+            "• Отправлять точку на карте (если есть GPS).\n"
+            "• Показывать примечания (если GPS нет)."
+        )
+        await edit_message(event.message, help_text, get_main_menu())
+    elif payload == "menu_back":
+        await edit_message(event.message, "👋 Главное меню:", get_main_menu())
+    elif payload.startswith("order_"):
+        order_id = payload.replace("order_", "")
+        if order_id in DB:
+            o = DB[order_id]
+            response = (
+                f"📦 **Заказ:** {o['order_id']}\n"
+                f"📍 **Адрес:** {o.get('address') or '—'}\n"
+                f"🚚 **Перевозчик:** {o.get('carrier') or '—'}\n"
+                f"🚛 **Машина:** {o.get('vehicle') or '—'}\n"
+                f"📊 **Статус:** {o.get('status') or '—'}\n"
+            )
+            if o.get('comment'):
+                response += f"📝 **Примечание:** {o['comment']}\n"
+            callbacks = [("🔙 Назад в меню", "menu_back")]
+            links = []
+            if o.get("current_lat") and o.get("current_lng"):
+                map_url = f"https://yandex.ru/maps/?pt={o['current_lng']},{o['current_lat']}&z=12"
+                links.append(("🗺️ Открыть карту", map_url))
+            elif o.get("gps_link"):
+                links.append(("🗺️ Открыть карту BaltGPS", o['gps_link']))
             else:
-                await event.message.answer("Заказ не найден.")
-    except Exception:
-        logger.error("handle_callback error:\n%s", traceback.format_exc())
-        try:
-            await event.message.answer("⚠️ Ошибка кнопки.")
-        except Exception:
-            pass
+                response += "\n🗺️ GPS недоступен. Попробуйте **🔄 Обновить GPS**."
+            await edit_message(event.message, response, callbacks, links)
+        else:
+            await event.message.answer("Заказ не найден.")
+
+async def run_max_bot():
+    await max_bot.delete_webhook()
+    await max_dp.start_polling(max_bot)
+
+@app.on_event("startup")
+async def startup():
+    global DB
+    if os.path.exists("shipments.json"):
+        with open("shipments.json", "r", encoding="utf-8") as f:
+            DB = json.load(f)
+        asyncio.create_task(update_all_coords())
+    asyncio.create_task(run_max_bot())
+    print("✅ MAX-бот запущен")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
-    if not (secrets.compare_digest(credentials.username, ADMIN_USER) and secrets.compare_digest(credentials.password, ADMIN_PASS)):
+    if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
 
-# ============================================================
-# API ДЛЯ САЙТА
-# ============================================================
+# === API ДЛЯ САЙТА ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
@@ -396,51 +352,44 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
     result = []
     for o in DB.values():
         s = str(o.get("status", "")).lower()
-        if status == "in_transit" and s not in ['в пути', 'планируется']:
-            continue
-        if status == "delivered" and s not in ['завершено', 'выгружено']:
-            continue
-        if status == "with_gps" and not o.get("current_lat"):
-            continue
+        if status == "in_transit" and s not in ['в пути', 'планируется']: continue
+        if status == "delivered" and s not in ['завершено', 'выгружено']: continue
+        if status == "with_gps":
+            if not o.get("current_lat"): continue
         if search:
             q = search.lower()
             if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower():
                 continue
         result.append(o)
-    def key(x):
-        valid = 1 if x.get("current_lat") else 0
-        oid = str(x.get("order_id") or "")
+    def sort_key(x):
+        is_valid = 1 if x.get("current_lat") else 0
+        order_id = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
-        if sort_by == "gps":
-            return (not valid, oid)
-        if sort_by == "order_id":
-            return oid
-        if sort_by == "city":
-            return (city == "", city, oid)
-        return (not valid, oid)
-    result.sort(key=key)
+        if sort_by == "gps": return (not is_valid, order_id)
+        elif sort_by == "order_id": return order_id
+        elif sort_by == "city": return (city == "", city, order_id)
+        return (not is_valid, order_id)
+    result.sort(key=sort_key)
     return result
 
 @app.get("/api/coords/{order_id}")
 async def get_online_coords(order_id: str):
-    if order_id not in DB:
-        raise HTTPException(404, "Заказ не найден")
+    if order_id not in DB: raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
     if o.get("gps_link"):
-        loop = asyncio.get_running_loop()
-        lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
+        lat, lng, status = get_coords_from_baltgps(o["gps_link"])
         if lat and lng:
             o["current_lat"] = lat
             o["current_lng"] = lng
             o["has_valid_gps"] = True
             save_db()
             return {"lat": lat, "lng": lng}
-        if status == "invalid_token":
-            raise HTTPException(400, "Ссылка устарела")
-        if status == "error":
-            raise HTTPException(503, "Спутник не отвечает")
-    if o.get("current_lat"):
-        return {"lat": o["current_lat"], "lng": o["current_lng"]}
+        else:
+            if status == "invalid_token":
+                raise HTTPException(400, "Ссылка на GPS устарела")
+            elif status == "error":
+                raise HTTPException(503, "Спутник не отвечает")
+    if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
     raise HTTPException(404, "GPS недоступен")
 
 @app.get("/api/admin/shipments")
@@ -467,63 +416,59 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
     global DB
     try:
         contents = await file.read()
-        loop = asyncio.get_running_loop()
-        def parse():
-            wb = openpyxl.load_workbook(io.BytesIO(contents))
-            if "Исх.логистика" not in wb.sheetnames:
-                raise ValueError("Нет листа 'Исх.логистика'")
-            ws = wb["Исх.логистика"]
-            for i in range(1, ws.max_row + 1):
-                if ws.row_dimensions[i].hidden:
-                    ws.row_dimensions[i].hidden = False
-            out = io.BytesIO()
-            wb.save(out)
-            out.seek(0)
-            df = pd.read_excel(out, sheet_name="Исх.логистика", dtype=str)
-            new_db = {}
-            skipped = 0
-            for _, row in df.iterrows():
-                raw = row.get('Заказ')
-                if pd.isna(raw) or str(raw).strip() == '' or str(raw).strip().lower() == 'nan':
-                    skipped += 1
-                    continue
-                oid = str(raw).strip()
-                def fd(v):
-                    if pd.isna(v) or str(v).strip() == '':
-                        return None
-                    try:
-                        return pd.to_datetime(v).strftime('%Y-%m-%d')
-                    except:
-                        return str(v)[:10]
-                def sf(v):
-                    if pd.isna(v) or str(v).strip() == '':
-                        return None
-                    try:
-                        return float(str(v).replace(',', '.').strip())
-                    except:
-                        return None
-                gps = str(row.get('ссылка')).strip() if not pd.isna(row.get('ссылка')) else None
-                new_db[oid] = {
-                    "order_id": oid,
-                    "address": str(row.get('Адрес доставки')).strip() if not pd.isna(row.get('Адрес доставки')) else None,
-                    "weight": sf(row.get('вес')),
-                    "plan_arrival": fd(row.get('Дата прибытия')),
-                    "carrier": str(row.get('Перевозчик')).strip() if not pd.isna(row.get('Перевозчик')) else None,
-                    "vehicle": str(row.get('Машина')).strip() if not pd.isna(row.get('Машина')) else None,
-                    "driver": str(row.get('Водитель')).strip() if not pd.isna(row.get('Водитель')) else None,
-                    "gps_link": gps,
-                    "comment": str(row.get('Примечания')).strip() if not pd.isna(row.get('Примечания')) else None,
-                    "status": str(row.get('статус доставки')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
-                    "has_valid_gps": None
-                }
-            return new_db, skipped
-        DB, skipped = await loop.run_in_executor(None, parse)
+        wb = openpyxl.load_workbook(io.BytesIO(contents))
+        if "Исх.логистика" not in wb.sheetnames:
+            raise HTTPException(400, "В файле нет листа 'Исх.логистика'")
+        ws = wb["Исх.логистика"]
+        for row_idx in range(1, ws.max_row + 1):
+            if ws.row_dimensions[row_idx].hidden:
+                ws.row_dimensions[row_idx].hidden = False
+        output = io.BytesIO()
+        wb.save(output)
+        output.seek(0)
+        df = pd.read_excel(output, sheet_name="Исх.логистика", dtype=str)
+        new_db = {}
+        skipped = 0
+        last_orders = []
+        for _, row in df.iterrows():
+            raw_order = row.get('Заказ')
+            if pd.isna(raw_order) or str(raw_order).strip() == '' or str(raw_order).strip().lower() == 'nan':
+                skipped += 1
+                continue
+            order_id = str(raw_order).strip()
+            last_orders.append(order_id)
+            if len(last_orders) > 5: last_orders.pop(0)
+            def fmt_date(val):
+                if pd.isna(val) or str(val).strip() == '': return None
+                try: return pd.to_datetime(val).strftime('%Y-%m-%d')
+                except: return str(val)[:10]
+            def safe_float(val):
+                if pd.isna(val) or str(val).strip() == '': return None
+                try: return float(str(val).replace(',', '.').strip())
+                except: return None
+            gps = str(row.get('ссылка')).strip() if not pd.isna(row.get('ссылка')) else None
+            new_db[order_id] = {
+                "order_id": order_id,
+                "address": str(row.get('Адрес доставки')).strip() if not pd.isna(row.get('Адрес доставки')) else None,
+                "weight": safe_float(row.get('вес')),
+                "plan_arrival": fmt_date(row.get('Дата прибытия')),
+                "carrier": str(row.get('Перевозчик')).strip() if not pd.isna(row.get('Перевозчик')) else None,
+                "vehicle": str(row.get('Машина')).strip() if not pd.isna(row.get('Машина')) else None,
+                "driver": str(row.get('Водитель')).strip() if not pd.isna(row.get('Водитель')) else None,
+                "gps_link": gps,
+                "comment": str(row.get('Примечания')).strip() if not pd.isna(row.get('Примечания')) else None,
+                "status": str(row.get('статус доставки')).strip().lower() if not pd.isna(row.get('статус доставки')) else "",
+                "has_valid_gps": None
+            }
+        DB = new_db
         save_db()
         asyncio.create_task(update_all_coords())
-        return {"ok": True, "message": f"Загружено {len(DB)}. Пропущено: {skipped}"}
+        debug_msg = ", ".join(last_orders)
+        return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}. Последние: {debug_msg}"}
     except Exception as e:
-        raise HTTPException(500, f"Ошибка: {e}")
-        # ============ ГЛАВНАЯ СТРАНИЦА ============
+        raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
+
+# ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
     return """
@@ -580,6 +525,7 @@ async def user_portal():
 <body>
     <div class="header"><h1>📍 ТПК — Отслеживание</h1><button class="theme-toggle" onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button></div>
 
+    <!-- Блок с ботом MAX и QR-кодом -->
     <div style="max-width: 1100px; margin: 0 auto 32px; background: linear-gradient(135deg, #1e3a8a 0%, #3b82f6 100%); padding: 30px; border-radius: 16px; box-shadow: 0 10px 25px -5px rgba(59, 130, 246, 0.5); display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 30px; color: white;">
         <div style="flex: 1; min-width: 280px;">
             <h2 style="margin-bottom: 12px; font-size: 24px; font-weight: 700; display: flex; align-items: center; gap: 10px;">
