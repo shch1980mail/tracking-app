@@ -1,9 +1,10 @@
-from fastapi import FastAPI, HTTPException, Depends, UploadFile, File
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Request
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
+from contextlib import asynccontextmanager
 import os, json, requests, asyncio, io
 import pandas as pd
 import openpyxl
@@ -33,7 +34,10 @@ except ImportError:
         MAXAPI_VARIANT = "sdk"
         print("✅ Используется библиотека: maxapi-sdk")
     except ImportError:
-        raise ImportError("Не найдена ни одна библиотека MAX. Установите 'maxapi' в requirements.txt")
+        raise ImportError("Не найдена ни одна библиотека MAX. Установите 'maxapi[fastapi]' в requirements.txt")
+
+# Импорт для Webhook (FastAPI)
+from maxapi.webhook.fastapi import FastAPIMaxWebhook
 
 def make_keyboard(callbacks: list, links: list = None):
     if MAXAPI_VARIANT == "love-apples":
@@ -72,12 +76,6 @@ async def edit_message(message, text: str, callbacks: list = None, links: list =
 # ============================================================
 # НАСТРОЙКИ
 # ============================================================
-app = FastAPI(title="ТПК Отслеживание")
-security = HTTPBasic()
-
-# Раздаём статику (qr.png лежит в папке static/)
-app.mount("/static", StaticFiles(directory="static"), name="static")
-
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
@@ -103,8 +101,62 @@ MAX_BOT_TOKEN = os.environ.get("MAX_BOT_TOKEN")
 if not MAX_BOT_TOKEN:
     raise ValueError("❌ Переменная окружения MAX_BOT_TOKEN не задана! Добавьте её в Layero → Переменные окружения.")
 
+# Публичный домен для Webhook (обязательно HTTPS)
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
+if not PUBLIC_URL:
+    raise ValueError("❌ Переменная PUBLIC_URL не задана. Укажите публичный HTTPS-домен Layero (например, https://your-project.layero.app)")
+
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
+
+# === Создаём webhook ДО app ===
+webhook = FastAPIMaxWebhook(dp=max_dp, bot=max_bot)
+
+# === Объединённый lifespan: наша инициализация + lifespan вебхука ===
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # --- STARTUP ---
+    global DB
+    if os.path.exists("shipments.json"):
+        with open("shipments.json", "r", encoding="utf-8") as f:
+            DB = json.load(f)
+        asyncio.create_task(update_all_coords())
+    asyncio.create_task(_register_webhook_once())
+    print("✅ MAX-бот запущен (Webhook mode)")
+
+    # Передаём управление внутреннему lifespan вебхука (важно!)
+    async with webhook.lifespan(app):
+        yield
+    # --- SHUTDOWN ---
+    print("🛑 Приложение остановлено")
+
+# === Создаём app с объединённым lifespan ===
+app = FastAPI(title="ТПК Отслеживание", lifespan=lifespan)
+security = HTTPBasic()
+
+# Раздаём статику
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# === Подключение Webhook к FastAPI ===
+webhook.setup(app, path="/webhook")
+
+# === Регистрация подписки на события MAX ===
+async def _register_webhook_once():
+    """Регистрирует вебхук идемпотентно: удаляет старую подписку, создаёт новую."""
+    try:
+        await max_bot.delete_webhook()
+    except Exception:
+        pass  # старая подписка могла отсутствовать или быть недоступной
+
+    try:
+        await max_bot.subscribe_webhook(
+            url=f"{PUBLIC_URL}/webhook",
+            update_types=["message_created", "message_callback", "bot_started"]
+        )
+        print(f"✅ Вебхук зарегистрирован: {PUBLIC_URL}/webhook")
+    except Exception as e:
+        print(f"⚠️ Ошибка регистрации вебхука: {e}")
+        print("   Проверьте PUBLIC_URL и доступность HTTPS.")
 
 class Shipment(BaseModel):
     order_id: str
@@ -123,7 +175,6 @@ class Shipment(BaseModel):
 def save_db():
     with open("shipments.json", "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
-
 # === GPS ===
 def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
@@ -314,10 +365,6 @@ async def handle_callback(event):
         else:
             await event.message.answer("Заказ не найден.")
 
-async def run_max_bot():
-    await max_bot.delete_webhook()
-    await max_dp.start_polling(max_bot)
-
 @app.on_event("startup")
 async def startup():
     global DB
@@ -325,14 +372,13 @@ async def startup():
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
         asyncio.create_task(update_all_coords())
-    asyncio.create_task(run_max_bot())
-    print("✅ MAX-бот запущен")
+    asyncio.create_task(_register_webhook_once())
+    print("✅ MAX-бот запущен (Webhook mode)")
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if credentials.username != ADMIN_USER or credentials.password != ADMIN_PASS:
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
-
 # === API ДЛЯ САЙТА ===
 @app.get("/api/settings/tabs")
 async def get_tabs():
@@ -467,7 +513,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         return {"ok": True, "message": f"Загружено {len(DB)} заказов. Пропущено пустых: {skipped}. Последние: {debug_msg}"}
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
-
 # ============ ГЛАВНАЯ СТРАНИЦА ============
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
