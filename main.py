@@ -15,6 +15,9 @@ import openpyxl
 logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger("max_bot")
 
+# ============================================================
+# АДАПТЕР MAXAPI
+# ============================================================
 MAXAPI_VARIANT = None
 Bot = Dispatcher = None
 Command = None
@@ -55,7 +58,22 @@ async def send_message(message, text: str, callbacks: list = None, links: list =
             return await message.answer(text=text, keyboard=kb)
         except Exception:
             logger.error("send with keyboard failed:\n%s", traceback.format_exc())
-    return await message.answer(text=text)  # fallback без клавиатуры
+    return await message.answer(text=text)
+
+async def edit_message(message, text: str, callbacks: list = None, links: list = None):
+    if callbacks or links:
+        try:
+            kb = make_keyboard(callbacks or [], links)
+            if USE_ATTACHMENTS:
+                return await message.edit(text=text, attachments=[kb])
+            return await message.edit(text=text, keyboard=kb)
+        except Exception:
+            logger.error("edit with keyboard failed:\n%s", traceback.format_exc())
+    return await message.edit(text=text)
+
+# ============================================================
+# НАСТРОЙКИ
+# ============================================================
 ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
@@ -98,11 +116,12 @@ webhook = FastAPIMaxWebhook(
     secret=WEBHOOK_SECRET if WEBHOOK_SECRET else None,
 )
 
-# === Правильный lifespan: ВКЛАДЫВАЕМ webhook.lifespan ===
+# ============================================================
+# LIFESPAN (вкладываем webhook.lifespan)
+# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global DB
-    # startup
     if os.path.exists("shipments.json"):
         with open("shipments.json", "r", encoding="utf-8") as f:
             DB = json.load(f)
@@ -152,7 +171,11 @@ class Shipment(BaseModel):
 def save_db():
     with open("shipments.json", "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
-        def get_coords_from_baltgps(gps_link: str):
+
+# ============================================================
+# GPS
+# ============================================================
+def get_coords_from_baltgps(gps_link: str):
     if not gps_link or "maps.baltgps.ru" not in gps_link:
         return None, None, "no_link"
     try:
@@ -161,11 +184,14 @@ def save_db():
             "svc": "token/login", "params": json.dumps({"token": token})
         }, timeout=(3.0, 5.0))
         data = r.json()
-        if "error" in data: return None, None, "invalid_token"
-        if "token" not in data: return None, None, "invalid_token"
+        if "error" in data:
+            return None, None, "invalid_token"
+        if "token" not in data:
+            return None, None, "invalid_token"
         unit_info = json.loads(data["token"])
         items = unit_info.get("items", [])
-        if not items: return None, None, "no_units"
+        if not items:
+            return None, None, "no_units"
         unit_id = items[0]
         sid = data.get("eid")
         r2 = requests.get("https://maps.baltgps.ru/wialon/ajax.html", params={
@@ -210,19 +236,31 @@ async def update_all_coords():
     tasks = [fetch_single_order_coords(oid, o) for oid, o in DB.items() if o.get("gps_link")]
     semaphore = asyncio.Semaphore(10)
     async def limited(t):
-        async with semaphore: await t
+        async with semaphore:
+            await t
     await asyncio.gather(*(limited(t) for t in tasks))
     save_db()
 
+# ============================================================
+# МЕНЮ
+# ============================================================
 def get_main_menu():
-    return [("📋 Выбрать заказ", "menu_choose_order"), ("🔄 Обновить GPS", "menu_update_gps"), ("❓ Помощь", "menu_help")]
+    return [
+        ("📋 Выбрать заказ", "menu_choose_order"),
+        ("🔄 Обновить GPS", "menu_update_gps"),
+        ("❓ Помощь", "menu_help")
+    ]
 
 def get_orders_menu():
     active = [o for o in DB.values() if o.get("status") == "в пути"][:10]
     items = [(f"{'🟢' if o.get('has_valid_gps') else '🔴'} {o['order_id']}", f"order_{o['order_id']}") for o in active]
     items.append(("🔙 Назад в меню", "menu_back"))
     return items
-    @max_dp.bot_started()
+
+# ============================================================
+# ОБРАБОТЧИКИ БОТА
+# ============================================================
+@max_dp.bot_started()
 async def handle_bot_started(event):
     try:
         await event.bot.send_message(
@@ -256,13 +294,15 @@ async def handle_message(event):
         if q.isdigit() and len(q) == 4:
             for o in DB.values():
                 if o["order_id"].endswith(q):
-                    found = o; break
+                    found = o
+                    break
         elif q in DB:
             found = DB[q]
         if found:
             o = found
             resp = f"📦 Заказ: {o['order_id']}\n📍 Адрес: {o.get('address') or '—'}\n🚚 Перевозчик: {o.get('carrier') or '—'}\n🚛 Машина: {o.get('vehicle') or '—'}\n📊 Статус: {o.get('status') or '—'}\n"
-            if o.get('comment'): resp += f"📝 Примечание: {o['comment']}\n"
+            if o.get('comment'):
+                resp += f"📝 Примечание: {o['comment']}\n"
             callbacks = [("🔙 Назад в меню", "menu_back")]
             links = []
             if o.get("current_lat") and o.get("current_lng"):
@@ -276,8 +316,10 @@ async def handle_message(event):
             await event.message.answer(f"❌ Заказ «{text}» не найден.")
     except Exception:
         logger.error("handle_message error:\n%s", traceback.format_exc())
-        try: await event.message.answer("⚠️ Ошибка обработки.")
-        except Exception: pass
+        try:
+            await event.message.answer("⚠️ Ошибка обработки.")
+        except Exception:
+            pass
 
 @max_dp.message_callback()
 async def handle_callback(event):
@@ -308,7 +350,8 @@ async def handle_callback(event):
             if oid in DB:
                 o = DB[oid]
                 resp = f"📦 Заказ: {o['order_id']}\n📍 Адрес: {o.get('address') or '—'}\n🚚 Перевозчик: {o.get('carrier') or '—'}\n🚛 Машина: {o.get('vehicle') or '—'}\n📊 Статус: {o.get('status') or '—'}\n"
-                if o.get('comment'): resp += f"📝 Примечание: {o['comment']}\n"
+                if o.get('comment'):
+                    resp += f"📝 Примечание: {o['comment']}\n"
                 callbacks = [("🔙 Назад в меню", "menu_back")]
                 links = []
                 if o.get("current_lat") and o.get("current_lng"):
@@ -322,14 +365,20 @@ async def handle_callback(event):
                 await event.message.answer("Заказ не найден.")
     except Exception:
         logger.error("handle_callback error:\n%s", traceback.format_exc())
-        try: await event.message.answer("⚠️ Ошибка кнопки.")
-        except Exception: pass
+        try:
+            await event.message.answer("⚠️ Ошибка кнопки.")
+        except Exception:
+            pass
 
 def check_admin(credentials: HTTPBasicCredentials = Depends(security)):
     if not (secrets.compare_digest(credentials.username, ADMIN_USER) and secrets.compare_digest(credentials.password, ADMIN_PASS)):
         raise HTTPException(401, "Неверный логин/пароль")
     return credentials.username
-    @app.get("/api/settings/tabs")
+
+# ============================================================
+# API ДЛЯ САЙТА
+# ============================================================
+@app.get("/api/settings/tabs")
 async def get_tabs():
     return SETTINGS
 
@@ -347,38 +396,51 @@ async def list_shipments(status: Optional[str] = None, search: Optional[str] = N
     result = []
     for o in DB.values():
         s = str(o.get("status", "")).lower()
-        if status == "in_transit" and s not in ['в пути', 'планируется']: continue
-        if status == "delivered" and s not in ['завершено', 'выгружено']: continue
-        if status == "with_gps" and not o.get("current_lat"): continue
+        if status == "in_transit" and s not in ['в пути', 'планируется']:
+            continue
+        if status == "delivered" and s not in ['завершено', 'выгружено']:
+            continue
+        if status == "with_gps" and not o.get("current_lat"):
+            continue
         if search:
             q = search.lower()
-            if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower(): continue
+            if q not in o.get("order_id", "").lower() and q not in o.get("address", "").lower():
+                continue
         result.append(o)
     def key(x):
         valid = 1 if x.get("current_lat") else 0
         oid = str(x.get("order_id") or "")
         city = str(x.get("address") or "").lower()
-        if sort_by == "gps": return (not valid, oid)
-        if sort_by == "order_id": return oid
-        if sort_by == "city": return (city == "", city, oid)
+        if sort_by == "gps":
+            return (not valid, oid)
+        if sort_by == "order_id":
+            return oid
+        if sort_by == "city":
+            return (city == "", city, oid)
         return (not valid, oid)
     result.sort(key=key)
     return result
 
 @app.get("/api/coords/{order_id}")
 async def get_online_coords(order_id: str):
-    if order_id not in DB: raise HTTPException(404, "Заказ не найден")
+    if order_id not in DB:
+        raise HTTPException(404, "Заказ не найден")
     o = DB[order_id]
     if o.get("gps_link"):
         loop = asyncio.get_running_loop()
         lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, o["gps_link"])
         if lat and lng:
-            o["current_lat"] = lat; o["current_lng"] = lng; o["has_valid_gps"] = True
+            o["current_lat"] = lat
+            o["current_lng"] = lng
+            o["has_valid_gps"] = True
             save_db()
             return {"lat": lat, "lng": lng}
-        if status == "invalid_token": raise HTTPException(400, "Ссылка устарела")
-        if status == "error": raise HTTPException(503, "Спутник не отвечает")
-    if o.get("current_lat"): return {"lat": o["current_lat"], "lng": o["current_lng"]}
+        if status == "invalid_token":
+            raise HTTPException(400, "Ссылка устарела")
+        if status == "error":
+            raise HTTPException(503, "Спутник не отвечает")
+    if o.get("current_lat"):
+        return {"lat": o["current_lat"], "lng": o["current_lng"]}
     raise HTTPException(404, "GPS недоступен")
 
 @app.get("/api/admin/shipments")
@@ -396,7 +458,8 @@ async def admin_create(s: Shipment, user=Depends(check_admin)):
 @app.delete("/api/admin/shipments/{order_id}")
 async def admin_delete(order_id: str, user=Depends(check_admin)):
     if order_id in DB:
-        del DB[order_id]; save_db()
+        del DB[order_id]
+        save_db()
     return {"ok": True}
 
 @app.post("/api/admin/upload")
@@ -411,23 +474,34 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
                 raise ValueError("Нет листа 'Исх.логистика'")
             ws = wb["Исх.логистика"]
             for i in range(1, ws.max_row + 1):
-                if ws.row_dimensions[i].hidden: ws.row_dimensions[i].hidden = False
-            out = io.BytesIO(); wb.save(out); out.seek(0)
+                if ws.row_dimensions[i].hidden:
+                    ws.row_dimensions[i].hidden = False
+            out = io.BytesIO()
+            wb.save(out)
+            out.seek(0)
             df = pd.read_excel(out, sheet_name="Исх.логистика", dtype=str)
-            new_db = {}; skipped = 0
+            new_db = {}
+            skipped = 0
             for _, row in df.iterrows():
                 raw = row.get('Заказ')
                 if pd.isna(raw) or str(raw).strip() == '' or str(raw).strip().lower() == 'nan':
-                    skipped += 1; continue
+                    skipped += 1
+                    continue
                 oid = str(raw).strip()
                 def fd(v):
-                    if pd.isna(v) or str(v).strip() == '': return None
-                    try: return pd.to_datetime(v).strftime('%Y-%m-%d')
-                    except: return str(v)[:10]
+                    if pd.isna(v) or str(v).strip() == '':
+                        return None
+                    try:
+                        return pd.to_datetime(v).strftime('%Y-%m-%d')
+                    except:
+                        return str(v)[:10]
                 def sf(v):
-                    if pd.isna(v) or str(v).strip() == '': return None
-                    try: return float(str(v).replace(',', '.').strip())
-                    except: return None
+                    if pd.isna(v) or str(v).strip() == '':
+                        return None
+                    try:
+                        return float(str(v).replace(',', '.').strip())
+                    except:
+                        return None
                 gps = str(row.get('ссылка')).strip() if not pd.isna(row.get('ссылка')) else None
                 new_db[oid] = {
                     "order_id": oid,
@@ -658,7 +732,8 @@ async def user_portal():
 </body>
 </html>
 """
-    # ============ АДМИН-ПАНЕЛЬ ============
+
+# ============ АДМИН-ПАНЕЛЬ ============
 @app.get("/admin", response_class=HTMLResponse)
 async def admin_panel(user=Depends(check_admin)):
     return """
