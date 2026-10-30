@@ -117,7 +117,7 @@ webhook = FastAPIMaxWebhook(
 )
 
 # ============================================================
-# LIFESPAN (вкладываем webhook.lifespan)
+# LIFESPAN
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
