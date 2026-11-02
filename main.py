@@ -599,9 +599,9 @@ def format_order(r: dict) -> str:
         f"📊 **Статус:** {norm_status(r.get('status')) or '—'}\n"
     )
     if norm_status(r.get("status")) in DELIVERED:
-        s += f"📅 **Отгрузка:** {r.get('ship_date') or '—'}\n"
+        s += f"📅 **Дата отправки:** {r.get('ship_date') or '—'}\n"
         s += f"📅 **Прибытие (план):** {r.get('plan_arrival') or '—'}\n"
-        s += f"📅 **Прибытие (факт):** {r.get('arrival_date') or 'нет данных'}\n"
+        s += f"📅 **Дата выгрузки:** {r.get('arrival_date') or 'нет данных'}\n"
     if r.get("comment"):
         s += f"📝 **Примечание:** {r['comment']}\n"
     return s
@@ -651,7 +651,7 @@ async def handle_callback(event):
             "🗺️ **Что я умею:**\n"
             "• Показывать адрес, перевозчика, машину и статус.\n"
             "• Отправлять точку на карте (если есть GPS).\n"
-            "• Показывать даты отгрузки/прибытия для завершённых."
+            "• Показывать даты отправки/выгрузки для завершённых."
         )
         await edit_message(event.message, help_text, get_main_menu())
     elif payload == "menu_back":
@@ -972,7 +972,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
 <div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
 <script>
-let currentTab='delivered', currentYear=null, map=null;
+let currentTab='in_transit', currentYear=null, map=null;
 function toggleTheme(){const d=document.documentElement.getAttribute('data-theme')==='dark';document.documentElement.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');}
 document.documentElement.setAttribute('data-theme',localStorage.getItem('theme')||'light');
 
@@ -983,13 +983,8 @@ async function loadTabs(){
         const st=t.dataset.status;
         t.classList.toggle('visible', s['show_'+st]!==false);
     });
-    const deliveredTab = document.querySelector('.tab[data-status="delivered"]');
-    if (deliveredTab && deliveredTab.classList.contains('visible')) {
-        setTab('delivered');
-    } else {
-        const firstVisible = document.querySelector('.tab.visible');
-        if (firstVisible) setTab(firstVisible.dataset.status);
-    }
+    const firstVisible = document.querySelector('.tab.visible');
+    if (firstVisible) setTab(firstVisible.dataset.status);
 }
 
 function setTab(s){
@@ -1003,7 +998,7 @@ function setTab(s){
         if (!currentYear) currentYear = new Date().getFullYear();
     } else {
         yearsBox.style.display = 'none';
-        currentYear = new Date().getFullYear(); // для "В пути" всегда текущий год
+        currentYear = new Date().getFullYear();
     }
     loadOrders();
 }
@@ -1060,8 +1055,8 @@ async function loadOrders(force=false){
                 <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
                 <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
                 <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
-                <div class="order-row"><strong>Отгрузка:</strong> ${o.ship_date||'—'}</div>
-                <div class="order-row"><strong>Выгрузка:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
+                <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
+                <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
                 </div>`;
             }
             
@@ -1072,7 +1067,7 @@ async function loadOrders(force=false){
             <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
             <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
             <div class="order-row"><strong>Вес:</strong> ${o.weight?o.weight+' кг':'—'}</div>
-            <div class="order-row"><strong>Отгрузка:</strong> ${o.ship_date||'—'}</div>
+            <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
             <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
             ${loc}
             </div>`;
@@ -1098,8 +1093,8 @@ async function openOrder(o){
     const isDelivered=(st==='завершено'||st==='выгружено');
     
     const dates=isDelivered
-        ?`<div><strong>Отгрузка</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div><div><strong>Прибытие (факт)</strong>${o.arrival_date||'нет данных'}</div>`
-        :`<div><strong>Отгрузка</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div>`;
+        ?`<div><strong>Дата отправки</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div><div><strong>Дата выгрузки</strong>${o.arrival_date||'нет данных'}</div>`
+        :`<div><strong>Дата отправки</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div>`;
     
     document.getElementById('modalContent').innerHTML=`<h2>📦 ${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></h2>
     <div class="modal-info">
@@ -1219,9 +1214,9 @@ tr:hover{background:#f0f8ff}
 <label>Направление</label><input id="f_direction"/>
 <label>Адрес доставки</label><input id="f_address"/>
 <label>Вес</label><input id="f_weight" type="number"/>
-<label>Дата отгрузки</label><input id="f_ship_date" type="date"/>
+<label>Дата отправки</label><input id="f_ship_date" type="date"/>
 <label>План прибытия</label><input id="f_plan_arrival" type="date"/>
-<label>Факт прибытия</label><input id="f_arrival_date" type="date"/>
+<label>Дата выгрузки</label><input id="f_arrival_date" type="date"/>
 <label>Перевозчик</label><input id="f_carrier"/>
 <label>Машина</label><input id="f_vehicle"/>
 <label>Водитель</label><input id="f_driver"/>
