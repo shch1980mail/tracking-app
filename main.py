@@ -534,7 +534,8 @@ async def fetch_single_order_coords(rec: dict):
     else:
         rec["current_lat"] = None
         rec["current_lng"] = None
-        rec["has_valid_gps"] = False
+        if status != "error":
+            rec["has_valid_gps"] = False
     rec["gps_checked"] = True
 
 
@@ -1103,6 +1104,8 @@ async function loadOrders(force=false){
             grid.innerHTML='<div style="text-align:center;width:100%;">Нет заказов</div>';
             return;
         }
+        
+        // 1. РИСУЕМ КАРТОЧКИ
         grid.innerHTML=orders.map(o=>{
             const st=(o.status||'').toLowerCase();
             const isDelivered=(st==='завершено'||st==='выгружено');
@@ -1111,19 +1114,18 @@ async function loadOrders(force=false){
             else if(st==='выгружено') badge='<span class="order-status status-badge-delivered">Выгружено</span>';
             else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
             
-            // Логика значка GPS (в правом верхнем углу рядом со статусом)
+            // ЛОГИКА ЗНАЧКА GPS
             let gpsIcon = '';
-            let gpsBtnId = '';
             if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
                 if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
+                    // Если уже проверено и работает
                     gpsIcon = `<span title="GPS доступен" style="margin-left:8px;font-size:16px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">🌍</span>`;
                 } else {
-                    gpsBtnId = `gps-${o.order_id.replace(/[^a-zA-Z0-9]/g, '')}-${o.year}`;
-                    gpsIcon = `<span id="${gpsBtnId}" title="Проверка GPS..." style="margin-left:8px;font-size:14px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</span>`;
+                    // Если ссылка есть, но еще не проверена - вешаем часы с классом для поиска
+                    gpsIcon = `<span class="gps-loading" data-key="${o._key}" title="Проверка GPS..." style="margin-left:8px;font-size:14px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</span>`;
                 }
             }
 
-            // Шапка карточки (Заказ + Статус + GPS)
             const head = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
                 <span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>
                 <div style="display:flex;align-items:center;">
@@ -1158,29 +1160,28 @@ async function loadOrders(force=false){
             </div>`;
         }).join('');
         
-        // --- УМНАЯ ПРОВЕРКА GPS В ФОНЕ (МЕНЯЕТ ЧАСЫ НА ЗЕМЛЮ) ---
-        orders.forEach(o => {
-            if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false && !o.has_valid_gps) {
-                const btnId = `gps-${o.order_id.replace(/[^a-zA-Z0-9]/g, '')}-${o.year}`;
-                const btn = document.getElementById(btnId);
-                if (btn) {
-                    fetch(`/api/check_gps/${encodeURIComponent(o._key)}`)
-                        .then(res => res.json())
-                        .then(data => {
-                            if (data.valid === true) {
-                                btn.innerHTML = '🌍'; // Меняем на землю
-                                btn.title = 'GPS доступен';
-                            } else if (data.valid === false) {
-                                btn.style.display = 'none'; // Скрываем, если сгорела
-                            } else {
-                                btn.innerHTML = '🌍'; // При ошибке сети всё равно разрешаем клик
-                            }
-                        })
-                        .catch(() => {
-                            btn.style.display = 'none';
-                        });
-                }
-            }
+        // 2. ФОНОВАЯ ПРОВЕРКА (ЧАСЫ -> ЗЕМЛЯ)
+        // Ищем все элементы, где сейчас висят часы
+        const loadingIcons = document.querySelectorAll('.gps-loading');
+        loadingIcons.forEach(icon => {
+            const key = icon.getAttribute('data-key');
+            if (!key) return;
+
+            fetch(`/api/check_gps/${encodeURIComponent(key)}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.valid === true) {
+                        icon.innerHTML = '🌍';
+                        icon.title = 'GPS доступен';
+                    } else if (data.valid === false) {
+                        icon.style.display = 'none'; // Если сгорела
+                    } else {
+                        icon.innerHTML = '🌍'; // При ошибке сервера всё равно разрешаем клик
+                    }
+                })
+                .catch(() => {
+                    icon.style.display = 'none'; // При сбое сети скрываем
+                });
         });
         
     }catch(e){
