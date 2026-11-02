@@ -405,6 +405,11 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
         rec["_key"] = make_key(order_id, rec["year"], row_index=rec["row_index"], service=service)
         rec["data_warnings"] = warnings
         rec["archived"] = False
+        # Сбрасываем статус GPS при загрузке, чтобы проверить заново
+        rec["has_valid_gps"] = None
+        rec["current_lat"] = None
+        rec["current_lng"] = None
+        
         records.append(rec)
 
     keys = [r["_key"] for r in records]
@@ -804,12 +809,44 @@ async def get_online_coords(key: str):
             save_db()
             return {"lat": lat, "lng": lng}
         if status == "invalid_token":
+            r["has_valid_gps"] = False
+            save_db()
             raise HTTPException(400, "Ссылка на GPS устарела")
         if status == "error":
             raise HTTPException(503, "Спутник не отвечает")
+            
     if r.get("current_lat"):
         return {"lat": r["current_lat"], "lng": r["current_lng"]}
     raise HTTPException(404, "GPS недоступен")
+
+
+# НОВЫЙ ЭНДПОИНТ: Быстрая проверка статуса ссылки (без запроса координат, просто ping API)
+@app.get("/api/check_gps/{key}")
+async def check_gps_link(key: str):
+    if key not in DB:
+        raise HTTPException(404, "Заказ не найден")
+    r = DB[key]
+    if not r.get("gps_link"):
+        return {"valid": False}
+        
+    if r.get("has_valid_gps") is not None:
+        return {"valid": r["has_valid_gps"]}
+        
+    # Если еще не проверяли, проверяем в фоне
+    loop = asyncio.get_event_loop()
+    lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, r["gps_link"])
+    
+    if lat and lng:
+        r["current_lat"], r["current_lng"], r["has_valid_gps"] = lat, lng, True
+        save_db()
+        return {"valid": True}
+    elif status == "invalid_token" or status == "no_units":
+        r["has_valid_gps"] = False
+        save_db()
+        return {"valid": False}
+    else:
+        # Если спутник недоступен временно (сеть), не ставим false, вернем null
+        return {"valid": None}
 
 
 @app.get("/api/admin/shipments")
@@ -827,6 +864,7 @@ async def admin_create(s: Shipment, user=Depends(check_admin)):
     rec["_key"] = make_key(rec["order_id"], rec["year"], service=service)
     if rec["_key"] in DB:
         rec["_key"] = f"{rec['_key']}#{int(dt.datetime.utcnow().timestamp())}"
+    rec["has_valid_gps"] = None
     merge_into_db([rec])
     asyncio.create_task(update_all_coords())
     return {"ok": True, "_key": rec["_key"]}
@@ -948,10 +986,11 @@ INDEX_HTML = r"""<!DOCTYPE html>
         padding: 4px 10px; 
         border-radius: 12px; 
         cursor: pointer; 
-        display: flex; 
+        display: none; /* Скрыт по умолчанию, включается через JS */
         align-items: center; 
         gap: 4px; 
         box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+        border: none;
     }
     .gps-badge-btn:hover { background: #c7d2fe; }
     
@@ -1009,7 +1048,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 let currentTab='in_transit', currentYear=null, map=null;
 function toggleTheme(){const d=document.documentElement.getAttribute('data-theme')==='dark';document.documentElement.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');}
-// Тема по умолчанию - тёмная
 document.documentElement.setAttribute('data-theme',localStorage.getItem('theme')||'dark');
 
 async function loadTabs(){
@@ -1085,9 +1123,8 @@ async function loadOrders(force=false){
             
             const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
             
-            // Кнопка GPS в правом нижнем углу, отображается только если ссылка валидна
-            const hasGps = o.has_valid_gps === true || (o.current_lat && o.current_lng);
-            const gpsBtn = hasGps ? `<div class="gps-badge-btn" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">GPS</div>` : '';
+            // Готовим кнопку GPS (она изначально скрыта, JS включит если надо)
+            const gpsBtn = `<button class="gps-badge-btn" id="gps-btn-${o._key}" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">GPS</button>`;
             
             if(isDelivered){
                 return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
@@ -1116,6 +1153,41 @@ async function loadOrders(force=false){
             ${gpsBtn}
             </div>`;
         }).join('');
+        
+        // ФОНОВАЯ ПРОВЕРКА ССЫЛОК
+        // Проходим по всем отрисованным заказам
+        orders.forEach(o => {
+            const btn = document.getElementById(`gps-btn-${o._key}`);
+            if (!btn) return;
+            
+            // Если GPS уже подтвержден, показываем сразу
+            if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
+                btn.style.display = 'flex';
+            } 
+            // Если есть ссылка, и она еще не помечена как сгоревшая (null)
+            else if (o.gps_link && o.has_valid_gps !== false) {
+                btn.innerHTML = '⏳'; // Показываем загрузку
+                btn.style.display = 'flex';
+                
+                // Запрашиваем проверку у сервера
+                fetch(`/api/check_gps/${encodeURIComponent(o._key)}`)
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.valid === true) {
+                            btn.innerHTML = 'GPS';
+                        } else if (data.valid === false) {
+                            btn.style.display = 'none'; // Скрываем, если ссылка сгорела
+                        } else {
+                            // Если временная ошибка сервера, вернем "GPS" с надеждой, что при клике прогрузится
+                            btn.innerHTML = 'GPS';
+                        }
+                    })
+                    .catch(() => {
+                        btn.style.display = 'none'; // При ошибке сети скрываем
+                    });
+            }
+        });
+        
     }catch(e){
         grid.innerHTML='<div style="text-align:center;width:100%;color:red;">Ошибка загрузки</div>';
     }
@@ -1156,7 +1228,7 @@ async function openOrder(o){
     
     if(o.current_lat&&o.current_lng){
         renderMap(o.current_lat,o.current_lng);
-    }else if(o.has_valid_gps === true && o.gps_link){
+    }else if(o.gps_link){
         loadCoords(o._key,o.gps_link);
     }else{
         document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует или ссылка недействительна.</div>';
