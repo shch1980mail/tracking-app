@@ -918,7 +918,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .orders-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px; }
     
     /* Карточки */
-    .order-card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); cursor:pointer; border-left:4px solid var(--primary); transition:.2s; color:var(--text); }
+    .order-card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); cursor:pointer; border-left:4px solid var(--primary); transition:.2s; color:var(--text); position:relative; }
     .order-card:hover { transform:translateY(-2px); }
     .order-card.delivered { border-left-color:var(--success); padding:14px 16px; }
     .order-card.delivered .order-row { margin:3px 0; }
@@ -935,6 +935,25 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .order-status { padding:4px 10px; border-radius:12px; font-size:11px; font-weight:700; }
     .in-transit { background:#d4edda; color:#155724; }
     .status-badge-delivered { background:#d1ecf1; color:#0c5460; }
+    
+    /* GPS бейдж в карточке */
+    .gps-badge-btn { 
+        position: absolute; 
+        bottom: 14px; 
+        right: 14px; 
+        background: #e0e7ff; 
+        color: #0c5460; 
+        font-size: 11px; 
+        font-weight: 700; 
+        padding: 4px 10px; 
+        border-radius: 12px; 
+        cursor: pointer; 
+        display: flex; 
+        align-items: center; 
+        gap: 4px; 
+        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    }
+    .gps-badge-btn:hover { background: #c7d2fe; }
     
     #modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; padding:20px; overflow-y:auto; }
     #modal.open { display:block; }
@@ -1066,6 +1085,10 @@ async function loadOrders(force=false){
             
             const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
             
+            // Кнопка GPS в правом нижнем углу, отображается только если ссылка валидна
+            const hasGps = o.has_valid_gps === true || (o.current_lat && o.current_lng);
+            const gpsBtn = hasGps ? `<div class="gps-badge-btn" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">GPS</div>` : '';
+            
             if(isDelivered){
                 return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
                 ${head}
@@ -1076,6 +1099,7 @@ async function loadOrders(force=false){
                     <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
                     <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
                 </div>
+                ${gpsBtn}
                 </div>`;
             }
             
@@ -1089,6 +1113,7 @@ async function loadOrders(force=false){
             <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
             <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
             ${loc}
+            ${gpsBtn}
             </div>`;
         }).join('');
     }catch(e){
@@ -1131,10 +1156,10 @@ async function openOrder(o){
     
     if(o.current_lat&&o.current_lng){
         renderMap(o.current_lat,o.current_lng);
-    }else if(o.gps_link){
+    }else if(o.has_valid_gps === true && o.gps_link){
         loadCoords(o._key,o.gps_link);
     }else{
-        document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>';
+        document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует или ссылка недействительна.</div>';
     }
 }
 
