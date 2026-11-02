@@ -128,7 +128,6 @@ STATUS_CANON = {
     "": "планируется",
     "nan": "планируется",
 }
-# «планируется» на публичном сайте/в боте не показываем
 IN_TRANSIT = {"в пути"}
 DELIVERED = {"завершено", "выгружено"}
 HIDDEN_STATUSES = {"планируется"}
@@ -759,7 +758,6 @@ async def list_shipments(
         if selected_year is not None and r.get("year") != selected_year:
             continue
         s = norm_status(r.get("status"))
-        # «планируется» на публичном сайте не показываем нигде
         if s in HIDDEN_STATUSES:
             continue
         if status == "in_transit" and s not in IN_TRANSIT:
@@ -824,7 +822,6 @@ async def get_online_coords(key: str):
 
 @app.get("/api/admin/shipments")
 async def admin_list(user=Depends(check_admin)):
-    # В админке показываем всё, включая «планируется»
     return [public_view(r) for r in DB.values()]
 
 
@@ -941,7 +938,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .order-status { padding:4px 10px; border-radius:12px; font-size:11px; font-weight:700; }
     .in-transit { background:#d4edda; color:#155724; }
     .delivered { background:#d1ecf1; color:#0c5460; }
-    .planned { background:#fff3cd; color:#856404; }
     #modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; padding:20px; overflow-y:auto; }
     #modal.open { display:block; }
     .modal-content { background:var(--card); max-width:900px; margin:40px auto; border-radius:16px; padding:28px; position:relative; }
@@ -972,65 +968,193 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Прибывшие</button>
     <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 С GPS</button>
 </div>
-<div class="years" id="yearsContainer"></div>
+<div class="years" id="yearsContainer" style="display:none;"></div>
 <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
 <div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
 <script>
-let currentTab='in_transit', currentYear=null, map=null;
+let currentTab='delivered', currentYear=null, map=null;
 function toggleTheme(){const d=document.documentElement.getAttribute('data-theme')==='dark';document.documentElement.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');}
 document.documentElement.setAttribute('data-theme',localStorage.getItem('theme')||'light');
-async function loadTabs(){const r=await fetch('/api/settings/tabs');const s=await r.json();document.querySelectorAll('.tab').forEach(t=>{const st=t.dataset.status;const key='show_'+st;t.classList.toggle('visible',s[key]!==false);});const a=document.querySelector('.tab.active');if(a&&!a.classList.contains('visible')){const f=document.querySelector('.tab.visible');if(f)setTab(f.dataset.status);}}
-function setTab(s){currentTab=s;document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelector(`.tab[data-status="${s}"]`).classList.add('active');loadOrders();}
-function setYear(y){currentYear=y;document.querySelectorAll('.year-chip').forEach(c=>c.classList.toggle('active',c.dataset.year===String(y)));loadOrders();}
-function debounceSearch(){clearTimeout(window.t);window.t=setTimeout(loadOrders,300);}
-async function loadYears(){const r=await fetch('/api/years');const years=await r.json();const box=document.getElementById('yearsContainer');const cur=new Date().getFullYear();const list=[...new Set([cur,...years])].sort((a,b)=>b-a);if(!currentYear)currentYear=cur;box.innerHTML=list.map(y=>`<button class="year-chip ${y===currentYear?'active':''}" data-year="${y}" onclick="setYear(${y})">${y}</button>`).join('')+`<button class="year-chip ${currentYear==='all'?'active':''}" data-year="all" onclick="setYear('all')">Все годы</button>`;}
-async function loadOrders(force=false){const s=document.getElementById('searchInput').value.trim();const sort=document.getElementById('sortSelect').value;const grid=document.getElementById('ordersGrid');grid.innerHTML='<div style="text-align:center;width:100%;">Загрузка...</div>';const cp=force?`&force_refresh=true&_t=${Date.now()}`:'';const url=`/api/shipments?status=${currentTab}&sort_by=${sort}&year=${currentYear}${s?'&search='+encodeURIComponent(s):''}${cp}`;try{const r=await fetch(url,{cache:force?'no-store':'default'});const orders=await r.json();if(!orders.length){grid.innerHTML='<div style="text-align:center;width:100%;">Нет заказов</div>';return;}grid.innerHTML=orders.map(o=>{
-const st=(o.status||'').toLowerCase();
-const isDelivered=(st==='завершено'||st==='выгружено');
-let badge='';
-if(st==='в пути')badge='<span class="order-status in-transit">В пути</span>';
-else if(st==='выгружено')badge='<span class="order-status delivered">Выгружено</span>';
-else if(st==='завершено')badge='<span class="order-status delivered">Завершено</span>';
-const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
-if(isDelivered){return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
-${head}
-<div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
-<div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
-<div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
-<div class="order-row"><strong>Отгрузка:</strong> ${o.ship_date||'—'}</div>
-<div class="order-row"><strong>Выгрузка:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
-</div>`;}
-const loc=o.comment?`<div class="loc-info">📝 ${o.comment}</div>`:'';
-return `<div class="order-card" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
-${head}
-<div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
-<div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
-<div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
-<div class="order-row"><strong>Вес:</strong> ${o.weight?o.weight+' кг':'—'}</div>
-<div class="order-row"><strong>Отгрузка:</strong> ${o.ship_date||'—'}</div>
-<div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
-${loc}
-</div>`;}).join('');}catch(e){grid.innerHTML='<div style="text-align:center;width:100%;color:red;">Ошибка загрузки</div>';}}
-function refreshData(){const b=document.getElementById('refreshBtn');b.innerHTML='⏳ Загрузка...';b.disabled=true;loadOrders(true).finally(()=>{b.innerHTML='🔄 Обновить';b.disabled=false;});}
-async function openOrder(o){document.getElementById('modal').classList.add('open');const st=(o.status||'').toLowerCase();const isDelivered=(st==='завершено'||st==='выгружено');
-const dates=isDelivered?`<div><strong>Отгрузка</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div><div><strong>Прибытие (факт)</strong>${o.arrival_date||'нет данных'}</div>`:`<div><strong>Отгрузка</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div>`;
-document.getElementById('modalContent').innerHTML=`<h2>📦 ${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></h2>
-<div class="modal-info">
-<div><strong>Адрес</strong>${o.address||'—'}</div>
-<div><strong>Перевозчик</strong>${o.carrier||'—'}</div>
-<div><strong>Машина (ТС)</strong>${o.vehicle||'—'}</div>
-<div><strong>Водитель</strong>${o.driver||'—'}</div>
-<div><strong>Вес</strong>${o.weight?o.weight+' кг':'—'}</div>
-<div><strong>Статус</strong>${o.status||'—'}</div>
-${dates}
-</div>
-${o.comment?`<div style="margin-top:20px;padding:12px;background:rgba(0,0,0,.05);border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>`:''}
-<div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
-if(o.current_lat&&o.current_lng){renderMap(o.current_lat,o.current_lng);}else if(o.gps_link){loadCoords(o._key,o.gps_link);}else{document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>';}}
-async function loadCoords(key,link){const m=document.getElementById('map');m.innerHTML='<div class="spinner"></div><div>Запрос к спутнику...</div>';try{const r=await fetch(`/api/coords/${encodeURIComponent(key)}`);if(r.ok){const d=await r.json();renderMap(d.lat,d.lng);}else{const e=await r.json();m.innerHTML=`<div style="text-align:center;padding:20px;color:#888;">${e.detail||'GPS недоступен'}<br><br><a href="${link}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a></div>`;}}catch(e){m.innerHTML=`<div style="text-align:center;padding:20px;color:#888;">Ошибка сети<br><br><a href="${link}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a></div>`;}}
-function renderMap(lat,lng){const m=document.getElementById('map');m.innerHTML='';if(map)map.remove();map=L.map('map').setView([lat,lng],8);L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);L.marker([lat,lng]).addTo(map);}
-function closeModal(){document.getElementById('modal').classList.remove('open');if(map){map.remove();map=null;}}
-loadTabs().then(loadYears).then(()=>loadOrders());
+
+async function loadTabs(){
+    const r=await fetch('/api/settings/tabs');
+    const s=await r.json();
+    document.querySelectorAll('.tab').forEach(t=>{
+        const st=t.dataset.status;
+        t.classList.toggle('visible', s['show_'+st]!==false);
+    });
+    const deliveredTab = document.querySelector('.tab[data-status="delivered"]');
+    if (deliveredTab && deliveredTab.classList.contains('visible')) {
+        setTab('delivered');
+    } else {
+        const firstVisible = document.querySelector('.tab.visible');
+        if (firstVisible) setTab(firstVisible.dataset.status);
+    }
+}
+
+function setTab(s){
+    currentTab=s;
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    document.querySelector(`.tab[data-status="${s}"]`).classList.add('active');
+    
+    const yearsBox = document.getElementById('yearsContainer');
+    if (s === 'delivered') {
+        yearsBox.style.display = 'flex';
+        if (!currentYear) currentYear = new Date().getFullYear();
+    } else {
+        yearsBox.style.display = 'none';
+        currentYear = new Date().getFullYear(); // для "В пути" всегда текущий год
+    }
+    loadOrders();
+}
+
+function setYear(y){
+    currentYear=y;
+    document.querySelectorAll('.year-chip').forEach(c=>c.classList.toggle('active',c.dataset.year===String(y)));
+    loadOrders();
+}
+
+function debounceSearch(){
+    clearTimeout(window.t);
+    window.t=setTimeout(loadOrders,300);
+}
+
+async function loadYears(){
+    const r=await fetch('/api/years');
+    const years=await r.json();
+    const box=document.getElementById('yearsContainer');
+    const cur=new Date().getFullYear();
+    const list=[...new Set([cur,...years])].sort((a,b)=>b-a);
+    if(!currentYear)currentYear=cur;
+    box.innerHTML=list.map(y=>`<button class="year-chip ${y===currentYear?'active':''}" data-year="${y}" onclick="setYear(${y})">${y}</button>`).join('');
+}
+
+async function loadOrders(force=false){
+    const s=document.getElementById('searchInput').value.trim();
+    const sort=document.getElementById('sortSelect').value;
+    const grid=document.getElementById('ordersGrid');
+    grid.innerHTML='<div style="text-align:center;width:100%;">Загрузка...</div>';
+    const cp=force?`&force_refresh=true&_t=${Date.now()}`:'';
+    const url=`/api/shipments?status=${currentTab}&sort_by=${sort}&year=${currentYear}${s?'&search='+encodeURIComponent(s):''}${cp}`;
+    
+    try{
+        const r=await fetch(url,{cache:force?'no-store':'default'});
+        const orders=await r.json();
+        if(!orders.length){
+            grid.innerHTML='<div style="text-align:center;width:100%;">Нет заказов</div>';
+            return;
+        }
+        grid.innerHTML=orders.map(o=>{
+            const st=(o.status||'').toLowerCase();
+            const isDelivered=(st==='завершено'||st==='выгружено');
+            let badge='';
+            if(st==='в пути')badge='<span class="order-status in-transit">В пути</span>';
+            else if(st==='выгружено')badge='<span class="order-status delivered">Выгружено</span>';
+            else if(st==='завершено')badge='<span class="order-status delivered">Завершено</span>';
+            
+            const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
+            
+            if(isDelivered){
+                return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+                ${head}
+                <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
+                <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
+                <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
+                <div class="order-row"><strong>Отгрузка:</strong> ${o.ship_date||'—'}</div>
+                <div class="order-row"><strong>Выгрузка:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
+                </div>`;
+            }
+            
+            const loc=o.comment?`<div class="loc-info">📝 ${o.comment}</div>`:'';
+            return `<div class="order-card" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+            ${head}
+            <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
+            <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
+            <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
+            <div class="order-row"><strong>Вес:</strong> ${o.weight?o.weight+' кг':'—'}</div>
+            <div class="order-row"><strong>Отгрузка:</strong> ${o.ship_date||'—'}</div>
+            <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
+            ${loc}
+            </div>`;
+        }).join('');
+    }catch(e){
+        grid.innerHTML='<div style="text-align:center;width:100%;color:red;">Ошибка загрузки</div>';
+    }
+}
+
+function refreshData(){
+    const b=document.getElementById('refreshBtn');
+    b.innerHTML='⏳ Загрузка...';
+    b.disabled=true;
+    loadOrders(true).finally(()=>{
+        b.innerHTML='🔄 Обновить';
+        b.disabled=false;
+    });
+}
+
+async function openOrder(o){
+    document.getElementById('modal').classList.add('open');
+    const st=(o.status||'').toLowerCase();
+    const isDelivered=(st==='завершено'||st==='выгружено');
+    
+    const dates=isDelivered
+        ?`<div><strong>Отгрузка</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div><div><strong>Прибытие (факт)</strong>${o.arrival_date||'нет данных'}</div>`
+        :`<div><strong>Отгрузка</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div>`;
+    
+    document.getElementById('modalContent').innerHTML=`<h2>📦 ${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></h2>
+    <div class="modal-info">
+        <div><strong>Адрес</strong>${o.address||'—'}</div>
+        <div><strong>Перевозчик</strong>${o.carrier||'—'}</div>
+        <div><strong>Машина (ТС)</strong>${o.vehicle||'—'}</div>
+        <div><strong>Водитель</strong>${o.driver||'—'}</div>
+        <div><strong>Вес</strong>${o.weight?o.weight+' кг':'—'}</div>
+        <div><strong>Статус</strong>${o.status||'—'}</div>
+        ${dates}
+    </div>
+    ${o.comment?`<div style="margin-top:20px;padding:12px;background:rgba(0,0,0,.05);border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>`:''}
+    <div id="map"><div class="spinner"></div>Загрузка координат...</div>`;
+    
+    if(o.current_lat&&o.current_lng){
+        renderMap(o.current_lat,o.current_lng);
+    }else if(o.gps_link){
+        loadCoords(o._key,o.gps_link);
+    }else{
+        document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует. Ориентируйтесь на примечание.</div>';
+    }
+}
+
+async function loadCoords(key,link){
+    const m=document.getElementById('map');
+    m.innerHTML='<div class="spinner"></div><div>Запрос к спутнику...</div>';
+    try{
+        const r=await fetch(`/api/coords/${encodeURIComponent(key)}`);
+        if(r.ok){
+            const d=await r.json();
+            renderMap(d.lat,d.lng);
+        }else{
+            const e=await r.json();
+            m.innerHTML=`<div style="text-align:center;padding:20px;color:#888;">${e.detail||'GPS недоступен'}<br><br><a href="${link}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a></div>`;
+        }
+    }catch(e){
+        m.innerHTML=`<div style="text-align:center;padding:20px;color:#888;">Ошибка сети<br><br><a href="${link}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a></div>`;
+    }
+}
+
+function renderMap(lat,lng){
+    const m=document.getElementById('map');
+    m.innerHTML='';
+    if(map)map.remove();
+    map=L.map('map').setView([lat,lng],8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+    L.marker([lat,lng]).addTo(map);
+}
+
+function closeModal(){
+    document.getElementById('modal').classList.remove('open');
+    if(map){map.remove();map=null;}
+}
+
+loadTabs().then(loadYears);
 </script>
 </body></html>"""
 
@@ -1080,7 +1204,7 @@ tr:hover{background:#f0f8ff}
 <button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
 <span id="uploadStatus"></span>
 </div>
-<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>, история сохраняется, прошлые годы уходят в архив (не удаляются). <b>Планируемые</b> заказы видны только здесь.</p>
+<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>, история сохраняется, прошлые годы уходят в архив (не удаляются).</p>
 </div>
 
 <input id="filter" placeholder="Поиск по номеру, адресу, машине..." oninput="renderTable()"/>
