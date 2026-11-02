@@ -1,5 +1,5 @@
 {
   "show_in_transit": true,
-  "show_delivered": false,
+  "show_delivered": true,
   "show_with_gps": false
 }
