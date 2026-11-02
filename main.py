@@ -984,7 +984,8 @@ INDEX_HTML = r"""<!DOCTYPE html>
 <script>
 let currentTab='in_transit', currentYear=null, map=null;
 function toggleTheme(){const d=document.documentElement.getAttribute('data-theme')==='dark';document.documentElement.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');}
-document.documentElement.setAttribute('data-theme',localStorage.getItem('theme')||'light');
+// Тема по умолчанию - тёмная
+document.documentElement.setAttribute('data-theme',localStorage.getItem('theme')||'dark');
 
 async function loadTabs(){
     const r=await fetch('/api/settings/tabs');
@@ -1062,11 +1063,13 @@ async function loadOrders(force=false){
             if(isDelivered){
                 return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
                 ${head}
-                <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
-                <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
-                <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
-                <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
-                <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
+                <div class="order-row" style="color: var(--text-sec);"><strong style="color: var(--text);">Адрес:</strong> ${o.address||'—'}</div>
+                <div class="order-row" style="color: var(--text-sec);"><strong style="color: var(--text);">Перевозчик:</strong> ${o.carrier||'—'}</div>
+                <div class="order-row" style="color: var(--text-sec);"><strong style="color: var(--text);">ТС:</strong> ${o.vehicle||'—'}</div>
+                <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);">
+                    <div class="order-row" style="color: var(--text-sec);"><strong style="color: var(--text);">Дата отправки:</strong> ${o.ship_date||'—'}</div>
+                    <div class="order-row" style="color: var(--text-sec);"><strong style="color: var(--text);">Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
+                </div>
                 </div>`;
             }
             
