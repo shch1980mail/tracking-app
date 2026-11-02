@@ -405,8 +405,10 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
         rec["_key"] = make_key(order_id, rec["year"], row_index=rec["row_index"], service=service)
         rec["data_warnings"] = warnings
         rec["archived"] = False
-        # Сбрасываем статус GPS при загрузке, чтобы проверить заново
+        
+        # При загрузке сбрасываем проверку GPS
         rec["has_valid_gps"] = None
+        rec["gps_checked"] = False
         rec["current_lat"] = None
         rec["current_lng"] = None
         
@@ -533,6 +535,7 @@ async def fetch_single_order_coords(rec: dict):
         rec["current_lat"] = None
         rec["current_lng"] = None
         rec["has_valid_gps"] = False
+    rec["gps_checked"] = True
 
 
 async def update_all_coords():
@@ -540,7 +543,7 @@ async def update_all_coords():
         if rec.get("has_valid_gps") is False:
             rec["current_lat"] = None
             rec["current_lng"] = None
-    tasks = [fetch_single_order_coords(r) for r in DB.values() if r.get("gps_link") and "baltgps" in r["gps_link"]]
+    tasks = [fetch_single_order_coords(r) for r in DB.values() if r.get("gps_link") and "baltgps" in r["gps_link"] and not r.get("gps_checked")]
     sem = asyncio.Semaphore(10)
     async def _limited(coro):
         async with sem:
@@ -638,6 +641,8 @@ async def handle_callback(event):
         await edit_message(event.message, "Выберите заказ из списка:", get_orders_menu())
     elif payload == "menu_update_gps":
         await edit_message(event.message, "⏳ Запускаю обновление GPS в фоне. Это может занять минуту...", get_main_menu())
+        for r in DB.values():
+            r["gps_checked"] = False
         asyncio.create_task(update_all_coords())
     elif payload == "menu_help":
         help_text = (
@@ -714,6 +719,7 @@ def public_view(r: dict) -> dict:
         "current_lat": r.get("current_lat"),
         "current_lng": r.get("current_lng"),
         "has_valid_gps": r.get("has_valid_gps"),
+        "gps_checked": r.get("gps_checked", False),
         "archived": r.get("archived", False),
         "is_service_row": r.get("is_service_row", False),
     }
@@ -734,6 +740,8 @@ async def list_shipments(
     force_refresh: bool = False,
 ):
     if force_refresh:
+        for r in DB.values():
+            r["gps_checked"] = False
         asyncio.create_task(update_all_coords())
 
     cur_year = dt.date.today().year
@@ -806,10 +814,12 @@ async def get_online_coords(key: str):
         lat, lng, status = get_coords_from_baltgps(r["gps_link"])
         if lat and lng:
             r["current_lat"], r["current_lng"], r["has_valid_gps"] = lat, lng, True
+            r["gps_checked"] = True
             save_db()
             return {"lat": lat, "lng": lng}
         if status == "invalid_token":
             r["has_valid_gps"] = False
+            r["gps_checked"] = True
             save_db()
             raise HTTPException(400, "Ссылка на GPS устарела")
         if status == "error":
@@ -820,7 +830,6 @@ async def get_online_coords(key: str):
     raise HTTPException(404, "GPS недоступен")
 
 
-# НОВЫЙ ЭНДПОИНТ: Быстрая проверка статуса ссылки (без запроса координат, просто ping API)
 @app.get("/api/check_gps/{key}")
 async def check_gps_link(key: str):
     if key not in DB:
@@ -829,23 +838,23 @@ async def check_gps_link(key: str):
     if not r.get("gps_link"):
         return {"valid": False}
         
-    if r.get("has_valid_gps") is not None:
-        return {"valid": r["has_valid_gps"]}
+    if r.get("gps_checked"):
+        return {"valid": r.get("has_valid_gps")}
         
-    # Если еще не проверяли, проверяем в фоне
     loop = asyncio.get_event_loop()
     lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, r["gps_link"])
     
     if lat and lng:
         r["current_lat"], r["current_lng"], r["has_valid_gps"] = lat, lng, True
+        r["gps_checked"] = True
         save_db()
         return {"valid": True}
     elif status == "invalid_token" or status == "no_units":
         r["has_valid_gps"] = False
+        r["gps_checked"] = True
         save_db()
         return {"valid": False}
     else:
-        # Если спутник недоступен временно (сеть), не ставим false, вернем null
         return {"valid": None}
 
 
@@ -865,6 +874,7 @@ async def admin_create(s: Shipment, user=Depends(check_admin)):
     if rec["_key"] in DB:
         rec["_key"] = f"{rec['_key']}#{int(dt.datetime.utcnow().timestamp())}"
     rec["has_valid_gps"] = None
+    rec["gps_checked"] = False
     merge_into_db([rec])
     asyncio.create_task(update_all_coords())
     return {"ok": True, "_key": rec["_key"]}
@@ -1123,8 +1133,8 @@ async function loadOrders(force=false){
             
             const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
             
-            // Готовим кнопку GPS (она изначально скрыта, JS включит если надо)
-            const gpsBtn = `<button class="gps-badge-btn" id="gps-btn-${o._key}" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">GPS</button>`;
+            // Кнопка GPS (по умолчанию скрыта, JS включит если надо)
+            const gpsBtn = `<button class="gps-badge-btn" id="gps-btn-${o._key}" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})"></button>`;
             
             if(isDelivered){
                 return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
@@ -1154,36 +1164,35 @@ async function loadOrders(force=false){
             </div>`;
         }).join('');
         
-        // ФОНОВАЯ ПРОВЕРКА ССЫЛОК
-        // Проходим по всем отрисованным заказам
+        // --- УМНАЯ ПРОВЕРКА GPS С ПЕСОЧНЫМИ ЧАСАМИ ---
         orders.forEach(o => {
             const btn = document.getElementById(`gps-btn-${o._key}`);
             if (!btn) return;
             
-            // Если GPS уже подтвержден, показываем сразу
+            // Если ссылка есть и она уже проверена как рабочая
             if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
+                btn.innerHTML = 'GPS';
                 btn.style.display = 'flex';
             } 
-            // Если есть ссылка, и она еще не помечена как сгоревшая (null)
-            else if (o.gps_link && o.has_valid_gps !== false) {
-                btn.innerHTML = '⏳'; // Показываем загрузку
+            // Если ссылка есть, но еще не проверена (и не помечена как сгоревшая)
+            else if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
+                btn.innerHTML = '⏳'; // Показываем часы
                 btn.style.display = 'flex';
                 
-                // Запрашиваем проверку у сервера
+                // Запускаем фоновую проверку на сервере
                 fetch(`/api/check_gps/${encodeURIComponent(o._key)}`)
                     .then(res => res.json())
                     .then(data => {
                         if (data.valid === true) {
-                            btn.innerHTML = 'GPS';
+                            btn.innerHTML = 'GPS'; // Меняем на GPS
                         } else if (data.valid === false) {
-                            btn.style.display = 'none'; // Скрываем, если ссылка сгорела
+                            btn.style.display = 'none'; // Скрываем, если сгорела
                         } else {
-                            // Если временная ошибка сервера, вернем "GPS" с надеждой, что при клике прогрузится
-                            btn.innerHTML = 'GPS';
+                            btn.innerHTML = 'GPS'; // При ошибке сети/спутника разрешаем кликнуть
                         }
                     })
                     .catch(() => {
-                        btn.style.display = 'none'; // При ошибке сети скрываем
+                        btn.style.display = 'none';
                     });
             }
         });
