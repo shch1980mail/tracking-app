@@ -916,20 +916,26 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .year-chip.active { background:var(--primary); color:#fff; border-color:var(--primary); }
     .container { max-width:1100px; margin:0 auto; }
     .orders-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px; }
-    .order-card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); cursor:pointer; border-left:4px solid var(--primary); transition:.2s; }
+    
+    /* Карточки */
+    .order-card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); cursor:pointer; border-left:4px solid var(--primary); transition:.2s; color:var(--text); }
     .order-card:hover { transform:translateY(-2px); }
     .order-card.delivered { border-left-color:var(--success); padding:14px 16px; }
     .order-card.delivered .order-row { margin:3px 0; }
     .order-card.delivered .order-id { font-size:15px; }
     .order-card.delivered .loc-info { display:none; }
     .order-card.delivered .order-row strong { min-width:96px; }
+    
     .order-id { color:var(--primary); font-weight:700; font-size:16px; }
     .order-row { font-size:13px; margin:6px 0; color:var(--text-sec); }
     .order-row strong { color:var(--text); min-width:90px; display:inline-block; }
     .loc-info { margin-top:10px; padding:8px; background:rgba(0,123,255,.08); border-radius:6px; font-size:13px; color:var(--primary); }
+    
+    /* Бейджи статусов */
     .order-status { padding:4px 10px; border-radius:12px; font-size:11px; font-weight:700; }
     .in-transit { background:#d4edda; color:#155724; }
-    .delivered { background:#d1ecf1; color:#0c5460; }
+    .status-badge-delivered { background:#d1ecf1; color:#0c5460; }
+    
     #modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; padding:20px; overflow-y:auto; }
     #modal.open { display:block; }
     .modal-content { background:var(--card); max-width:900px; margin:40px auto; border-radius:16px; padding:28px; position:relative; }
@@ -1054,9 +1060,9 @@ async function loadOrders(force=false){
             const st=(o.status||'').toLowerCase();
             const isDelivered=(st==='завершено'||st==='выгружено');
             let badge='';
-            if(st==='в пути')badge='<span class="order-status in-transit">В пути</span>';
-            else if(st==='выгружено')badge='<span class="order-status delivered">Выгружено</span>';
-            else if(st==='завершено')badge='<span class="order-status delivered">Завершено</span>';
+            if(st==='в пути') badge='<span class="order-status in-transit">В пути</span>';
+            else if(st==='выгружено') badge='<span class="order-status status-badge-delivered">Выгружено</span>';
+            else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
             
             const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
             
