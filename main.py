@@ -984,26 +984,6 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .in-transit { background:#d4edda; color:#155724; }
     .status-badge-delivered { background:#d1ecf1; color:#0c5460; }
     
-    /* GPS бейдж в карточке */
-    .gps-badge-btn { 
-        position: absolute; 
-        bottom: 14px; 
-        right: 14px; 
-        background: #e0e7ff; 
-        color: #0c5460; 
-        font-size: 11px; 
-        font-weight: 700; 
-        padding: 4px 10px; 
-        border-radius: 12px; 
-        cursor: pointer; 
-        display: none; /* Скрыт по умолчанию, включается через JS */
-        align-items: center; 
-        gap: 4px; 
-        box-shadow: 0 1px 3px rgba(0,0,0,0.1);
-        border: none;
-    }
-    .gps-badge-btn:hover { background: #c7d2fe; }
-    
     #modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; padding:20px; overflow-y:auto; }
     #modal.open { display:block; }
     .modal-content { background:var(--card); max-width:900px; margin:40px auto; border-radius:16px; padding:28px; position:relative; }
@@ -1131,18 +1111,26 @@ async function loadOrders(force=false){
             else if(st==='выгружено') badge='<span class="order-status status-badge-delivered">Выгружено</span>';
             else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
             
-            const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
-            
-            // Логика кнопки GPS
-            let gpsBtnHtml = '';
+            // Логика значка GPS (в правом верхнем углу рядом со статусом)
+            let gpsIcon = '';
+            let gpsBtnId = '';
             if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
                 if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
-                    gpsBtnHtml = `<button class="gps-badge-btn" style="display:flex;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">GPS</button>`;
+                    gpsIcon = `<span title="GPS доступен" style="margin-left:8px;font-size:16px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">🌍</span>`;
                 } else {
-                    // Если ссылка есть, но еще не проверена
-                    gpsBtnHtml = `<button class="gps-badge-btn" id="gps-btn-${encodeURIComponent(o._key)}" style="display:flex;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</button>`;
+                    gpsBtnId = `gps-${o.order_id.replace(/[^a-zA-Z0-9]/g, '')}-${o.year}`;
+                    gpsIcon = `<span id="${gpsBtnId}" title="Проверка GPS..." style="margin-left:8px;font-size:14px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</span>`;
                 }
             }
+
+            // Шапка карточки (Заказ + Статус + GPS)
+            const head = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>
+                <div style="display:flex;align-items:center;">
+                    ${badge}
+                    ${gpsIcon}
+                </div>
+            </div>`;
             
             if(isDelivered){
                 return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
@@ -1154,7 +1142,6 @@ async function loadOrders(force=false){
                     <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
                     <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
                 </div>
-                ${gpsBtnHtml}
                 </div>`;
             }
             
@@ -1168,29 +1155,29 @@ async function loadOrders(force=false){
             <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
             <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
             ${loc}
-            ${gpsBtnHtml}
             </div>`;
         }).join('');
         
-        // Фоновая проверка часов (⏳ -> GPS)
+        // --- УМНАЯ ПРОВЕРКА GPS В ФОНЕ (МЕНЯЕТ ЧАСЫ НА ЗЕМЛЮ) ---
         orders.forEach(o => {
             if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false && !o.has_valid_gps) {
-                const safeId = encodeURIComponent(o._key);
-                const btn = document.getElementById(`gps-btn-${safeId}`);
+                const btnId = `gps-${o.order_id.replace(/[^a-zA-Z0-9]/g, '')}-${o.year}`;
+                const btn = document.getElementById(btnId);
                 if (btn) {
                     fetch(`/api/check_gps/${encodeURIComponent(o._key)}`)
                         .then(res => res.json())
                         .then(data => {
                             if (data.valid === true) {
-                                btn.innerHTML = 'GPS';
+                                btn.innerHTML = '🌍'; // Меняем на землю
+                                btn.title = 'GPS доступен';
                             } else if (data.valid === false) {
-                                btn.style.display = 'none';
+                                btn.style.display = 'none'; // Скрываем, если сгорела
                             } else {
-                                btn.innerHTML = 'GPS';
+                                btn.innerHTML = '🌍'; // При ошибке сети всё равно разрешаем клик
                             }
                         })
                         .catch(() => {
-                            btn.innerHTML = 'GPS';
+                            btn.style.display = 'none';
                         });
                 }
             }
