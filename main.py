@@ -939,7 +939,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .modal-info { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:20px; }
     .modal-info strong { display:block; color:var(--text-sec); font-size:12px; text-transform:uppercase; }
     
-    /* --- КАСТОМНЫЙ СПИННЕР (ЛОГОТИП) --- */
+    /* Кастомный логотип в качестве спиннера загрузки карты */
     .custom-spinner { 
         width: 50px; 
         height: 50px; 
@@ -955,9 +955,10 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
+<!-- Обновленная шапка с логотипом -->
 <div class="header">
     <div style="display:flex; align-items:center; gap:10px;">
-        <img src="/static/logo.png" alt="Логотип" style="height:36px; width:auto;">
+        <img src="/static/logo-2.png" alt="Логотип" style="height:36px; width:auto;">
         <h1 style="margin:0;">ТПК — Отслеживание</h1>
     </div>
     <button onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button>
@@ -1117,8 +1118,7 @@ async function openOrder(o){
     </div>
     ${o.comment?`<div style="margin-top:20px;padding:12px;background:rgba(0,0,0,.05);border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>`:''}
     
-    <!-- Заменили старый кружок на логотип -->
-    <div id="map"><img src="/static/logo.png" class="custom-spinner" alt="Загрузка..."><div>Загрузка координат...</div></div>`;
+    <div id="map"><img src="/static/logo-2.png" class="custom-spinner" alt="Загрузка..."><div>Загрузка координат...</div></div>`;
     
     if(o.current_lat&&o.current_lng){
         renderMap(o.current_lat,o.current_lng);
@@ -1131,8 +1131,7 @@ async function openOrder(o){
 
 async function loadCoords(key,link){
     const m=document.getElementById('map');
-    // Заменили старый кружок на логотип при запросе к спутнику
-    m.innerHTML='<img src="/static/logo.png" class="custom-spinner" alt="Загрузка..."><div>Запрос к спутнику...</div>';
+    m.innerHTML='<img src="/static/logo-2.png" class="custom-spinner" alt="Загрузка..."><div>Запрос к спутнику...</div>';
     try{
         const r=await fetch(`/api/coords/${encodeURIComponent(key)}`);
         if(r.ok){
@@ -1162,5 +1161,114 @@ function closeModal(){
 }
 
 loadTabs().then(loadYears);
+</script>
+</body></html>"""
+
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8"><title>Админ-панель</title>
+<style>
+body{font-family:Arial;padding:20px;background:#f0f2f5;margin:0}
+.top-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+.btn{padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-weight:bold}
+.btn-green{background:#28a745;color:#fff}.btn-blue{background:#007bff;color:#fff}.btn-red{background:#dc3545;color:#fff}
+.panel{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);margin-bottom:20px}
+.panel h3{margin-top:0}
+.upload-box{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.settings-grid{display:flex;gap:20px;margin-top:10px}
+.settings-grid label{display:flex;align-items:center;gap:6px;cursor:pointer}
+table{border-collapse:collapse;width:100%;background:#fff;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+th{background:#333;color:#fff;position:sticky;top:0}
+tr:hover{background:#f0f8ff}
+#filter{padding:10px;width:300px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px}
+#modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:1000}
+#modalContent{background:#fff;max-width:640px;margin:60px auto;padding:30px;border-radius:8px;max-height:80vh;overflow-y:auto}
+#modalContent label{display:block;margin-top:10px;font-weight:bold}
+#modalContent input,#modalContent select{width:100%;padding:8px;box-sizing:border-box;margin-top:4px}
+.modal-buttons{margin-top:20px;text-align:right}
+#uploadStatus{font-weight:bold;margin-left:10px}
+</style>
+</head>
+<body>
+<div class="top-bar"><h1>🚚 Управление перевозками</h1><button class="btn btn-green" onclick="openAdd()">➕ Добавить заказ</button></div>
+
+<div class="panel">
+<h3>👁️ Видимость вкладок на главной</h3>
+<div class="settings-grid">
+<label><input type="checkbox" id="chk_in_transit" onchange="saveTabs()"> 🚚 В пути</label>
+<label><input type="checkbox" id="chk_delivered" onchange="saveTabs()"> ✅ Прибывшие</label>
+<label><input type="checkbox" id="chk_with_gps" onchange="saveTabs()"> 📍 С GPS</label>
+</div>
+</div>
+
+<div class="panel">
+<h3>📥 Загрузка данных из Excel</h3>
+<div class="upload-box">
+<input type="file" id="excelFile" accept=".xlsx, .xls">
+<button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
+<span id="uploadStatus"></span>
+</div>
+<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>, история сохраняется, прошлые годы уходят в архив (не удаляются).</p>
+</div>
+
+<input id="filter" placeholder="Поиск по номеру, адресу, машине..." oninput="renderTable()"/>
+<table id="shipments">
+<thead><tr><th>Заказ</th><th>Год</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Отгрузка</th><th>Прибытие</th><th>Действия</th></tr></thead>
+<tbody></tbody>
+</table>
+
+<div id="modal"><div id="modalContent">
+<h2 id="modalTitle">Добавить заказ</h2>
+<label>Номер заказа *</label><input id="f_order_id"/>
+<label>Направление</label><input id="f_direction"/>
+<label>Адрес доставки</label><input id="f_address"/>
+<label>Вес</label><input id="f_weight" type="number"/>
+<label>Дата отправки</label><input id="f_ship_date" type="date"/>
+<label>План прибытия</label><input id="f_plan_arrival" type="date"/>
+<label>Дата выгрузки</label><input id="f_arrival_date" type="date"/>
+<label>Перевозчик</label><input id="f_carrier"/>
+<label>Машина</label><input id="f_vehicle"/>
+<label>Водитель</label><input id="f_driver"/>
+<label>GPS-ссылка</label><input id="f_gps_link"/>
+<label>Примечание</label><input id="f_comment"/>
+<label>Статус</label>
+<select id="f_status">
+<option value="планируется">планируется</option>
+<option value="в пути">в пути</option>
+<option value="выгружено">выгружено</option>
+<option value="завершено">завершено</option>
+</select>
+<div class="modal-buttons">
+<button class="btn" onclick="closeModal()">Отмена</button>
+<button class="btn btn-green" onclick="saveOrder()">Сохранить</button>
+</div>
+</div></div>
+
+<script>
+let allData=[];
+async function loadSettings(){const r=await fetch('/api/settings/tabs');const s=await r.json();document.getElementById('chk_in_transit').checked=s.show_in_transit!==false;document.getElementById('chk_delivered').checked=s.show_delivered!==false;document.getElementById('chk_with_gps').checked=s.show_with_gps!==false;}
+async function saveTabs(){const p={show_in_transit:document.getElementById('chk_in_transit').checked,show_delivered:document.getElementById('chk_delivered').checked,show_with_gps:document.getElementById('chk_with_gps').checked};await fetch('/api/admin/settings/tabs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});}
+async function load(){const r=await fetch('/api/admin/shipments');allData=await r.json();renderTable();}
+function renderTable(){const q=document.getElementById('filter').value.toLowerCase();const f=allData.filter(s=>[(s.order_id||''),(s.address||''),(s.vehicle||''),(s.carrier||'')].join(' ').toLowerCase().includes(q));document.querySelector('#shipments tbody').innerHTML=f.map(s=>`<tr>
+<td><b>${s.order_id}</b>${s.is_service_row?' <small>(служ.)</small>':''}</td>
+<td>${s.year||''}</td>
+<td>${s.address||''}</td>
+<td>${s.carrier||''}</td>
+<td>${s.vehicle||''}</td>
+<td>${s.status||'—'}</td>
+<td>${s.ship_date||''}</td>
+<td>${s.arrival_date||s.plan_arrival||''}</td>
+<td><button class="btn btn-blue" style="padding:4px 8px;" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
+<button class="btn btn-red" style="padding:4px 8px;" onclick="del('${s._key}')">🗑</button></td></tr>`).join('');}
+function openAdd(){['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value='');document.getElementById('f_order_id').disabled=false;document.getElementById('f_status').value='планируется';document.getElementById('modalTitle').innerText='Добавить заказ';document.getElementById('modal').style.display='block';}
+function openEdit(s){['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value=s[f]||'');document.getElementById('f_order_id').disabled=true;document.getElementById('f_status').value=s.status||'планируется';document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id+' ('+s.year+')';document.getElementById('modal').style.display='block';}
+function closeModal(){document.getElementById('modal').style.display='none';}
+async function saveOrder(){const p={order_id:document.getElementById('f_order_id').value,direction:document.getElementById('f_direction').value,address:document.getElementById('f_address').value,weight:parseFloat(document.getElementById('f_weight').value)||null,ship_date:document.getElementById('f_ship_date').value||null,plan_arrival:document.getElementById('f_plan_arrival').value||null,arrival_date:document.getElementById('f_arrival_date').value||null,carrier:document.getElementById('f_carrier').value,vehicle:document.getElementById('f_vehicle').value,driver:document.getElementById('f_driver').value,gps_link:document.getElementById('f_gps_link').value,comment:document.getElementById('f_comment').value,status:document.getElementById('f_status').value};await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});closeModal();load();}
+async function del(key){if(!confirm('Удалить запись '+key+'?'))return;await fetch('/api/admin/shipments/'+encodeURIComponent(key),{method:'DELETE'});load();}
+async function uploadExcel(){const fi=document.getElementById('excelFile');if(!fi.files.length){alert('Выберите файл!');return;}const fd=new FormData();fd.append('file',fi.files[0]);const b=document.getElementById('uploadBtn');const st=document.getElementById('uploadStatus');b.disabled=true;b.innerText='⏳ Обработка...';st.innerText='Пожалуйста, подождите...';st.style.color='blue';try{const r=await fetch('/api/admin/upload',{method:'POST',body:fd});const d=await r.json();if(r.ok){st.innerText='✅ '+d.message;st.style.color='green';load();}else{st.innerText='❌ Ошибка: '+d.detail;st.style.color='red';}}catch(e){st.innerText='❌ Ошибка сети';st.style.color='red';}finally{b.disabled=false;b.innerText='Обновить базу из файла';}}
+loadSettings();load();
 </script>
 </body></html>"""
