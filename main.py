@@ -955,7 +955,13 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </style>
 </head>
 <body>
-<div class="header"><h1>📍 ТПК — Отслеживание</h1><button onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button></div>
+<div class="header">
+    <div style="display:flex; align-items:center; gap:10px;">
+        <img src="/static/logo.png" alt="Логотип" style="height:36px; width:auto;">
+        <h1 style="margin:0;">ТПК — Отслеживание</h1>
+    </div>
+    <button onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button>
+</div>
 <div class="controls">
     <div class="search-box"><input id="searchInput" placeholder="Поиск по номеру, городу или машине..." oninput="debounceSearch()"></div>
     <select class="sort-select" id="sortSelect" onchange="loadOrders()">
