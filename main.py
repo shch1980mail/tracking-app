@@ -83,7 +83,7 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
 SETTINGS_FILE = "settings.json"
-DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": False, "show_with_gps": False}
+DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": False}
 
 if os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -128,8 +128,10 @@ STATUS_CANON = {
     "": "планируется",
     "nan": "планируется",
 }
-IN_TRANSIT = {"в пути", "планируется"}
+# «планируется» на публичном сайте/в боте не показываем
+IN_TRANSIT = {"в пути"}
 DELIVERED = {"завершено", "выгружено"}
+HIDDEN_STATUSES = {"планируется"}
 SERVICE_IDS = {"оборудование", "выставка", "рем.комп. для конша"}
 
 
@@ -172,6 +174,10 @@ def make_key(order_id: str, year: int, row_index: int = None, service: bool = Fa
 def is_service_id(order_id: str) -> bool:
     oid = (order_id or "").strip()
     return oid.lower() in SERVICE_IDS or not re.match(r"^ТПК\d{8}$", oid)
+
+
+def is_hidden_status(rec: dict) -> bool:
+    return norm_status(rec.get("status")) in HIDDEN_STATUSES
 
 
 def load_db():
@@ -574,13 +580,15 @@ def find_by_short(q: str):
     q = q.upper()
     if q.isdigit() and len(q) == 4:
         for r in DB.values():
+            if is_hidden_status(r):
+                continue
             if r["order_id"].endswith(q):
                 return r
     return None
 
 
 def find_all_by_order_id(order_id: str):
-    return [r for r in DB.values() if r["order_id"] == order_id]
+    return [r for r in DB.values() if r["order_id"] == order_id and not is_hidden_status(r)]
 
 
 def format_order(r: dict) -> str:
@@ -651,7 +659,7 @@ async def handle_callback(event):
         await edit_message(event.message, "👋 Главное меню:", get_main_menu())
     elif payload.startswith("order_"):
         key = payload[len("order_"):]
-        if key in DB:
+        if key in DB and not is_hidden_status(DB[key]):
             r = DB[key]
             links = []
             if r.get("current_lat") and r.get("current_lng"):
@@ -751,6 +759,9 @@ async def list_shipments(
         if selected_year is not None and r.get("year") != selected_year:
             continue
         s = norm_status(r.get("status"))
+        # «планируется» на публичном сайте не показываем нигде
+        if s in HIDDEN_STATUSES:
+            continue
         if status == "in_transit" and s not in IN_TRANSIT:
             continue
         if status == "delivered" and s not in DELIVERED:
@@ -813,6 +824,7 @@ async def get_online_coords(key: str):
 
 @app.get("/api/admin/shipments")
 async def admin_list(user=Depends(check_admin)):
+    # В админке показываем всё, включая «планируется»
     return [public_view(r) for r in DB.values()]
 
 
@@ -957,7 +969,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
 </div>
 <div class="tabs" id="tabsContainer">
     <button class="tab" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути</button>
-    <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Выгружено</button>
+    <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Прибывшие</button>
     <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 С GPS</button>
 </div>
 <div class="years" id="yearsContainer"></div>
@@ -979,7 +991,6 @@ let badge='';
 if(st==='в пути')badge='<span class="order-status in-transit">В пути</span>';
 else if(st==='выгружено')badge='<span class="order-status delivered">Выгружено</span>';
 else if(st==='завершено')badge='<span class="order-status delivered">Завершено</span>';
-else if(st==='планируется')badge='<span class="order-status planned">Планируется</span>';
 const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
 if(isDelivered){return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
 ${head}
@@ -1057,7 +1068,7 @@ tr:hover{background:#f0f8ff}
 <h3>👁️ Видимость вкладок на главной</h3>
 <div class="settings-grid">
 <label><input type="checkbox" id="chk_in_transit" onchange="saveTabs()"> 🚚 В пути</label>
-<label><input type="checkbox" id="chk_delivered" onchange="saveTabs()"> ✅ Выгружено</label>
+<label><input type="checkbox" id="chk_delivered" onchange="saveTabs()"> ✅ Прибывшие</label>
 <label><input type="checkbox" id="chk_with_gps" onchange="saveTabs()"> 📍 С GPS</label>
 </div>
 </div>
@@ -1069,7 +1080,7 @@ tr:hover{background:#f0f8ff}
 <button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
 <span id="uploadStatus"></span>
 </div>
-<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>, история сохраняется, прошлые годы уходят в архив (не удаляются).</p>
+<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>, история сохраняется, прошлые годы уходят в архив (не удаляются). <b>Планируемые</b> заказы видны только здесь.</p>
 </div>
 
 <input id="filter" placeholder="Поиск по номеру, адресу, машине..." oninput="renderTable()"/>
