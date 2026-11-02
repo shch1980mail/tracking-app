@@ -10,9 +10,11 @@ DATABASE_URL = os.environ.get("DATABASE_URL")
 _current_sid = None
 
 
+def is_url(s: str) -> bool:
+    return bool(s) and s.startswith("http")
+
+
 async def mark_as_done(conn, order_id):
-    """Помечает заказ как завершённый, если ссылка сгорела."""
-    print(f"  {order_id}: ссылка невалидна, помечаю как 'завершено'")
     await conn.execute("""
         UPDATE shipments
         SET status = 'завершено', current_lat = NULL, current_lng = NULL
@@ -21,10 +23,8 @@ async def mark_as_done(conn, order_id):
 
 
 async def save_position(conn, order_id, lat, lng):
-    """Сохраняет позицию. При первом появлении фиксирует ship_lat/ship_lng."""
     row = await conn.fetchrow("SELECT ship_lat FROM shipments WHERE order_id = $1", order_id)
     if row and row["ship_lat"] is None:
-        # Первый раз видим машину — фиксируем стартовую точку
         await conn.execute("""
             UPDATE shipments
             SET ship_lat = $1, ship_lng = $2,
@@ -35,7 +35,6 @@ async def save_position(conn, order_id, lat, lng):
             WHERE order_id = $3
         """, lat, lng, order_id)
     else:
-        # Уже видели — обновляем только текущую позицию
         await conn.execute("""
             UPDATE shipments
             SET current_lat = $1, current_lng = $2,
@@ -46,7 +45,6 @@ async def save_position(conn, order_id, lat, lng):
 
 
 async def get_sid_from_maps_baltgps(gps_link: str):
-    """maps.baltgps.ru — перехват sid через Playwright."""
     captured = {"sid": None}
 
     async with async_playwright() as p:
@@ -64,13 +62,11 @@ async def get_sid_from_maps_baltgps(gps_link: str):
             sid = extract_sid(request.url)
             if sid and not captured["sid"]:
                 captured["sid"] = sid
-                print(f"  Перехвачен sid: {sid[:16]}...")
 
         async def on_response(response):
             sid = extract_sid(response.url)
             if sid and not captured["sid"]:
                 captured["sid"] = sid
-                print(f"  Перехвачен sid из ответа: {sid[:16]}...")
 
         page.on("request", on_request)
         page.on("response", on_response)
@@ -78,8 +74,8 @@ async def get_sid_from_maps_baltgps(gps_link: str):
         try:
             await page.goto(gps_link, timeout=60000, wait_until="domcontentloaded")
             await page.wait_for_timeout(12000)
-        except Exception as e:
-            print(f"  Playwright ошибка: {e}")
+        except Exception:
+            pass
         finally:
             await browser.close()
 
@@ -87,40 +83,27 @@ async def get_sid_from_maps_baltgps(gps_link: str):
 
 
 async def get_coords_from_gs_baltgps(gps_link: str):
-    """gs.baltgps.ru — координаты из HTML после клика по карте."""
     coords = {"lat": None, "lng": None}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
         try:
             await page.goto(gps_link, timeout=90000, wait_until="domcontentloaded")
-            print("  Жду 25 секунд, пока карта прогрузится...")
             await page.wait_for_timeout(25000)
-
             html = await page.content()
             m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
-
             if m:
-                coords["lat"] = float(m[-1][0])
-                coords["lng"] = float(m[-1][1])
-                print(f"  Найдено из HTML: {coords['lat']}, {coords['lng']}")
+                coords["lat"], coords["lng"] = float(m[-1][0]), float(m[-1][1])
             else:
-                print("  Координаты в HTML не найдены, кликаю по карте...")
                 await page.mouse.click(900, 400)
                 await page.wait_for_timeout(3000)
-
                 html = await page.content()
                 m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
                 if m:
-                    coords["lat"] = float(m[-1][0])
-                    coords["lng"] = float(m[-1][1])
-                    print(f"  Найдено после клика: {coords['lat']}, {coords['lng']}")
-                else:
-                    print(f"  Координаты не найдены")
-        except Exception as e:
-            print(f"  Ошибка Playwright (gs): {e}")
+                    coords["lat"], coords["lng"] = float(m[-1][0]), float(m[-1][1])
+        except Exception:
+            pass
         finally:
             await browser.close()
 
@@ -128,37 +111,27 @@ async def get_coords_from_gs_baltgps(gps_link: str):
 
 
 async def get_coords_from_axenta(gps_link: str):
-    """axenta.cloud — координаты из JSON или HTML."""
     coords = {"lat": None, "lng": None}
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=True)
         page = await browser.new_page()
-
         try:
             await page.goto(gps_link, timeout=90000, wait_until="domcontentloaded")
-            print("  Axenta: жду 25 секунд...")
             await page.wait_for_timeout(25000)
-
             html = await page.content()
             m = re.findall(r'"lat"\s*:\s*(\d+\.\d+).*?"lng"\s*:\s*(\d+\.\d+)', html)
-
             if m:
                 coords["lat"], coords["lng"] = float(m[0][0]), float(m[0][1])
-                print(f"  Axenta (из JSON): {coords['lat']}, {coords['lng']}")
             else:
                 await page.mouse.click(900, 400)
                 await page.wait_for_timeout(3000)
-
                 html = await page.content()
                 m = re.findall(r'N(\d+\.\d+)[,\s]*E(\d+\.\d+)', html)
                 if m:
                     coords["lat"], coords["lng"] = float(m[-1][0]), float(m[-1][1])
-                    print(f"  Axenta (из HTML): {coords['lat']}, {coords['lng']}")
-                else:
-                    print("  Axenta: координаты не найдены")
-        except Exception as e:
-            print(f"  Ошибка Playwright (axenta): {e}")
+        except Exception:
+            pass
         finally:
             await browser.close()
 
@@ -166,105 +139,73 @@ async def get_coords_from_axenta(gps_link: str):
 
 
 def get_units_from_token(token: str, base_url: str = "https://maps.baltgps.ru"):
-    """token/login — для maps.baltgps.ru."""
     try:
-        r = requests.get(
-            f"{base_url}/wialon/ajax.html",
-            params={
-                "svc": "token/login",
-                "params": json.dumps({"token": token})
-            },
-            timeout=15
-        )
+        r = requests.get(f"{base_url}/wialon/ajax.html", params={
+            "svc": "token/login", "params": json.dumps({"token": token})
+        }, timeout=15)
         data = r.json()
         if "token" in data:
             return json.loads(data["token"]).get("items", []), data.get("eid"), data.get("host")
-    except Exception as e:
-        print(f"  token/login ошибка: {e}")
+    except Exception:
+        pass
     return [], None, None
 
 
 def get_position_by_sid(sid: str, unit_id: int, base_url: str = "https://maps.baltgps.ru"):
-    """core/search_item — для maps.baltgps.ru."""
     try:
-        r = requests.get(
-            f"{base_url}/wialon/ajax.html",
-            params={
-                "svc": "core/search_item",
-                "params": json.dumps({"id": unit_id, "flags": 1025}),
-                "sid": sid
-            },
-            timeout=10
-        )
+        r = requests.get(f"{base_url}/wialon/ajax.html", params={
+            "svc": "core/search_item",
+            "params": json.dumps({"id": unit_id, "flags": 1025}),
+            "sid": sid,
+        }, timeout=10)
         data = r.json()
         if "error" in data:
             return None, None, "sid_expired"
-        item = data.get("item", {})
-        pos = item.get("pos")
+        pos = data.get("item", {}).get("pos")
         if pos and "x" in pos and "y" in pos:
             return pos["y"], pos["x"], "ok"
-    except Exception as e:
-        print(f"  search_item ошибка: {e}")
+    except Exception:
+        pass
     return None, None, "unknown"
 
 
 async def process_order(conn, order_id: str, gps_link: str):
-    """Определяет тип ссылки и обрабатывает соответственно."""
     global _current_sid
 
-    if not gps_link or not gps_link.startswith("http"):
+    if not is_url(gps_link):
+        # это не ссылка, а текст (старый баг загрузки) — не помечаем как завершённое
         return False
 
-    # === Тип 1: axenta.cloud ===
     if "axenta.cloud" in gps_link:
-        print(f"  {order_id}: тип axenta.cloud")
         lat, lng = await get_coords_from_axenta(gps_link)
         if lat and lng:
             await save_position(conn, order_id, lat, lng)
-            print(f"  {order_id}: {lat}, {lng} ✅")
             return True
         await mark_as_done(conn, order_id)
         return False
 
-    # === Тип 2: gs.baltgps.ru ===
     if "gs.baltgps.ru" in gps_link:
-        print(f"  {order_id}: тип gs.baltgps.ru")
         lat, lng = await get_coords_from_gs_baltgps(gps_link)
         if lat and lng:
             await save_position(conn, order_id, lat, lng)
-            print(f"  {order_id}: {lat}, {lng} ✅")
             return True
         await mark_as_done(conn, order_id)
         return False
 
-    # === Тип 3: maps.baltgps.ru ===
     if "maps.baltgps.ru" in gps_link:
-        print(f"  {order_id}: тип maps.baltgps.ru")
         token = gps_link.split("?t=")[-1]
-        units, eid, host = get_units_from_token(token)
-
+        units, _eid, _host = get_units_from_token(token)
         if not units:
-            print(f"  {order_id}: не удалось получить список машин")
             await mark_as_done(conn, order_id)
             return False
-
-        print(f"  Получаю новый sid через Playwright...")
         _current_sid = await get_sid_from_maps_baltgps(gps_link)
-
         if not _current_sid:
-            print(f"  {order_id}: не удалось получить sid")
             await mark_as_done(conn, order_id)
             return False
-
-        unit_id = units[0]
-        lat, lng, status = get_position_by_sid(_current_sid, unit_id)
-
+        lat, lng, status = get_position_by_sid(_current_sid, units[0])
         if lat and lng:
             await save_position(conn, order_id, lat, lng)
-            print(f"  {order_id}: {lat}, {lng} ✅")
             return True
-
-        print(f"  {order_id}: координаты не получены ({status})")
         if status == "sid_expired":
             await mark_as_done(conn, order_id)
         return False
@@ -276,18 +217,20 @@ async def main():
     conn = await asyncpg.connect(DATABASE_URL)
     rows = await conn.fetch("""
         SELECT order_id, gps_link FROM shipments
-        WHERE status IN ('в пути', 'планируется') 
-          AND gps_link IS NOT NULL 
+        WHERE status IN ('в пути', 'планируется')
+          AND gps_link IS NOT NULL
           AND gps_link != ''
     """)
     print(f"Найдено {len(rows)} активных заказов\n")
     updated = 0
-    for row in rows:
-        try:
-            if await process_order(conn, row["order_id"], row["gps_link"]):
-                updated += 1
-        except Exception as e:
-            print(f"  {row['order_id']}: ошибка {e}")
+    # создаём корутины и сразу awaited через gather
+    tasks = [process_order(conn, r["order_id"], r["gps_link"]) for r in rows]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    for r, res in zip(rows, results):
+        if isinstance(res, Exception):
+            print(f"  {r['order_id']}: ошибка {res}")
+        elif res:
+            updated += 1
     await conn.close()
     print(f"\nОбновлено: {updated} из {len(rows)}")
 
