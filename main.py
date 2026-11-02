@@ -1133,8 +1133,16 @@ async function loadOrders(force=false){
             
             const head=`<div style="display:flex;justify-content:space-between;margin-bottom:8px;"><span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>${badge}</div>`;
             
-            // Кнопка GPS (по умолчанию скрыта, JS включит если надо)
-            const gpsBtn = `<button class="gps-badge-btn" id="gps-btn-${o._key}" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})"></button>`;
+            // Логика кнопки GPS
+            let gpsBtnHtml = '';
+            if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
+                if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
+                    gpsBtnHtml = `<button class="gps-badge-btn" style="display:flex;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">GPS</button>`;
+                } else {
+                    // Если ссылка есть, но еще не проверена
+                    gpsBtnHtml = `<button class="gps-badge-btn" id="gps-btn-${encodeURIComponent(o._key)}" style="display:flex;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</button>`;
+                }
+            }
             
             if(isDelivered){
                 return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
@@ -1146,7 +1154,7 @@ async function loadOrders(force=false){
                     <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
                     <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
                 </div>
-                ${gpsBtn}
+                ${gpsBtnHtml}
                 </div>`;
             }
             
@@ -1160,40 +1168,31 @@ async function loadOrders(force=false){
             <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
             <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
             ${loc}
-            ${gpsBtn}
+            ${gpsBtnHtml}
             </div>`;
         }).join('');
         
-        // --- УМНАЯ ПРОВЕРКА GPS С ПЕСОЧНЫМИ ЧАСАМИ ---
+        // Фоновая проверка часов (⏳ -> GPS)
         orders.forEach(o => {
-            const btn = document.getElementById(`gps-btn-${o._key}`);
-            if (!btn) return;
-            
-            // Если ссылка есть и она уже проверена как рабочая
-            if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
-                btn.innerHTML = 'GPS';
-                btn.style.display = 'flex';
-            } 
-            // Если ссылка есть, но еще не проверена (и не помечена как сгоревшая)
-            else if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
-                btn.innerHTML = '⏳'; // Показываем часы
-                btn.style.display = 'flex';
-                
-                // Запускаем фоновую проверку на сервере
-                fetch(`/api/check_gps/${encodeURIComponent(o._key)}`)
-                    .then(res => res.json())
-                    .then(data => {
-                        if (data.valid === true) {
-                            btn.innerHTML = 'GPS'; // Меняем на GPS
-                        } else if (data.valid === false) {
-                            btn.style.display = 'none'; // Скрываем, если сгорела
-                        } else {
-                            btn.innerHTML = 'GPS'; // При ошибке сети/спутника разрешаем кликнуть
-                        }
-                    })
-                    .catch(() => {
-                        btn.style.display = 'none';
-                    });
+            if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false && !o.has_valid_gps) {
+                const safeId = encodeURIComponent(o._key);
+                const btn = document.getElementById(`gps-btn-${safeId}`);
+                if (btn) {
+                    fetch(`/api/check_gps/${encodeURIComponent(o._key)}`)
+                        .then(res => res.json())
+                        .then(data => {
+                            if (data.valid === true) {
+                                btn.innerHTML = 'GPS';
+                            } else if (data.valid === false) {
+                                btn.style.display = 'none';
+                            } else {
+                                btn.innerHTML = 'GPS';
+                            }
+                        })
+                        .catch(() => {
+                            btn.innerHTML = 'GPS';
+                        });
+                }
             }
         });
         
