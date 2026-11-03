@@ -87,7 +87,7 @@ DEFAULT_SETTINGS = {
     "show_in_transit": True,
     "show_delivered": True,
     "show_with_gps": False,
-    "show_planned": False,          # [FIX 8] — показывать «планируется» в UI
+    "show_planned": False,
 }
 
 if os.path.exists(SETTINGS_FILE):
@@ -171,7 +171,6 @@ def year_of(rec: dict, fallback: int = None) -> int:
     return dt.date.today().year
 
 
-# [FIX 1] Стабильный отпечаток строки — не зависит от row_index / порядка в df.
 def row_fingerprint(rec: dict) -> str:
     parts = [
         str(rec.get("address") or "").strip(),
@@ -188,7 +187,6 @@ def short_hash(s: str) -> str:
     return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
 
 
-# [FIX 1] Ключ = order_id__year; при повторе order_id+year — суффикс по отпечатку.
 def make_key(order_id: str, year: int, fp: str = None, service: bool = False) -> str:
     base = f"{order_id}__{year}"
     if fp is not None:
@@ -213,7 +211,7 @@ def load_db():
         with open(DB_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         DB = migrate_raw_db(raw)
-        remap_legacy_keys()      # [FIX 2]
+        remap_legacy_keys()
     else:
         DB = {}
     return DB
@@ -241,8 +239,6 @@ def migrate_raw_db(raw: dict) -> dict:
     return out
 
 
-# [FIX 2] Однократная миграция: убрать __rowN у не-служебных строк,
-# пересобрать ключ по отпечатку содержимого. Служебные строки тоже пересобираем.
 def remap_legacy_keys():
     global DB
     changed = False
@@ -284,7 +280,6 @@ def save_db():
         json.dump(DB, f, ensure_ascii=False, indent=2)
 
 
-# [FIX 6] Сохраняем GPS-статус, если ссылка не изменилась.
 def merge_into_db(new_records: list) -> dict:
     global DB
     now = dt.datetime.utcnow().isoformat(timespec="seconds")
@@ -293,7 +288,6 @@ def merge_into_db(new_records: list) -> dict:
         key = rec["_key"]
         if key in DB:
             old = DB[key]
-            # [FIX 6] GPS-статус не сбрасываем при неизменной ссылке
             if old.get("gps_link") == rec.get("gps_link"):
                 rec["has_valid_gps"] = old.get("has_valid_gps")
                 rec["gps_checked"] = old.get("gps_checked", False)
@@ -326,27 +320,33 @@ def merge_into_db(new_records: list) -> dict:
 # ============================================================
 # ПАРСИНГ EXCEL
 # ============================================================
-COLUMN_MAP = {
-    "Заказ": "order_id",
-    "Направление": "direction",
-    "Адрес доставки": "address",
+# [FIX EXCEL HEADERS] — карта соответствия нормализованных заголовков
+COLUMN_MAP_NORM = {
+    "заказ": "order_id",
+    "направление": "direction",
+    "адресдоставки": "address",
     "вес": "weight",
-    "Дата отгрузки (ФАКТ)": "ship_date",
-    "Дата прибытия": "plan_arrival",
-    "Перевозчик": "carrier",
-    "Машина": "vehicle",
-    "Водитель": "driver",
-    "Ставка": "rate",
-    "Срок транзита": "transit_days",
-    "Тип тс": "vehicle_type",
-    "Термологер": "thermologger",
-    "Примечания": "comment",
+    "датаотгрузкифакт": "ship_date",
+    "датаприбытия": "plan_arrival",
+    "перевозчик": "carrier",
+    "машина": "vehicle",
+    "водитель": "driver",
+    "ставка": "rate",
+    "сроктранзита": "transit_days",
+    "типтс": "vehicle_type",
+    "термологер": "thermologger",
+    "примечания": "comment",
     "ссылка": "gps_link",
-    "статус доставки": "status",
+    "статусдоставки": "status",
     "местоположение": "location_note",
 }
 
 REQUIRED_COLS = ["Заказ"]
+
+
+def norm_col_name(name: str) -> str:
+    """Удаляет все пробелы и приводит к нижнему регистру: 'ссылка ' -> 'ссылка'."""
+    return re.sub(r"\s+", "", str(name)).lower()
 
 
 def strip_filters(wb: openpyxl.Workbook):
@@ -393,7 +393,6 @@ def _safe_str(v):
     return s
 
 
-# [FIX 7] Реальные номера строк Excel (1-based) для каждой строки листа.
 def _real_excel_rows(contents: bytes, sheet_name: str) -> list:
     wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
     try:
@@ -425,14 +424,16 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
     wb.save(buf)
     buf.seek(0)
 
+    # Читаем датафрейм
     df = pd.read_excel(buf, sheet_name="Исх.логистика", header=0, dtype=str, keep_default_na=False)
-    df.columns = [str(c).strip() for c in df.columns]
-
-    missing = [c for c in REQUIRED_COLS if c not in df.columns]
+    
+    # [FIX EXCEL HEADERS] Создаем маппинг реальных колонок на нормализованные
+    real_cols = {norm_col_name(c): c for c in df.columns}
+    
+    missing = [c for c in REQUIRED_COLS if norm_col_name(c) not in real_cols]
     if missing:
         raise HTTPException(400, f"Не найдены колонки: {missing}. Есть: {list(df.columns)}")
 
-    # [FIX 7] реальные номера строк Excel — чтобы row_index не сдвигался
     real_rows = _real_excel_rows(contents, "Исх.логистика")
     data_rows_with_idx = [(r_idx, row) for r_idx, row in real_rows[1:]]
     real_iter = iter(data_rows_with_idx)
@@ -447,7 +448,8 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
     }
 
     for idx, row in df.iterrows():
-        raw_order = _safe_str(row.get("Заказ"))
+        # Берем значение по нормализованному имени
+        raw_order = _safe_str(row.get(real_cols.get("заказ")))
         if not raw_order:
             audit["skipped_empty"] += 1
             continue
@@ -464,13 +466,15 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
         rec = {"order_id": order_id, "is_service_row": service, "row_index": excel_row_idx}
         warnings = []
 
-        for excel_col, field in COLUMN_MAP.items():
-            if excel_col == "Заказ":
+        for norm_col, field in COLUMN_MAP_NORM.items():
+            if norm_col == "заказ":
                 continue
-            if excel_col not in df.columns:
+            real_col = real_cols.get(norm_col)
+            if not real_col:
                 rec[field] = None
                 continue
-            val = row.get(excel_col)
+                
+            val = row.get(real_col)
             if field == "weight":
                 fv = _safe_float(val)
                 rec[field] = fv
@@ -492,12 +496,13 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
             elif field == "rate":
                 rec[field] = _safe_float(val)
             elif field == "gps_link":
-                # [FIX 4] — только URL, текст переносим в comment
+                # [FIX] Ищем ссылку
                 s = _safe_str(val)
                 if s and not s.startswith("http"):
                     audit["gps_looks_like_text"].append({
                         "order_id": order_id, "row": excel_row_idx, "raw": s
                     })
+                    # Если в ссылке текст, переносим в примечание
                     if not rec.get("comment"):
                         rec["comment"] = s
                     s = None
@@ -505,7 +510,15 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
             else:
                 rec[field] = _safe_str(val)
 
-        # [FIX 3] arrival_date — только фактическая дата, plan_arrival не трогаем
+        # [FIX] Если gps_link пуст, но в местоположении есть URL, переносим оттуда
+        if not rec.get("gps_link") and rec.get("location_note"):
+            loc = str(rec["location_note"])
+            m = re.search(r'https?://\S+', loc, re.IGNORECASE)
+            if m:
+                rec["gps_link"] = m.group(0).strip()
+                rec["location_note"] = loc.replace(rec["gps_link"], "").strip() or None
+
+        # Вычисление фактической даты
         arrival_fact = None
         if norm_status(rec.get("status")) in DELIVERED:
             if "Дата выгрузки (ФАКТ)" in df.columns:
@@ -533,7 +546,7 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
 
         rec["year"] = year_of(rec, fallback=fallback_year)
         rec["_row_fp"] = row_fingerprint(rec)
-        rec["_key"] = make_key(order_id, rec["year"], service=service)  # [FIX 1]
+        rec["_key"] = make_key(order_id, rec["year"], service=service)
         rec["data_warnings"] = warnings
         rec["archived"] = False
 
@@ -544,7 +557,6 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
 
         records.append(rec)
 
-    # [FIX 1] дедупликация по стабильному отпечатку, а не по row_index
     seen: dict[str, int] = {}
     for r in records:
         base = r["_key"]
@@ -598,7 +610,6 @@ async def _register_webhook_once():
         print(f"✅ Вебхук зарегистрирован: {PUBLIC_URL}/webhook")
     except Exception as e:
         print(f"⚠️ Ошибка регистрации вебхука: {e}")
-        print("   Проверьте PUBLIC_URL и доступность HTTPS.")
 
 
 class Shipment(BaseModel):
@@ -906,7 +917,6 @@ async def list_shipments(
         if selected_year is not None and r.get("year") != selected_year:
             continue
         s = norm_status(r.get("status"))
-        # [FIX 8] — «планируется» показываем, если включён show_planned
         if s in HIDDEN_STATUSES and not SETTINGS.get("show_planned", False):
             continue
         if status == "in_transit" and s not in IN_TRANSIT:
@@ -1021,7 +1031,6 @@ async def admin_create(s: Shipment, user=Depends(check_admin)):
     base_key = make_key(rec["order_id"], rec["year"], service=service)
     rec["_key"] = base_key
     if rec["_key"] in DB:
-        # повтор order_id+year — стабильный суффикс по отпечатку
         rec["_key"] = make_key(rec["order_id"], rec["year"], fp=fp, service=service)
         if rec["_key"] in DB:
             rec["_key"] = f"{rec['_key']}#{int(dt.datetime.utcnow().timestamp())}"
@@ -1055,7 +1064,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         new_keys = {r["_key"] for r in records}
         stale = [r["_key"] for k, r in DB.items() if k not in new_keys and not r.get("archived")]
         audit["stale_in_db"] = stale
-        # [FIX 8] — сколько «планируется» скрыто в UI
         audit["hidden_planned"] = sum(
             1 for r in records if norm_status(r.get("status")) in HIDDEN_STATUSES
         )
@@ -1064,7 +1072,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
 
         last = [r["order_id"] for r in records[-5:]]
 
-        # [FIX 5] — выводим предупреждения в отчёт
         warn_parts = []
         if audit["weight_parse_failed"]:
             warn_parts.append(
@@ -1222,7 +1229,6 @@ async function loadTabs(){
     const s=await r.json();
     document.querySelectorAll('.tab').forEach(t=>{
         const st=t.dataset.status;
-        // planned показываем только если включено в настройках
         let vis = s['show_'+st]!==false;
         if(st==='planned') vis = !!s.show_planned;
         t.classList.toggle('visible', vis);
@@ -1279,7 +1285,6 @@ function renderCard(o) {
     else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
     else if(isPlanned) badge='<span class="order-status status-badge-planned">Планируется</span>';
 
-    // [FIX 3] — бейдж «нет факт. даты выгрузки»
     const noFact = (isDelivered && o.arrival_fact_missing)
         ? '<span class="warn-badge" title="Нет фактической даты выгрузки">нет факта</span>' : '';
 
