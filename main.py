@@ -288,18 +288,24 @@ def merge_into_db(new_records: list) -> dict:
         key = rec["_key"]
         if key in DB:
             old = DB[key]
-            if old.get("gps_link") == rec.get("gps_link"):
-                rec["has_valid_gps"] = old.get("has_valid_gps")
-                rec["gps_checked"] = old.get("gps_checked", False)
-                rec["current_lat"] = old.get("current_lat")
-                rec["current_lng"] = old.get("current_lng")
+            # Сначала копируем старые статусы GPS, чтобы не сбрасывать
+            rec["has_valid_gps"] = old.get("has_valid_gps")
+            rec["gps_checked"] = old.get("gps_checked", False)
+            rec["current_lat"] = old.get("current_lat")
+            rec["current_lng"] = old.get("current_lng")
 
             rec["history"] = old.get("history", []) + [{
                 "loaded_at": now,
                 "snapshot": {k: old.get(k) for k in old if k not in ("history",)},
             }]
             rec["first_seen_at"] = old.get("first_seen_at", now)
-            if {k: old.get(k) for k in old if k != "history"} == {k: rec.get(k) for k in rec if k != "history"}:
+            
+            # Сравниваем: если вообще ничего не изменилось, пишем unchanged
+            # Игнорируем служебные поля при сравнении
+            old_clean = {k: v for k, v in old.items() if k not in ("history", "updated_at", "first_seen_at")}
+            new_clean = {k: v for k, v in rec.items() if k not in ("history", "updated_at", "first_seen_at")}
+            
+            if old_clean == new_clean:
                 stats["unchanged"] += 1
             else:
                 stats["updated"] += 1
@@ -320,7 +326,6 @@ def merge_into_db(new_records: list) -> dict:
 # ============================================================
 # ПАРСИНГ EXCEL
 # ============================================================
-# [FIX EXCEL HEADERS] — карта соответствия нормализованных заголовков
 COLUMN_MAP_NORM = {
     "заказ": "order_id",
     "направление": "direction",
@@ -345,7 +350,6 @@ REQUIRED_COLS = ["Заказ"]
 
 
 def norm_col_name(name: str) -> str:
-    """Удаляет все пробелы и приводит к нижнему регистру: 'ссылка ' -> 'ссылка'."""
     return re.sub(r"\s+", "", str(name)).lower()
 
 
@@ -424,12 +428,9 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
     wb.save(buf)
     buf.seek(0)
 
-    # Читаем датафрейм
     df = pd.read_excel(buf, sheet_name="Исх.логистика", header=0, dtype=str, keep_default_na=False)
-    
-    # [FIX EXCEL HEADERS] Создаем маппинг реальных колонок на нормализованные
     real_cols = {norm_col_name(c): c for c in df.columns}
-    
+
     missing = [c for c in REQUIRED_COLS if norm_col_name(c) not in real_cols]
     if missing:
         raise HTTPException(400, f"Не найдены колонки: {missing}. Есть: {list(df.columns)}")
@@ -448,7 +449,6 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
     }
 
     for idx, row in df.iterrows():
-        # Берем значение по нормализованному имени
         raw_order = _safe_str(row.get(real_cols.get("заказ")))
         if not raw_order:
             audit["skipped_empty"] += 1
@@ -496,13 +496,11 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
             elif field == "rate":
                 rec[field] = _safe_float(val)
             elif field == "gps_link":
-                # [FIX] Ищем ссылку
                 s = _safe_str(val)
                 if s and not s.startswith("http"):
                     audit["gps_looks_like_text"].append({
                         "order_id": order_id, "row": excel_row_idx, "raw": s
                     })
-                    # Если в ссылке текст, переносим в примечание
                     if not rec.get("comment"):
                         rec["comment"] = s
                     s = None
@@ -510,7 +508,6 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
             else:
                 rec[field] = _safe_str(val)
 
-        # [FIX] Если gps_link пуст, но в местоположении есть URL, переносим оттуда
         if not rec.get("gps_link") and rec.get("location_note"):
             loc = str(rec["location_note"])
             m = re.search(r'https?://\S+', loc, re.IGNORECASE)
@@ -518,7 +515,9 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
                 rec["gps_link"] = m.group(0).strip()
                 rec["location_note"] = loc.replace(rec["gps_link"], "").strip() or None
 
-        # Вычисление фактической даты
+        if rec.get("gps_link"):
+            rec["gps_link"] = rec["gps_link"].strip()
+
         arrival_fact = None
         if norm_status(rec.get("status")) in DELIVERED:
             if "Дата выгрузки (ФАКТ)" in df.columns:
@@ -1289,7 +1288,10 @@ function renderCard(o) {
         ? '<span class="warn-badge" title="Нет фактической даты выгрузки">нет факта</span>' : '';
 
     let gpsIcon = '';
-    if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
+    // МЯГКАЯ ПРОВЕРКА: ищем baltgps в ссылке
+    const hasGpsLink = o.gps_link && typeof o.gps_link === 'string' && (o.gps_link.includes('baltgps') || o.gps_link.startsWith('http'));
+    
+    if (hasGpsLink && o.has_valid_gps !== false) {
         if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
             gpsIcon = `<span title="GPS доступен" style="margin-left:8px;font-size:16px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">🌍</span>`;
         } else {
@@ -1348,8 +1350,9 @@ async function loadOrders(force=false){
             return;
         }
 
-        const withLink = orders.filter(o => o.gps_link && o.gps_link.startsWith('http'));
-        const withoutLink = orders.filter(o => !o.gps_link || !o.gps_link.startsWith('http'));
+        // ДЕЛИМ НА ГРУППЫ С МЯГКОЙ ПРОВЕРКОЙ
+        const withLink = orders.filter(o => o.gps_link && typeof o.gps_link === 'string' && (o.gps_link.includes('baltgps') || o.gps_link.startsWith('http')));
+        const withoutLink = orders.filter(o => !o.gps_link || typeof o.gps_link !== 'string' || (!o.gps_link.includes('baltgps') && !o.gps_link.startsWith('http')));
 
         let html = '';
 
@@ -1444,7 +1447,7 @@ async function openOrder(o){
 
     if(o.current_lat&&o.current_lng){
         renderMap(o.current_lat,o.current_lng);
-    }else if(o.gps_link && o.gps_link.startsWith('http')){
+    }else if(o.gps_link && typeof o.gps_link === 'string' && o.gps_link.length > 5){
         loadCoords(o._key,o.gps_link);
     }else{
         document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует или ссылка недействительна.</div>';
