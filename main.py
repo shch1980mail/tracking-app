@@ -1088,7 +1088,7 @@ async function loadYears(){
     box.innerHTML=list.map(y=>`<button class="year-chip ${y===currentYear?'active':''}" data-year="${y}" onclick="setYear(${y})">${y}</button>`).join('');
 }
 
-// ФУНКЦИЯ РЕНДЕРА ОДНОЙ КАРТОЧКИ (чтобы не дублировать код)
+// ФУНКЦИЯ РЕНДЕРА ОДНОЙ КАРТОЧКИ
 function renderCard(o) {
     const st=(o.status||'').toLowerCase();
     const isDelivered=(st==='завершено'||st==='выгружено');
@@ -1164,19 +1164,33 @@ async function loadOrders(force=false){
 
         let html = '';
 
-        // Группа 1: Со ссылкой
+        // Группа 1: С треккингом
         if (withLink.length > 0) {
-            html += `<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 5px; font-weight: bold; font-size: 18px; color: var(--primary); border-bottom: 2px solid var(--primary); padding-bottom: 5px;">🔗 Ссылка на трекинг</div>`;
+            html += `<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 10px; display: flex; align-items: center; gap: 12px;">
+                <div style="background: var(--primary); color: white; padding: 6px 16px; border-radius: 20px; font-weight: 700; font-size: 14px; box-shadow: 0 2px 8px rgba(0,123,255,0.3);">
+                    🗺️ С треккингом (${withLink.length})
+                </div>
+                <div style="flex: 1; height: 2px; background: linear-gradient(90deg, var(--primary), transparent); border-radius: 2px;"></div>
+            </div>`;
             html += withLink.map(o => renderCard(o)).join('');
         }
 
-        // Группа 2: Без ссылки
+        // Группа 2: Без треккинга
         if (withoutLink.length > 0) {
-            // Черта-разделитель
+            // Красивый разделитель
             if (withLink.length > 0) {
-                html += `<div style="grid-column: 1 / -1; margin: 30px 0 10px 0; border-top: 2px dashed var(--border);"></div>`;
+                html += `<div style="grid-column: 1 / -1; margin: 30px 0 20px 0; display: flex; align-items: center; gap: 10px;">
+                    <div style="flex: 1; border-top: 2px dashed var(--border);"></div>
+                    <div style="color: var(--text-sec); font-size: 20px;">📦</div>
+                    <div style="flex: 1; border-top: 2px dashed var(--border);"></div>
+                </div>`;
             }
-            html += `<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 5px; font-weight: bold; font-size: 18px; color: var(--text-sec); border-bottom: 2px solid var(--border); padding-bottom: 5px;">📦 Без ссылки</div>`;
+            html += `<div style="grid-column: 1 / -1; margin-bottom: 10px; display: flex; align-items: center; gap: 12px;">
+                <div style="background: var(--text-sec); color: var(--card); padding: 6px 16px; border-radius: 20px; font-weight: 700; font-size: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+                    📦 Без треккинга (${withoutLink.length})
+                </div>
+                <div style="flex: 1; height: 2px; background: linear-gradient(90deg, var(--border), transparent); border-radius: 2px;"></div>
+            </div>`;
             html += withoutLink.map(o => renderCard(o)).join('');
         }
 
