@@ -406,7 +406,6 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
         rec["data_warnings"] = warnings
         rec["archived"] = False
         
-        # При загрузке сбрасываем проверку GPS
         rec["has_valid_gps"] = None
         rec["gps_checked"] = False
         rec["current_lat"] = None
@@ -1089,6 +1088,59 @@ async function loadYears(){
     box.innerHTML=list.map(y=>`<button class="year-chip ${y===currentYear?'active':''}" data-year="${y}" onclick="setYear(${y})">${y}</button>`).join('');
 }
 
+// ФУНКЦИЯ РЕНДЕРА ОДНОЙ КАРТОЧКИ (чтобы не дублировать код)
+function renderCard(o) {
+    const st=(o.status||'').toLowerCase();
+    const isDelivered=(st==='завершено'||st==='выгружено');
+    let badge='';
+    if(st==='в пути') badge='<span class="order-status in-transit">В пути</span>';
+    else if(st==='выгружено') badge='<span class="order-status status-badge-delivered">Выгружено</span>';
+    else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
+    
+    // ЛОГИКА ЗНАЧКА GPS
+    let gpsIcon = '';
+    if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
+        if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
+            gpsIcon = `<span title="GPS доступен" style="margin-left:8px;font-size:16px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">🌍</span>`;
+        } else {
+            gpsIcon = `<span class="gps-loading" data-key="${o._key}" title="Проверка GPS..." style="margin-left:8px;font-size:14px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</span>`;
+        }
+    }
+
+    const head = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>
+        <div style="display:flex;align-items:center;">
+            ${badge}
+            ${gpsIcon}
+        </div>
+    </div>`;
+    
+    if(isDelivered){
+        return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+        ${head}
+        <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
+        <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
+        <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
+        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);">
+            <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
+            <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
+        </div>
+        </div>`;
+    }
+    
+    const loc=o.comment?`<div class="loc-info">📝 ${o.comment}</div>`:'';
+    return `<div class="order-card" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+    ${head}
+    <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
+    <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
+    <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
+    <div class="order-row"><strong>Вес:</strong> ${o.weight?o.weight+' кг':'—'}</div>
+    <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
+    <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
+    ${loc}
+    </div>`;
+}
+
 async function loadOrders(force=false){
     const s=document.getElementById('searchInput').value.trim();
     const sort=document.getElementById('sortSelect').value;
@@ -1099,74 +1151,41 @@ async function loadOrders(force=false){
     
     try{
         const r=await fetch(url,{cache:force?'no-store':'default'});
-        const orders=await r.json();
+        let orders=await r.json();
+        
         if(!orders.length){
             grid.innerHTML='<div style="text-align:center;width:100%;">Нет заказов</div>';
             return;
         }
-        
-        // 1. РИСУЕМ КАРТОЧКИ
-        grid.innerHTML=orders.map(o=>{
-            const st=(o.status||'').toLowerCase();
-            const isDelivered=(st==='завершено'||st==='выгружено');
-            let badge='';
-            if(st==='в пути') badge='<span class="order-status in-transit">В пути</span>';
-            else if(st==='выгружено') badge='<span class="order-status status-badge-delivered">Выгружено</span>';
-            else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
-            
-            // ЛОГИКА ЗНАЧКА GPS
-            let gpsIcon = '';
-            if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
-                if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
-                    // Если уже проверено и работает
-                    gpsIcon = `<span title="GPS доступен" style="margin-left:8px;font-size:16px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">🌍</span>`;
-                } else {
-                    // Если ссылка есть, но еще не проверена - вешаем часы с классом для поиска
-                    gpsIcon = `<span class="gps-loading" data-key="${o._key}" title="Проверка GPS..." style="margin-left:8px;font-size:14px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</span>`;
-                }
-            }
 
-            const head = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                <span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>
-                <div style="display:flex;align-items:center;">
-                    ${badge}
-                    ${gpsIcon}
-                </div>
-            </div>`;
-            
-            if(isDelivered){
-                return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
-                ${head}
-                <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
-                <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
-                <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
-                <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);">
-                    <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
-                    <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
-                </div>
-                </div>`;
+        // РАЗДЕЛЯЕМ НА ДВЕ ГРУППЫ
+        const withLink = orders.filter(o => o.gps_link && o.gps_link.startsWith('http'));
+        const withoutLink = orders.filter(o => !o.gps_link || !o.gps_link.startsWith('http'));
+
+        let html = '';
+
+        // Группа 1: Со ссылкой
+        if (withLink.length > 0) {
+            html += `<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 5px; font-weight: bold; font-size: 18px; color: var(--primary); border-bottom: 2px solid var(--primary); padding-bottom: 5px;">🔗 Ссылка на трекинг</div>`;
+            html += withLink.map(o => renderCard(o)).join('');
+        }
+
+        // Группа 2: Без ссылки
+        if (withoutLink.length > 0) {
+            // Черта-разделитель
+            if (withLink.length > 0) {
+                html += `<div style="grid-column: 1 / -1; margin: 30px 0 10px 0; border-top: 2px dashed var(--border);"></div>`;
             }
-            
-            const loc=o.comment?`<div class="loc-info">📝 ${o.comment}</div>`:'';
-            return `<div class="order-card" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
-            ${head}
-            <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
-            <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
-            <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
-            <div class="order-row"><strong>Вес:</strong> ${o.weight?o.weight+' кг':'—'}</div>
-            <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
-            <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
-            ${loc}
-            </div>`;
-        }).join('');
-        
-        // 2. ФОНОВАЯ ПРОВЕРКА (ЧАСЫ -> ЗЕМЛЯ)
-        // Ищем все элементы, где сейчас висят часы
-        const loadingIcons = document.querySelectorAll('.gps-loading');
-        loadingIcons.forEach(icon => {
+            html += `<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 5px; font-weight: bold; font-size: 18px; color: var(--text-sec); border-bottom: 2px solid var(--border); padding-bottom: 5px;">📦 Без ссылки</div>`;
+            html += withoutLink.map(o => renderCard(o)).join('');
+        }
+
+        grid.innerHTML = html;
+
+        // ЗАПУСК ПРОВЕРКИ ЧАСОВ
+        document.querySelectorAll('.gps-loading').forEach(icon => {
             const key = icon.getAttribute('data-key');
             if (!key) return;
-
             fetch(`/api/check_gps/${encodeURIComponent(key)}`)
                 .then(res => res.json())
                 .then(data => {
@@ -1174,14 +1193,12 @@ async function loadOrders(force=false){
                         icon.innerHTML = '🌍';
                         icon.title = 'GPS доступен';
                     } else if (data.valid === false) {
-                        icon.style.display = 'none'; // Если сгорела
+                        icon.style.display = 'none';
                     } else {
-                        icon.innerHTML = '🌍'; // При ошибке сервера всё равно разрешаем клик
+                        icon.innerHTML = '🌍';
                     }
                 })
-                .catch(() => {
-                    icon.style.display = 'none'; // При сбое сети скрываем
-                });
+                .catch(() => { icon.style.display = 'none'; });
         });
         
     }catch(e){
