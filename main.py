@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from typing import Optional
 from contextlib import asynccontextmanager
-import os, json, re, requests, asyncio, io, datetime as dt
+import os, json, re, requests, asyncio, io, datetime as dt, hashlib
 import pandas as pd
 import openpyxl
 
@@ -83,15 +83,23 @@ ADMIN_USER = os.environ.get("ADMIN_USER", "admin")
 ADMIN_PASS = os.environ.get("ADMIN_PASS", "admin123")
 
 SETTINGS_FILE = "settings.json"
-DEFAULT_SETTINGS = {"show_in_transit": True, "show_delivered": True, "show_with_gps": False}
+DEFAULT_SETTINGS = {
+    "show_in_transit": True,
+    "show_delivered": True,
+    "show_with_gps": False,
+    "show_planned": False,          # [FIX 8] — показывать «планируется» в UI
+}
 
 if os.path.exists(SETTINGS_FILE):
     with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
         SETTINGS = json.load(f)
+    for k, v in DEFAULT_SETTINGS.items():
+        SETTINGS.setdefault(k, v)
 else:
     SETTINGS = DEFAULT_SETTINGS.copy()
-    with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
-        json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
+
+with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+    json.dump(SETTINGS, f, ensure_ascii=False, indent=2)
 
 
 def save_settings():
@@ -163,10 +171,28 @@ def year_of(rec: dict, fallback: int = None) -> int:
     return dt.date.today().year
 
 
-def make_key(order_id: str, year: int, row_index: int = None, service: bool = False) -> str:
+# [FIX 1] Стабильный отпечаток строки — не зависит от row_index / порядка в df.
+def row_fingerprint(rec: dict) -> str:
+    parts = [
+        str(rec.get("address") or "").strip(),
+        str(rec.get("ship_date") or "").strip(),
+        str(rec.get("plan_arrival") or "").strip(),
+        str(rec.get("carrier") or "").strip(),
+        str(rec.get("vehicle") or "").strip(),
+        str(rec.get("weight") or "").strip(),
+    ]
+    return "|".join(parts)
+
+
+def short_hash(s: str) -> str:
+    return hashlib.md5(s.encode("utf-8")).hexdigest()[:8]
+
+
+# [FIX 1] Ключ = order_id__year; при повторе order_id+year — суффикс по отпечатку.
+def make_key(order_id: str, year: int, fp: str = None, service: bool = False) -> str:
     base = f"{order_id}__{year}"
-    if service and row_index is not None:
-        return f"{base}__row{row_index}"
+    if fp is not None:
+        return f"{base}__{short_hash(fp)}"
     return base
 
 
@@ -176,6 +202,8 @@ def is_service_id(order_id: str) -> bool:
 
 
 def is_hidden_status(rec: dict) -> bool:
+    if SETTINGS.get("show_planned", False):
+        return False
     return norm_status(rec.get("status")) in HIDDEN_STATUSES
 
 
@@ -185,6 +213,7 @@ def load_db():
         with open(DB_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         DB = migrate_raw_db(raw)
+        remap_legacy_keys()      # [FIX 2]
     else:
         DB = {}
     return DB
@@ -212,19 +241,65 @@ def migrate_raw_db(raw: dict) -> dict:
     return out
 
 
+# [FIX 2] Однократная миграция: убрать __rowN у не-служебных строк,
+# пересобрать ключ по отпечатку содержимого. Служебные строки тоже пересобираем.
+def remap_legacy_keys():
+    global DB
+    changed = False
+    new_db = {}
+    for key, rec in DB.items():
+        fp = row_fingerprint(rec)
+        service = rec.get("is_service_row", False)
+        is_legacy_row = bool(re.search(r"__row\d+$", key))
+
+        order_id = rec.get("order_id") or key.split("__")[0]
+        year = rec.get("year") or year_of(rec)
+        base_key = f"{order_id}__{year}"
+
+        if key == base_key and not service and not is_legacy_row:
+            new_db[key] = rec
+            continue
+
+        if is_legacy_row or service:
+            new_key = make_key(order_id, year, fp=fp, service=service)
+            if new_key in new_db:
+                i = 2
+                while f"{new_key}#{i}" in new_db:
+                    i += 1
+                new_key = f"{new_key}#{i}"
+            rec["_key"] = new_key
+            new_db[new_key] = rec
+            if new_key != key:
+                changed = True
+        else:
+            new_db[key] = rec
+
+    if changed:
+        DB = new_db
+        save_db()
+
+
 def save_db():
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
 
 
+# [FIX 6] Сохраняем GPS-статус, если ссылка не изменилась.
 def merge_into_db(new_records: list) -> dict:
     global DB
     now = dt.datetime.utcnow().isoformat(timespec="seconds")
-    stats = {"added": 0, "updated": 0, "unchanged": 0}
+    stats = {"added": 0, "updated": 0, "unchanged": 0, "duplicates": 0}
     for rec in new_records:
         key = rec["_key"]
         if key in DB:
             old = DB[key]
+            # [FIX 6] GPS-статус не сбрасываем при неизменной ссылке
+            if old.get("gps_link") == rec.get("gps_link"):
+                rec["has_valid_gps"] = old.get("has_valid_gps")
+                rec["gps_checked"] = old.get("gps_checked", False)
+                rec["current_lat"] = old.get("current_lat")
+                rec["current_lng"] = old.get("current_lng")
+
             rec["history"] = old.get("history", []) + [{
                 "loaded_at": now,
                 "snapshot": {k: old.get(k) for k in old if k not in ("history",)},
@@ -318,6 +393,28 @@ def _safe_str(v):
     return s
 
 
+# [FIX 7] Реальные номера строк Excel (1-based) для каждой строки листа.
+def _real_excel_rows(contents: bytes, sheet_name: str) -> list:
+    wb = openpyxl.load_workbook(io.BytesIO(contents), read_only=True, data_only=True)
+    try:
+        ws = wb[sheet_name]
+        header_row = None
+        rows = []
+        for r_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
+            if header_row is None:
+                if row and any((str(c).strip() if c is not None else "") == "Заказ" for c in row):
+                    header_row = r_idx
+                    rows.append((r_idx, list(row)))
+                continue
+            rows.append((r_idx, list(row)))
+        return rows
+    finally:
+        try:
+            wb.close()
+        except Exception:
+            pass
+
+
 def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[list, dict]:
     wb = openpyxl.load_workbook(io.BytesIO(contents))
     if "Исх.логистика" not in wb.sheetnames:
@@ -335,11 +432,18 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
     if missing:
         raise HTTPException(400, f"Не найдены колонки: {missing}. Есть: {list(df.columns)}")
 
+    # [FIX 7] реальные номера строк Excel — чтобы row_index не сдвигался
+    real_rows = _real_excel_rows(contents, "Исх.логистика")
+    data_rows_with_idx = [(r_idx, row) for r_idx, row in real_rows[1:]]
+    real_iter = iter(data_rows_with_idx)
+
     records = []
     audit = {
         "missing_in_db": [], "stale_in_db": [], "duplicates": {}, "misaligned": [],
         "nonstandard_ids": [], "skipped_empty": 0, "weight_parse_failed": [],
         "date_parse_failed": [], "gps_looks_like_text": [],
+        "arrival_fact_missing": [], "hidden_planned": 0,
+        "legacy_dup_remapped": [],
     }
 
     for idx, row in df.iterrows():
@@ -352,7 +456,12 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
         if service:
             audit["nonstandard_ids"].append(order_id)
 
-        rec = {"order_id": order_id, "is_service_row": service, "row_index": int(idx) + 2}
+        try:
+            excel_row_idx, _ = next(real_iter)
+        except StopIteration:
+            excel_row_idx = int(idx) + 2
+
+        rec = {"order_id": order_id, "is_service_row": service, "row_index": excel_row_idx}
         warnings = []
 
         for excel_col, field in COLUMN_MAP.items():
@@ -367,62 +476,89 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
                 rec[field] = fv
                 if fv is None and _safe_str(val):
                     warnings.append("weight_parse_failed")
-                    audit["weight_parse_failed"].append({"order_id": order_id, "row": rec["row_index"], "raw": str(val)})
+                    audit["weight_parse_failed"].append({
+                        "order_id": order_id, "row": excel_row_idx, "raw": str(val)
+                    })
             elif field in ("ship_date", "plan_arrival"):
                 dv = parse_iso_date(val)
                 rec[field] = dv
                 if dv is None and _safe_str(val):
                     warnings.append(f"{field}_parse_failed")
-                    audit["date_parse_failed"].append({"order_id": order_id, "row": rec["row_index"], "field": field, "raw": str(val)})
+                    audit["date_parse_failed"].append({
+                        "order_id": order_id, "row": excel_row_idx, "field": field, "raw": str(val)
+                    })
             elif field == "status":
                 rec["status"] = norm_status(_safe_str(val) or "")
             elif field == "rate":
                 rec[field] = _safe_float(val)
             elif field == "gps_link":
+                # [FIX 4] — только URL, текст переносим в comment
                 s = _safe_str(val)
-                rec[field] = s
                 if s and not s.startswith("http"):
-                    audit["gps_looks_like_text"].append({"order_id": order_id, "row": rec["row_index"], "raw": s})
+                    audit["gps_looks_like_text"].append({
+                        "order_id": order_id, "row": excel_row_idx, "raw": s
+                    })
+                    if not rec.get("comment"):
+                        rec["comment"] = s
+                    s = None
+                rec[field] = s
             else:
                 rec[field] = _safe_str(val)
 
+        # [FIX 3] arrival_date — только фактическая дата, plan_arrival не трогаем
         arrival_fact = None
         if norm_status(rec.get("status")) in DELIVERED:
-            if rec.get("plan_arrival"):
-                arrival_fact = rec["plan_arrival"]
-            else:
+            if "Дата выгрузки (ФАКТ)" in df.columns:
+                arrival_fact = parse_iso_date(row.get("Дата выгрузки (ФАКТ)"))
+            if not arrival_fact:
                 blob = " ".join(str(rec.get(k) or "") for k in ("comment", "location_note"))
-                m = re.search(r"\b(\d{2})[./](\d{2})[./](\d{2,4})\b", blob)
+                m = re.search(
+                    r"(?:выгруж\w*|прибыл\w*|на выгрузке)\D{0,20}"
+                    r"(\d{2})[./](\d{2})[./](\d{2,4})",
+                    blob, re.IGNORECASE,
+                )
                 if m:
                     d, mo, y = m.group(1), m.group(2), m.group(3)
                     if len(y) == 2:
                         y = "20" + y
                     arrival_fact = f"{y}-{mo}-{d}"
         rec["arrival_date"] = arrival_fact
-        rec["arrival_fact_missing"] = bool(norm_status(rec.get("status")) in DELIVERED and not arrival_fact)
+        rec["arrival_fact_missing"] = bool(
+            norm_status(rec.get("status")) in DELIVERED and not arrival_fact
+        )
+        if rec["arrival_fact_missing"]:
+            audit["arrival_fact_missing"].append({
+                "order_id": order_id, "row": excel_row_idx
+            })
 
         rec["year"] = year_of(rec, fallback=fallback_year)
-        rec["_key"] = make_key(order_id, rec["year"], row_index=rec["row_index"], service=service)
+        rec["_row_fp"] = row_fingerprint(rec)
+        rec["_key"] = make_key(order_id, rec["year"], service=service)  # [FIX 1]
         rec["data_warnings"] = warnings
         rec["archived"] = False
-        
+
         rec["has_valid_gps"] = None
         rec["gps_checked"] = False
         rec["current_lat"] = None
         rec["current_lng"] = None
-        
+
         records.append(rec)
 
-    keys = [r["_key"] for r in records]
-    for k in set(keys):
-        if keys.count(k) > 1:
-            audit["duplicates"][k] = keys.count(k)
-
-    seen = set()
+    # [FIX 1] дедупликация по стабильному отпечатку, а не по row_index
+    seen: dict[str, int] = {}
     for r in records:
-        if r["_key"] in seen:
-            r["_key"] = f"{r['_key']}__row{r['row_index']}"
-        seen.add(r["_key"])
+        base = r["_key"]
+        if base in seen:
+            order_id = r["order_id"]
+            year = r["year"]
+            r["_key"] = make_key(order_id, year, fp=r["_row_fp"], service=r["is_service_row"])
+            if r["_key"] in seen:
+                audit["duplicates"][r["_key"]] = audit["duplicates"].get(r["_key"], 1) + 1
+                r["data_warnings"].append("duplicate_order_id_year")
+            else:
+                seen[r["_key"]] = 1
+        else:
+            seen[base] = 1
 
     return records, audit
 
@@ -543,11 +679,17 @@ async def update_all_coords():
         if rec.get("has_valid_gps") is False:
             rec["current_lat"] = None
             rec["current_lng"] = None
-    tasks = [fetch_single_order_coords(r) for r in DB.values() if r.get("gps_link") and "baltgps" in r["gps_link"] and not r.get("gps_checked")]
+    tasks = [
+        fetch_single_order_coords(r)
+        for r in DB.values()
+        if r.get("gps_link") and "baltgps" in r["gps_link"] and not r.get("gps_checked")
+    ]
     sem = asyncio.Semaphore(10)
+
     async def _limited(coro):
         async with sem:
             await coro
+
     await asyncio.gather(*(_limited(t) for t in tasks))
     save_db()
 
@@ -722,6 +864,7 @@ def public_view(r: dict) -> dict:
         "gps_checked": r.get("gps_checked", False),
         "archived": r.get("archived", False),
         "is_service_row": r.get("is_service_row", False),
+        "data_warnings": r.get("data_warnings", []),
     }
 
 
@@ -763,13 +906,16 @@ async def list_shipments(
         if selected_year is not None and r.get("year") != selected_year:
             continue
         s = norm_status(r.get("status"))
-        if s in HIDDEN_STATUSES:
+        # [FIX 8] — «планируется» показываем, если включён show_planned
+        if s in HIDDEN_STATUSES and not SETTINGS.get("show_planned", False):
             continue
         if status == "in_transit" and s not in IN_TRANSIT:
             continue
         if status == "delivered" and s not in DELIVERED:
             continue
         if status == "with_gps" and not r.get("current_lat"):
+            continue
+        if status == "planned" and s not in HIDDEN_STATUSES:
             continue
         if search:
             q = search.lower()
@@ -824,7 +970,7 @@ async def get_online_coords(key: str):
             raise HTTPException(400, "Ссылка на GPS устарела")
         if status == "error":
             raise HTTPException(503, "Спутник не отвечает")
-            
+
     if r.get("current_lat"):
         return {"lat": r["current_lat"], "lng": r["current_lng"]}
     raise HTTPException(404, "GPS недоступен")
@@ -837,19 +983,19 @@ async def check_gps_link(key: str):
     r = DB[key]
     if not r.get("gps_link"):
         return {"valid": False}
-        
+
     if r.get("gps_checked"):
         return {"valid": r.get("has_valid_gps")}
-        
+
     loop = asyncio.get_event_loop()
     lat, lng, status = await loop.run_in_executor(None, get_coords_from_baltgps, r["gps_link"])
-    
+
     if lat and lng:
         r["current_lat"], r["current_lng"], r["has_valid_gps"] = lat, lng, True
         r["gps_checked"] = True
         save_db()
         return {"valid": True}
-    elif status == "invalid_token" or status == "no_units":
+    elif status in ("invalid_token", "no_units"):
         r["has_valid_gps"] = False
         r["gps_checked"] = True
         save_db()
@@ -870,9 +1016,15 @@ async def admin_create(s: Shipment, user=Depends(check_admin)):
     rec["year"] = year_of(rec, fallback=dt.date.today().year)
     service = is_service_id(rec["order_id"])
     rec["is_service_row"] = service
-    rec["_key"] = make_key(rec["order_id"], rec["year"], service=service)
+    fp = row_fingerprint(rec)
+    rec["_row_fp"] = fp
+    base_key = make_key(rec["order_id"], rec["year"], service=service)
+    rec["_key"] = base_key
     if rec["_key"] in DB:
-        rec["_key"] = f"{rec['_key']}#{int(dt.datetime.utcnow().timestamp())}"
+        # повтор order_id+year — стабильный суффикс по отпечатку
+        rec["_key"] = make_key(rec["order_id"], rec["year"], fp=fp, service=service)
+        if rec["_key"] in DB:
+            rec["_key"] = f"{rec['_key']}#{int(dt.datetime.utcnow().timestamp())}"
     rec["has_valid_gps"] = None
     rec["gps_checked"] = False
     merge_into_db([rec])
@@ -903,19 +1055,45 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         new_keys = {r["_key"] for r in records}
         stale = [r["_key"] for k, r in DB.items() if k not in new_keys and not r.get("archived")]
         audit["stale_in_db"] = stale
+        # [FIX 8] — сколько «планируется» скрыто в UI
+        audit["hidden_planned"] = sum(
+            1 for r in records if norm_status(r.get("status")) in HIDDEN_STATUSES
+        )
         with open(audit_path, "w", encoding="utf-8") as f:
             json.dump(audit, f, ensure_ascii=False, indent=2)
 
         last = [r["order_id"] for r in records[-5:]]
-        return {
-            "ok": True,
-            "message": (
-                f"Загружено {len(records)} строк (добавлено {stats['added']}, обновлено {stats['updated']}, "
-                f"без изменений {stats['unchanged']}). Пропущено пустых: {audit['skipped_empty']}. "
-                f"Дублей в файле: {len(audit['duplicates'])}. Осиротевших в БД: {len(stale)}. "
-                f"Последние: {', '.join(last)}. Аудит: {audit_path}"
-            ),
-        }
+
+        # [FIX 5] — выводим предупреждения в отчёт
+        warn_parts = []
+        if audit["weight_parse_failed"]:
+            warn_parts.append(
+                f"⚠️ вес не распознан: {len(audit['weight_parse_failed'])} "
+                f"({', '.join(x['order_id'] for x in audit['weight_parse_failed'][:3])}...)"
+            )
+        if audit["gps_looks_like_text"]:
+            warn_parts.append(f"⚠️ gps_link не URL: {len(audit['gps_looks_like_text'])}")
+        if audit["duplicates"]:
+            warn_parts.append(f"⚠️ дубли order_id+year: {len(audit['duplicates'])}")
+        if audit["date_parse_failed"]:
+            warn_parts.append(f"⚠️ даты не распознаны: {len(audit['date_parse_failed'])}")
+        if audit["arrival_fact_missing"]:
+            warn_parts.append(f"⚠️ нет факт. даты выгрузки: {len(audit['arrival_fact_missing'])}")
+        if audit["hidden_planned"]:
+            warn_parts.append(f"⚠️ скрыто в UI (планируется): {audit['hidden_planned']}")
+
+        message = (
+            f"Загружено {len(records)} строк (добавлено {stats['added']}, "
+            f"обновлено {stats['updated']}, без изменений {stats['unchanged']}). "
+            f"Пропущено пустых: {audit['skipped_empty']}. "
+            f"Дублей в файле: {len(audit['duplicates'])}. "
+            f"Осиротевших в БД: {len(stale)}. "
+            f"Последние: {', '.join(last)}. Аудит: {audit_path}"
+        )
+        if warn_parts:
+            message += "\n" + " | ".join(warn_parts)
+
+        return {"ok": True, "message": message}
     except HTTPException:
         raise
     except Exception as e:
@@ -964,8 +1142,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .year-chip.active { background:var(--primary); color:#fff; border-color:var(--primary); }
     .container { max-width:1100px; margin:0 auto; }
     .orders-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px; }
-    
-    /* Карточки */
+
     .order-card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); cursor:pointer; border-left:4px solid var(--primary); transition:.2s; color:var(--text); position:relative; }
     .order-card:hover { transform:translateY(-2px); }
     .order-card.delivered { border-left-color:var(--success); padding:14px 16px; }
@@ -973,17 +1150,18 @@ INDEX_HTML = r"""<!DOCTYPE html>
     .order-card.delivered .order-id { font-size:15px; }
     .order-card.delivered .loc-info { display:none; }
     .order-card.delivered .order-row strong { min-width:96px; }
-    
+
     .order-id { color:var(--primary); font-weight:700; font-size:16px; }
     .order-row { font-size:13px; margin:6px 0; color:var(--text-sec); }
     .order-row strong { color:var(--text); min-width:90px; display:inline-block; }
     .loc-info { margin-top:10px; padding:8px; background:rgba(0,123,255,.08); border-radius:6px; font-size:13px; color:var(--primary); }
-    
-    /* Бейджи статусов */
+
     .order-status { padding:4px 10px; border-radius:12px; font-size:11px; font-weight:700; }
     .in-transit { background:#d4edda; color:#155724; }
     .status-badge-delivered { background:#d1ecf1; color:#0c5460; }
-    
+    .status-badge-planned { background:#fff3cd; color:#856404; }
+    .warn-badge { background:#f8d7da; color:#721c24; padding:2px 8px; border-radius:8px; font-size:10px; margin-left:6px; }
+
     #modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; padding:20px; overflow-y:auto; }
     #modal.open { display:block; }
     .modal-content { background:var(--card); max-width:900px; margin:40px auto; border-radius:16px; padding:28px; position:relative; }
@@ -992,24 +1170,22 @@ INDEX_HTML = r"""<!DOCTYPE html>
     [data-theme="dark"] #map { background:#1a1a1a; }
     .modal-info { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:20px; }
     .modal-info strong { display:block; color:var(--text-sec); font-size:12px; text-transform:uppercase; }
-    
-    /* Кастомный логотип в качестве спиннера загрузки карты */
-    .custom-spinner { 
-        width: 50px; 
-        height: 50px; 
+
+    .custom-spinner {
+        width: 50px;
+        height: 50px;
         margin-bottom: 15px;
-        animation: spin 2s linear infinite; 
+        animation: spin 2s linear infinite;
     }
-    @keyframes spin { 
-        0% { transform: rotate(0deg); } 
-        100% { transform: rotate(360deg); } 
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
     }
-    
+
     .btn-reload { padding:10px 20px; background:var(--primary); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold; text-decoration:none; display:inline-block; }
 </style>
 </head>
 <body>
-<!-- Обновленная шапка с логотипом -->
 <div class="header">
     <div style="display:flex; align-items:center; gap:10px;">
         <img src="/static/logo-2.png" alt="Логотип" style="height:36px; width:auto;">
@@ -1031,6 +1207,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <button class="tab" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути</button>
     <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Прибывшие</button>
     <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 С GPS</button>
+    <button class="tab" data-status="planned" onclick="setTab('planned')">📋 Планируется</button>
 </div>
 <div class="years" id="yearsContainer" style="display:none;"></div>
 <div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
@@ -1045,7 +1222,10 @@ async function loadTabs(){
     const s=await r.json();
     document.querySelectorAll('.tab').forEach(t=>{
         const st=t.dataset.status;
-        t.classList.toggle('visible', s['show_'+st]!==false);
+        // planned показываем только если включено в настройках
+        let vis = s['show_'+st]!==false;
+        if(st==='planned') vis = !!s.show_planned;
+        t.classList.toggle('visible', vis);
     });
     const firstVisible = document.querySelector('.tab.visible');
     if (firstVisible) setTab(firstVisible.dataset.status);
@@ -1054,10 +1234,11 @@ async function loadTabs(){
 function setTab(s){
     currentTab=s;
     document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
-    document.querySelector(`.tab[data-status="${s}"]`).classList.add('active');
-    
+    const btn = document.querySelector(`.tab[data-status="${s}"]`);
+    if(btn) btn.classList.add('active');
+
     const yearsBox = document.getElementById('yearsContainer');
-    if (s === 'delivered') {
+    if (s === 'delivered' || s === 'planned') {
         yearsBox.style.display = 'flex';
         if (!currentYear) currentYear = new Date().getFullYear();
     } else {
@@ -1088,16 +1269,20 @@ async function loadYears(){
     box.innerHTML=list.map(y=>`<button class="year-chip ${y===currentYear?'active':''}" data-year="${y}" onclick="setYear(${y})">${y}</button>`).join('');
 }
 
-// ФУНКЦИЯ РЕНДЕРА ОДНОЙ КАРТОЧКИ
 function renderCard(o) {
     const st=(o.status||'').toLowerCase();
     const isDelivered=(st==='завершено'||st==='выгружено');
+    const isPlanned=(st==='планируется');
     let badge='';
     if(st==='в пути') badge='<span class="order-status in-transit">В пути</span>';
     else if(st==='выгружено') badge='<span class="order-status status-badge-delivered">Выгружено</span>';
     else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
-    
-    // ЛОГИКА ЗНАЧКА GPS
+    else if(isPlanned) badge='<span class="order-status status-badge-planned">Планируется</span>';
+
+    // [FIX 3] — бейдж «нет факт. даты выгрузки»
+    const noFact = (isDelivered && o.arrival_fact_missing)
+        ? '<span class="warn-badge" title="Нет фактической даты выгрузки">нет факта</span>' : '';
+
     let gpsIcon = '';
     if (o.gps_link && o.gps_link.startsWith('http') && o.has_valid_gps !== false) {
         if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
@@ -1110,11 +1295,10 @@ function renderCard(o) {
     const head = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
         <span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>
         <div style="display:flex;align-items:center;">
-            ${badge}
-            ${gpsIcon}
+            ${badge}${noFact}${gpsIcon}
         </div>
     </div>`;
-    
+
     if(isDelivered){
         return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
         ${head}
@@ -1123,11 +1307,12 @@ function renderCard(o) {
         <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
         <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);">
             <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
-            <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||o.plan_arrival||'—'}</div>
+            <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
+            <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||'нет данных'}</div>
         </div>
         </div>`;
     }
-    
+
     const loc=o.comment?`<div class="loc-info">📝 ${o.comment}</div>`:'';
     return `<div class="order-card" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
     ${head}
@@ -1148,23 +1333,21 @@ async function loadOrders(force=false){
     grid.innerHTML='<div style="text-align:center;width:100%;">Загрузка...</div>';
     const cp=force?`&force_refresh=true&_t=${Date.now()}`:'';
     const url=`/api/shipments?status=${currentTab}&sort_by=${sort}&year=${currentYear}${s?'&search='+encodeURIComponent(s):''}${cp}`;
-    
+
     try{
         const r=await fetch(url,{cache:force?'no-store':'default'});
         let orders=await r.json();
-        
+
         if(!orders.length){
             grid.innerHTML='<div style="text-align:center;width:100%;">Нет заказов</div>';
             return;
         }
 
-        // РАЗДЕЛЯЕМ НА ДВЕ ГРУППЫ
         const withLink = orders.filter(o => o.gps_link && o.gps_link.startsWith('http'));
         const withoutLink = orders.filter(o => !o.gps_link || !o.gps_link.startsWith('http'));
 
         let html = '';
 
-        // Группа 1: С треккингом
         if (withLink.length > 0) {
             html += `<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 10px; display: flex; align-items: center; gap: 12px;">
                 <div style="background: var(--primary); color: white; padding: 6px 16px; border-radius: 20px; font-weight: 700; font-size: 14px; box-shadow: 0 2px 8px rgba(0,123,255,0.3);">
@@ -1175,9 +1358,7 @@ async function loadOrders(force=false){
             html += withLink.map(o => renderCard(o)).join('');
         }
 
-        // Группа 2: Без треккинга
         if (withoutLink.length > 0) {
-            // Красивый разделитель
             if (withLink.length > 0) {
                 html += `<div style="grid-column: 1 / -1; margin: 30px 0 20px 0; display: flex; align-items: center; gap: 10px;">
                     <div style="flex: 1; border-top: 2px dashed var(--border);"></div>
@@ -1196,7 +1377,6 @@ async function loadOrders(force=false){
 
         grid.innerHTML = html;
 
-        // ЗАПУСК ПРОВЕРКИ ЧАСОВ
         document.querySelectorAll('.gps-loading').forEach(icon => {
             const key = icon.getAttribute('data-key');
             if (!key) return;
@@ -1214,7 +1394,7 @@ async function loadOrders(force=false){
                 })
                 .catch(() => { icon.style.display = 'none'; });
         });
-        
+
     }catch(e){
         grid.innerHTML='<div style="text-align:center;width:100%;color:red;">Ошибка загрузки</div>';
     }
@@ -1234,11 +1414,14 @@ async function openOrder(o){
     document.getElementById('modal').classList.add('open');
     const st=(o.status||'').toLowerCase();
     const isDelivered=(st==='завершено'||st==='выгружено');
-    
+
     const dates=isDelivered
-        ?`<div><strong>Дата отправки</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div><div><strong>Дата выгрузки</strong>${o.arrival_date||'нет данных'}</div>`
+        ?`<div><strong>Дата отправки</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div><div><strong>Дата выгрузки (факт)</strong>${o.arrival_date||'нет данных'}</div>`
         :`<div><strong>Дата отправки</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div>`;
-    
+
+    const warnings = (o.data_warnings && o.data_warnings.length)
+        ? `<div style="margin-top:12px;padding:8px;background:#fff3cd;color:#856404;border-radius:6px;font-size:12px;">⚠️ ${o.data_warnings.join(', ')}</div>` : '';
+
     document.getElementById('modalContent').innerHTML=`<h2>📦 ${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></h2>
     <div class="modal-info">
         <div><strong>Адрес</strong>${o.address||'—'}</div>
@@ -1250,12 +1433,13 @@ async function openOrder(o){
         ${dates}
     </div>
     ${o.comment?`<div style="margin-top:20px;padding:12px;background:rgba(0,0,0,.05);border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>`:''}
-    
+    ${warnings}
+
     <div id="map"><img src="/static/logo-2.png" class="custom-spinner" alt="Загрузка..."><div>Загрузка координат...</div></div>`;
-    
+
     if(o.current_lat&&o.current_lng){
         renderMap(o.current_lat,o.current_lng);
-    }else if(o.gps_link){
+    }else if(o.gps_link && o.gps_link.startsWith('http')){
         loadCoords(o._key,o.gps_link);
     }else{
         document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует или ссылка недействительна.</div>';
@@ -1310,7 +1494,7 @@ body{font-family:Arial;padding:20px;background:#f0f2f5;margin:0}
 .panel{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);margin-bottom:20px}
 .panel h3{margin-top:0}
 .upload-box{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-.settings-grid{display:flex;gap:20px;margin-top:10px}
+.settings-grid{display:flex;gap:20px;margin-top:10px;flex-wrap:wrap}
 .settings-grid label{display:flex;align-items:center;gap:6px;cursor:pointer}
 table{border-collapse:collapse;width:100%;background:#fff;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
 th,td{border:1px solid #ddd;padding:8px;text-align:left}
@@ -1322,7 +1506,8 @@ tr:hover{background:#f0f8ff}
 #modalContent label{display:block;margin-top:10px;font-weight:bold}
 #modalContent input,#modalContent select{width:100%;padding:8px;box-sizing:border-box;margin-top:4px}
 .modal-buttons{margin-top:20px;text-align:right}
-#uploadStatus{font-weight:bold;margin-left:10px}
+#uploadStatus{font-weight:bold;margin-left:10px;white-space:pre-line}
+.warn-row{background:#fff3cd !important;}
 </style>
 </head>
 <body>
@@ -1334,6 +1519,7 @@ tr:hover{background:#f0f8ff}
 <label><input type="checkbox" id="chk_in_transit" onchange="saveTabs()"> 🚚 В пути</label>
 <label><input type="checkbox" id="chk_delivered" onchange="saveTabs()"> ✅ Прибывшие</label>
 <label><input type="checkbox" id="chk_with_gps" onchange="saveTabs()"> 📍 С GPS</label>
+<label><input type="checkbox" id="chk_planned" onchange="saveTabs()"> 📋 Планируется</label>
 </div>
 </div>
 
@@ -1344,12 +1530,12 @@ tr:hover{background:#f0f8ff}
 <button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
 <span id="uploadStatus"></span>
 </div>
-<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>, история сохраняется, прошлые годы уходят в архив (не удаляются).</p>
+<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>; при повторе order_id+год — по стабильному отпечатку содержимого. История сохраняется, прошлые годы уходят в архив (не удаляются).</p>
 </div>
 
 <input id="filter" placeholder="Поиск по номеру, адресу, машине..." oninput="renderTable()"/>
 <table id="shipments">
-<thead><tr><th>Заказ</th><th>Год</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Отгрузка</th><th>Прибытие</th><th>Действия</th></tr></thead>
+<thead><tr><th>Заказ</th><th>Год</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Отгрузка</th><th>Прибытие (план)</th><th>Выгрузка (факт)</th><th>Действия</th></tr></thead>
 <tbody></tbody>
 </table>
 
@@ -1361,11 +1547,11 @@ tr:hover{background:#f0f8ff}
 <label>Вес</label><input id="f_weight" type="number"/>
 <label>Дата отправки</label><input id="f_ship_date" type="date"/>
 <label>План прибытия</label><input id="f_plan_arrival" type="date"/>
-<label>Дата выгрузки</label><input id="f_arrival_date" type="date"/>
+<label>Дата выгрузки (факт)</label><input id="f_arrival_date" type="date"/>
 <label>Перевозчик</label><input id="f_carrier"/>
 <label>Машина</label><input id="f_vehicle"/>
 <label>Водитель</label><input id="f_driver"/>
-<label>GPS-ссылка</label><input id="f_gps_link"/>
+<label>GPS-ссылка (только URL)</label><input id="f_gps_link"/>
 <label>Примечание</label><input id="f_comment"/>
 <label>Статус</label>
 <select id="f_status">
@@ -1382,10 +1568,31 @@ tr:hover{background:#f0f8ff}
 
 <script>
 let allData=[];
-async function loadSettings(){const r=await fetch('/api/settings/tabs');const s=await r.json();document.getElementById('chk_in_transit').checked=s.show_in_transit!==false;document.getElementById('chk_delivered').checked=s.show_delivered!==false;document.getElementById('chk_with_gps').checked=s.show_with_gps!==false;}
-async function saveTabs(){const p={show_in_transit:document.getElementById('chk_in_transit').checked,show_delivered:document.getElementById('chk_delivered').checked,show_with_gps:document.getElementById('chk_with_gps').checked};await fetch('/api/admin/settings/tabs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});}
+async function loadSettings(){
+    const r=await fetch('/api/settings/tabs');
+    const s=await r.json();
+    document.getElementById('chk_in_transit').checked=s.show_in_transit!==false;
+    document.getElementById('chk_delivered').checked=s.show_delivered!==false;
+    document.getElementById('chk_with_gps').checked=s.show_with_gps!==false;
+    document.getElementById('chk_planned').checked=!!s.show_planned;
+}
+async function saveTabs(){
+    const p={
+        show_in_transit:document.getElementById('chk_in_transit').checked,
+        show_delivered:document.getElementById('chk_delivered').checked,
+        show_with_gps:document.getElementById('chk_with_gps').checked,
+        show_planned:document.getElementById('chk_planned').checked
+    };
+    await fetch('/api/admin/settings/tabs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+}
 async function load(){const r=await fetch('/api/admin/shipments');allData=await r.json();renderTable();}
-function renderTable(){const q=document.getElementById('filter').value.toLowerCase();const f=allData.filter(s=>[(s.order_id||''),(s.address||''),(s.vehicle||''),(s.carrier||'')].join(' ').toLowerCase().includes(q));document.querySelector('#shipments tbody').innerHTML=f.map(s=>`<tr>
+function renderTable(){
+    const q=document.getElementById('filter').value.toLowerCase();
+    const f=allData.filter(s=>[(s.order_id||''),(s.address||''),(s.vehicle||''),(s.carrier||'')].join(' ').toLowerCase().includes(q));
+    document.querySelector('#shipments tbody').innerHTML=f.map(s=>{
+        const warn = (s.data_warnings && s.data_warnings.length) ? ' warn-row' : '';
+        const noFact = s.arrival_fact_missing ? ' <span title="Нет факт. даты выгрузки" style="color:#dc3545;">⚠️</span>' : '';
+        return `<tr class="${warn}">
 <td><b>${s.order_id}</b>${s.is_service_row?' <small>(служ.)</small>':''}</td>
 <td>${s.year||''}</td>
 <td>${s.address||''}</td>
@@ -1393,15 +1600,61 @@ function renderTable(){const q=document.getElementById('filter').value.toLowerCa
 <td>${s.vehicle||''}</td>
 <td>${s.status||'—'}</td>
 <td>${s.ship_date||''}</td>
-<td>${s.arrival_date||s.plan_arrival||''}</td>
+<td>${s.plan_arrival||''}</td>
+<td>${s.arrival_date||'<span style="color:#999;">—</span>'}${noFact}</td>
 <td><button class="btn btn-blue" style="padding:4px 8px;" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
-<button class="btn btn-red" style="padding:4px 8px;" onclick="del('${s._key}')">🗑</button></td></tr>`).join('');}
-function openAdd(){['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value='');document.getElementById('f_order_id').disabled=false;document.getElementById('f_status').value='планируется';document.getElementById('modalTitle').innerText='Добавить заказ';document.getElementById('modal').style.display='block';}
-function openEdit(s){['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value=s[f]||'');document.getElementById('f_order_id').disabled=true;document.getElementById('f_status').value=s.status||'планируется';document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id+' ('+s.year+')';document.getElementById('modal').style.display='block';}
+<button class="btn btn-red" style="padding:4px 8px;" onclick="del('${s._key}')">🗑</button></td></tr>`;
+    }).join('');
+}
+function openAdd(){
+    ['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value='');
+    document.getElementById('f_order_id').disabled=false;
+    document.getElementById('f_status').value='планируется';
+    document.getElementById('modalTitle').innerText='Добавить заказ';
+    document.getElementById('modal').style.display='block';
+}
+function openEdit(s){
+    ['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value=s[f]||'');
+    document.getElementById('f_order_id').disabled=true;
+    document.getElementById('f_status').value=s.status||'планируется';
+    document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id+' ('+s.year+')';
+    document.getElementById('modal').style.display='block';
+}
 function closeModal(){document.getElementById('modal').style.display='none';}
-async function saveOrder(){const p={order_id:document.getElementById('f_order_id').value,direction:document.getElementById('f_direction').value,address:document.getElementById('f_address').value,weight:parseFloat(document.getElementById('f_weight').value)||null,ship_date:document.getElementById('f_ship_date').value||null,plan_arrival:document.getElementById('f_plan_arrival').value||null,arrival_date:document.getElementById('f_arrival_date').value||null,carrier:document.getElementById('f_carrier').value,vehicle:document.getElementById('f_vehicle').value,driver:document.getElementById('f_driver').value,gps_link:document.getElementById('f_gps_link').value,comment:document.getElementById('f_comment').value,status:document.getElementById('f_status').value};await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});closeModal();load();}
+async function saveOrder(){
+    const p={
+        order_id:document.getElementById('f_order_id').value,
+        direction:document.getElementById('f_direction').value,
+        address:document.getElementById('f_address').value,
+        weight:parseFloat(document.getElementById('f_weight').value)||null,
+        ship_date:document.getElementById('f_ship_date').value||null,
+        plan_arrival:document.getElementById('f_plan_arrival').value||null,
+        arrival_date:document.getElementById('f_arrival_date').value||null,
+        carrier:document.getElementById('f_carrier').value,
+        vehicle:document.getElementById('f_vehicle').value,
+        driver:document.getElementById('f_driver').value,
+        gps_link:document.getElementById('f_gps_link').value,
+        comment:document.getElementById('f_comment').value,
+        status:document.getElementById('f_status').value
+    };
+    await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+    closeModal();load();
+}
 async function del(key){if(!confirm('Удалить запись '+key+'?'))return;await fetch('/api/admin/shipments/'+encodeURIComponent(key),{method:'DELETE'});load();}
-async function uploadExcel(){const fi=document.getElementById('excelFile');if(!fi.files.length){alert('Выберите файл!');return;}const fd=new FormData();fd.append('file',fi.files[0]);const b=document.getElementById('uploadBtn');const st=document.getElementById('uploadStatus');b.disabled=true;b.innerText='⏳ Обработка...';st.innerText='Пожалуйста, подождите...';st.style.color='blue';try{const r=await fetch('/api/admin/upload',{method:'POST',body:fd});const d=await r.json();if(r.ok){st.innerText='✅ '+d.message;st.style.color='green';load();}else{st.innerText='❌ Ошибка: '+d.detail;st.style.color='red';}}catch(e){st.innerText='❌ Ошибка сети';st.style.color='red';}finally{b.disabled=false;b.innerText='Обновить базу из файла';}}
+async function uploadExcel(){
+    const fi=document.getElementById('excelFile');
+    if(!fi.files.length){alert('Выберите файл!');return;}
+    const fd=new FormData();fd.append('file',fi.files[0]);
+    const b=document.getElementById('uploadBtn');const st=document.getElementById('uploadStatus');
+    b.disabled=true;b.innerText='⏳ Обработка...';st.innerText='Пожалуйста, подождите...';st.style.color='blue';
+    try{
+        const r=await fetch('/api/admin/upload',{method:'POST',body:fd});
+        const d=await r.json();
+        if(r.ok){st.innerText='✅ '+d.message;st.style.color='green';load();}
+        else{st.innerText='❌ Ошибка: '+d.detail;st.style.color='red';}
+    }catch(e){st.innerText='❌ Ошибка сети';st.style.color='red';}
+    finally{b.disabled=false;b.innerText='Обновить базу из файла';}
+}
 loadSettings();load();
 </script>
 </body></html>"""
