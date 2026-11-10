@@ -114,7 +114,6 @@ DB: dict = {}
 DB_LOCK = asyncio.Lock()
 
 # FIX 2: поля, которые «принадлежат» пользователю после ручного редактирования.
-# При слиянии с Excel для manual_edit-записей эти поля НЕ перезаписываются.
 MANUAL_PROTECTED_FIELDS = (
     "direction", "address", "weight", "ship_date", "plan_arrival", "arrival_date",
     "carrier", "vehicle", "driver", "gps_link", "comment", "status",
@@ -129,9 +128,12 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 if not PUBLIC_URL:
     raise ValueError("❌ Переменная PUBLIC_URL не задана. Укажите публичный HTTPS-домен Layero (например, https://your-project.layero.app)")
 
+# FIX 14: webhook secret (по желанию, убирает warning)
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
+
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
-webhook = FastAPIMaxWebhook(dp=max_dp, bot=max_bot)
+webhook = FastAPIMaxWebhook(dp=max_dp, bot=max_bot, secret=WEBHOOK_SECRET or None)
 
 
 # ============================================================
@@ -217,8 +219,6 @@ def is_hidden_status(rec: dict) -> bool:
 
 def load_db():
     # FIX 3: load_db больше НЕ вызывает remap_legacy_keys/save_db.
-    # Мы только читаем и нормализуем в памяти. Запись — только по явному действию
-    # (API-изменение, загрузка Excel) под DB_LOCK.
     global DB
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
@@ -253,12 +253,10 @@ def migrate_raw_db(raw: dict) -> dict:
 
 
 def remap_legacy_keys_in_memory():
-    # FIX 4: только в памяти. Не пишет на диск. Не меняет _key у manual_edit-записей
-    # и у записей с уже стабильным ключом (__rowNNN или __<hash>). Добавляет алиасы.
+    # FIX 4: только в памяти. Не пишет на диск. Не меняет _key у manual_edit.
     global DB
     new_db = {}
     for key, rec in DB.items():
-        # Никогда не трогаем ключ ручных записей — иначе фронт теряет _key.
         if rec.get("manual_edit"):
             new_db[key] = rec
             continue
@@ -308,7 +306,6 @@ async def save_db():
 
 def merge_into_db_unlocked(new_records: list) -> dict:
     # FIX 7: логика слияния без лока (лок берётся снаружи).
-    # Для записей, помеченных manual_edit, защищаем ручные поля от Excel.
     global DB
     now = dt.datetime.utcnow().isoformat(timespec="seconds")
     stats = {"added": 0, "updated": 0, "unchanged": 0, "duplicates": 0, "protected": 0}
@@ -317,7 +314,6 @@ def merge_into_db_unlocked(new_records: list) -> dict:
         if key in DB:
             old = DB[key]
 
-            # Переносим «живые» состояния GPS, чтобы не сбрасывать проверку.
             rec["has_valid_gps"] = old.get("has_valid_gps")
             rec["gps_checked"] = old.get("gps_checked", False)
             rec["current_lat"] = old.get("current_lat")
@@ -360,7 +356,9 @@ def merge_into_db_unlocked(new_records: list) -> dict:
     return stats
 
 
-# ПАРСИНГ EXCEL — без изменений (кроме импорта утилит)
+# ============================================================
+# ПАРСИНГ EXCEL
+# ============================================================
 COLUMN_MAP_NORM = {
     "заказ": "order_id",
     "направление": "direction",
@@ -616,8 +614,6 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
 async def lifespan(app: FastAPI):
     global DB
     load_db()
-    # FIX 9: не запускаем update_all_coords сразу, чтобы не гонять с запросами
-    # в первые секунды. Дадим приложению подняться.
     if DB:
         async def _delayed_update():
             await asyncio.sleep(10)
@@ -645,10 +641,13 @@ async def _register_webhook_once():
     except Exception:
         pass
     try:
-        await max_bot.subscribe_webhook(
-            url=f"{PUBLIC_URL}/webhook",
-            update_types=["message_created", "message_callback", "bot_started"],
-        )
+        kwargs = {
+            "url": f"{PUBLIC_URL}/webhook",
+            "update_types": ["message_created", "message_callback", "bot_started"],
+        }
+        if WEBHOOK_SECRET:
+            kwargs["secret"] = WEBHOOK_SECRET
+        await max_bot.subscribe_webhook(**kwargs)
         print(f"✅ Вебхук зарегистрирован: {PUBLIC_URL}/webhook")
     except Exception as e:
         print(f"⚠️ Ошибка регистрации вебхука: {e}")
@@ -1183,7 +1182,7 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
 
 
 # ============================================================
-# ГЛАВНАЯ / АДМИНКА (HTML без изменений — см. ваш файл)
+# ГЛАВНАЯ / АДМИНКА
 # ============================================================
 @app.get("/", response_class=HTMLResponse)
 async def user_portal():
@@ -1195,7 +1194,548 @@ async def admin_panel(user=Depends(check_admin)):
     return ADMIN_HTML
 
 
-# INDEX_HTML и ADMIN_HTML остаются БЕЗ ИЗМЕНЕНИЙ — скопируйте из вашего файла.
-# (Ниже — заглушки, чтобы файл был валидным; замените на ваш полный HTML.)
-INDEX_HTML = r"""<!DOCTYPE html><html><body>INDEX_HTML — вставьте ваш полный HTML</body></html>"""
-ADMIN_HTML = r"""<!DOCTYPE html><html><body>ADMIN_HTML — вставьте ваш полный HTML</body></html>"""
+INDEX_HTML = r"""<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ТПК — Отслеживание</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<style>
+    :root { --bg:#f0f2f5; --card:#fff; --text:#1a1a1a; --text-sec:#6c757d; --border:#e0e0e0; --primary:#007bff; --success:#28a745; --shadow:0 2px 12px rgba(0,0,0,.08); }
+    [data-theme="dark"] { --bg:#1a1a1a; --card:#2d2d2d; --text:#e8e8e8; --text-sec:#a0a0a0; --border:#404040; --primary:#4a9eff; --success:#28a745; }
+    * { margin:0; padding:0; box-sizing:border-box; }
+    body { font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:var(--bg); color:var(--text); padding:24px; }
+    .header { max-width:1100px; margin:0 auto 24px; display:flex; justify-content:space-between; align-items:center; }
+    .header h1 { font-size:28px; }
+    .controls { max-width:1100px; margin:0 auto 16px; display:flex; gap:10px; flex-wrap:wrap; }
+    .search-box { position:relative; flex:1; min-width:250px; }
+    .search-box input { width:100%; padding:14px 20px 14px 48px; border-radius:12px; border:2px solid var(--border); background:var(--card); color:var(--text); }
+    .search-box::before { content:'🔍'; position:absolute; left:16px; top:50%; transform:translateY(-50%); }
+    .sort-select { padding:14px; border-radius:12px; border:2px solid var(--border); background:var(--card); color:var(--text); cursor:pointer; }
+    .refresh-btn { padding:14px; border-radius:12px; border:none; background:var(--primary); color:#fff; font-weight:bold; cursor:pointer; display:flex; align-items:center; gap:6px; }
+    .tabs { max-width:1100px; margin:0 auto 12px; display:flex; gap:8px; background:var(--card); padding:8px; border-radius:12px; box-shadow:var(--shadow); }
+    .tab { flex:1; padding:12px; border:none; background:transparent; color:var(--text-sec); font-weight:600; cursor:pointer; border-radius:8px; display:none; }
+    .tab.visible { display:block; }
+    .tab.active { background:var(--primary); color:#fff; }
+    .years { max-width:1100px; margin:0 auto 16px; display:flex; gap:6px; flex-wrap:wrap; }
+    .year-chip { padding:8px 14px; border-radius:20px; border:2px solid var(--border); background:var(--card); color:var(--text-sec); cursor:pointer; font-weight:600; }
+    .year-chip.active { background:var(--primary); color:#fff; border-color:var(--primary); }
+    .container { max-width:1100px; margin:0 auto; }
+    .orders-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(320px,1fr)); gap:16px; }
+
+    .order-card { background:var(--card); border-radius:12px; padding:20px; box-shadow:var(--shadow); cursor:pointer; border-left:4px solid var(--primary); transition:.2s; color:var(--text); position:relative; }
+    .order-card:hover { transform:translateY(-2px); }
+    .order-card.delivered { border-left-color:var(--success); padding:14px 16px; }
+    .order-card.delivered .order-row { margin:3px 0; }
+    .order-card.delivered .order-id { font-size:15px; }
+    .order-card.delivered .loc-info { display:none; }
+    .order-card.delivered .order-row strong { min-width:96px; }
+
+    .order-id { color:var(--primary); font-weight:700; font-size:16px; }
+    .order-row { font-size:13px; margin:6px 0; color:var(--text-sec); }
+    .order-row strong { color:var(--text); min-width:90px; display:inline-block; }
+    .loc-info { margin-top:10px; padding:8px; background:rgba(0,123,255,.08); border-radius:6px; font-size:13px; color:var(--primary); }
+
+    .order-status { padding:4px 10px; border-radius:12px; font-size:11px; font-weight:700; }
+    .in-transit { background:#d4edda; color:#155724; }
+    .status-badge-delivered { background:#d1ecf1; color:#0c5460; }
+    .status-badge-planned { background:#fff3cd; color:#856404; }
+    .warn-badge { background:#f8d7da; color:#721c24; padding:2px 8px; border-radius:8px; font-size:10px; margin-left:6px; }
+
+    #modal { display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:1000; padding:20px; overflow-y:auto; }
+    #modal.open { display:block; }
+    .modal-content { background:var(--card); max-width:900px; margin:40px auto; border-radius:16px; padding:28px; position:relative; }
+    .modal-close { position:absolute; top:16px; right:16px; font-size:24px; cursor:pointer; border:none; background:none; color:var(--text); }
+    #map { height:400px; margin-top:20px; border-radius:12px; display:flex; flex-direction:column; align-items:center; justify-content:center; background:#eaeaea; color:#888; gap:10px; }
+    [data-theme="dark"] #map { background:#1a1a1a; }
+    .modal-info { display:grid; grid-template-columns:1fr 1fr; gap:12px; margin-top:20px; }
+    .modal-info strong { display:block; color:var(--text-sec); font-size:12px; text-transform:uppercase; }
+
+    .custom-spinner {
+        width: 50px;
+        height: 50px;
+        margin-bottom: 15px;
+        animation: spin 2s linear infinite;
+    }
+    @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+    }
+
+    .btn-reload { padding:10px 20px; background:var(--primary); color:#fff; border:none; border-radius:8px; cursor:pointer; font-weight:bold; text-decoration:none; display:inline-block; }
+</style>
+</head>
+<body>
+<div class="header">
+    <div style="display:flex; align-items:center; gap:10px;">
+        <img src="/static/logo-2.png" alt="Логотип" style="height:36px; width:auto;">
+        <h1 style="margin:0;">ТПК — Отслеживание</h1>
+    </div>
+    <button onclick="toggleTheme()" style="background:none;border:none;font-size:24px;cursor:pointer;">🌙</button>
+</div>
+<div class="controls">
+    <div class="search-box"><input id="searchInput" placeholder="Поиск по номеру, городу или машине..." oninput="debounceSearch()"></div>
+    <select class="sort-select" id="sortSelect" onchange="loadOrders()">
+        <option value="gps">📍 Сначала с GPS</option>
+        <option value="order_id">🔢 По номеру заказа</option>
+        <option value="city">🏙️ По городу</option>
+        <option value="arrival_date">📅 По дате прибытия</option>
+    </select>
+    <button class="refresh-btn" onclick="refreshData()" id="refreshBtn">🔄 Обновить</button>
+</div>
+<div class="tabs" id="tabsContainer">
+    <button class="tab" data-status="in_transit" onclick="setTab('in_transit')">🚚 В пути</button>
+    <button class="tab" data-status="delivered" onclick="setTab('delivered')">✅ Прибывшие</button>
+    <button class="tab" data-status="with_gps" onclick="setTab('with_gps')">📍 С GPS</button>
+    <button class="tab" data-status="planned" onclick="setTab('planned')">📋 Планируется</button>
+</div>
+<div class="years" id="yearsContainer" style="display:none;"></div>
+<div class="container"><div class="orders-grid" id="ordersGrid"></div></div>
+<div id="modal"><div class="modal-content"><button class="modal-close" onclick="closeModal()">×</button><div id="modalContent"></div></div></div>
+<script>
+let currentTab='in_transit', currentYear=null, map=null;
+function toggleTheme(){const d=document.documentElement.getAttribute('data-theme')==='dark';document.documentElement.setAttribute('data-theme',d?'light':'dark');localStorage.setItem('theme',d?'light':'dark');}
+document.documentElement.setAttribute('data-theme',localStorage.getItem('theme')||'dark');
+
+async function loadTabs(){
+    const r=await fetch('/api/settings/tabs');
+    const s=await r.json();
+    document.querySelectorAll('.tab').forEach(t=>{
+        const st=t.dataset.status;
+        let vis = s['show_'+st]!==false;
+        if(st==='planned') vis = !!s.show_planned;
+        t.classList.toggle('visible', vis);
+    });
+    const firstVisible = document.querySelector('.tab.visible');
+    if (firstVisible) setTab(firstVisible.dataset.status);
+}
+
+function setTab(s){
+    currentTab=s;
+    document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));
+    const btn = document.querySelector(`.tab[data-status="${s}"]`);
+    if(btn) btn.classList.add('active');
+
+    const yearsBox = document.getElementById('yearsContainer');
+    if (s === 'delivered' || s === 'planned') {
+        yearsBox.style.display = 'flex';
+        if (!currentYear) currentYear = new Date().getFullYear();
+    } else {
+        yearsBox.style.display = 'none';
+        currentYear = new Date().getFullYear();
+    }
+    loadOrders();
+}
+
+function setYear(y){
+    currentYear=y;
+    document.querySelectorAll('.year-chip').forEach(c=>c.classList.toggle('active',c.dataset.year===String(y)));
+    loadOrders();
+}
+
+function debounceSearch(){
+    clearTimeout(window.t);
+    window.t=setTimeout(loadOrders,300);
+}
+
+async function loadYears(){
+    const r=await fetch('/api/years');
+    const years=await r.json();
+    const box=document.getElementById('yearsContainer');
+    const cur=new Date().getFullYear();
+    const list=[...new Set([cur,...years])].sort((a,b)=>b-a);
+    if(!currentYear)currentYear=cur;
+    box.innerHTML=list.map(y=>`<button class="year-chip ${y===currentYear?'active':''}" data-year="${y}" onclick="setYear(${y})">${y}</button>`).join('');
+}
+
+function renderCard(o) {
+    const st=(o.status||'').toLowerCase();
+    const isDelivered=(st==='завершено'||st==='выгружено');
+    const isPlanned=(st==='планируется');
+    let badge='';
+    if(st==='в пути') badge='<span class="order-status in-transit">В пути</span>';
+    else if(st==='выгружено') badge='<span class="order-status status-badge-delivered">Выгружено</span>';
+    else if(st==='завершено') badge='<span class="order-status status-badge-delivered">Завершено</span>';
+    else if(isPlanned) badge='<span class="order-status status-badge-planned">Планируется</span>';
+
+    const noFact = (isDelivered && o.arrival_fact_missing)
+        ? '<span class="warn-badge" title="Нет фактической даты выгрузки">нет факта</span>' : '';
+
+    let gpsIcon = '';
+    const hasGpsLink = o.gps_link && String(o.gps_link).trim().length > 0;
+
+    if (hasGpsLink && o.has_valid_gps !== false) {
+        if (o.has_valid_gps === true || (o.current_lat && o.current_lng)) {
+            gpsIcon = `<span title="GPS доступен" style="margin-left:8px;font-size:16px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">🌍</span>`;
+        } else {
+            gpsIcon = `<span class="gps-loading" data-key="${o._key}" title="Проверка GPS..." style="margin-left:8px;font-size:14px;cursor:pointer;" onclick="event.stopPropagation(); openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})">⏳</span>`;
+        }
+    }
+
+    const head = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+        <span class="order-id">${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></span>
+        <div style="display:flex;align-items:center;">
+            ${badge}${noFact}${gpsIcon}
+        </div>
+    </div>`;
+
+    if(isDelivered){
+        return `<div class="order-card delivered" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+        ${head}
+        <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
+        <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
+        <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
+        <div style="margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--border);">
+            <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
+            <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
+            <div class="order-row"><strong>Дата выгрузки:</strong> ${o.arrival_date||'нет данных'}</div>
+        </div>
+        </div>`;
+    }
+
+    const loc=o.comment?`<div class="loc-info">📝 ${o.comment}</div>`:'';
+    return `<div class="order-card" onclick='openOrder(${JSON.stringify(o).replace(/'/g,"&#39;")})'>
+    ${head}
+    <div class="order-row"><strong>Адрес:</strong> ${o.address||'—'}</div>
+    <div class="order-row"><strong>Перевозчик:</strong> ${o.carrier||'—'}</div>
+    <div class="order-row"><strong>ТС:</strong> ${o.vehicle||'—'}</div>
+    <div class="order-row"><strong>Вес:</strong> ${o.weight?o.weight+' кг':'—'}</div>
+    <div class="order-row"><strong>Дата отправки:</strong> ${o.ship_date||'—'}</div>
+    <div class="order-row"><strong>Прибытие (план):</strong> ${o.plan_arrival||'—'}</div>
+    ${loc}
+    </div>`;
+}
+
+async function loadOrders(force=false){
+    const s=document.getElementById('searchInput').value.trim();
+    const sort=document.getElementById('sortSelect').value;
+    const grid=document.getElementById('ordersGrid');
+    grid.innerHTML='<div style="text-align:center;width:100%;">Загрузка...</div>';
+    const cp=force?`&force_refresh=true&_t=${Date.now()}`:'';
+    const url=`/api/shipments?status=${currentTab}&sort_by=${sort}&year=${currentYear}${s?'&search='+encodeURIComponent(s):''}${cp}`;
+
+    try{
+        const r=await fetch(url,{cache:force?'no-store':'default'});
+        let orders=await r.json();
+
+        if(!orders.length){
+            grid.innerHTML='<div style="text-align:center;width:100%;">Нет заказов</div>';
+            return;
+        }
+
+        const withLink = orders.filter(o => o.gps_link && String(o.gps_link).trim().length > 0);
+        const withoutLink = orders.filter(o => !o.gps_link || String(o.gps_link).trim().length === 0);
+
+        let html = '';
+
+        if (withLink.length > 0) {
+            html += `<div style="grid-column: 1 / -1; margin-top: 10px; margin-bottom: 10px; display: flex; align-items: center; gap: 12px;">
+                <div style="background: var(--primary); color: white; padding: 6px 16px; border-radius: 20px; font-weight: 700; font-size: 14px; box-shadow: 0 2px 8px rgba(0,123,255,0.3);">
+                    🗺️ С треккингом (${withLink.length})
+                </div>
+                <div style="flex: 1; height: 2px; background: linear-gradient(90deg, var(--primary), transparent); border-radius: 2px;"></div>
+            </div>`;
+            html += withLink.map(o => renderCard(o)).join('');
+        }
+
+        if (withoutLink.length > 0) {
+            if (withLink.length > 0) {
+                html += `<div style="grid-column: 1 / -1; margin: 30px 0 20px 0; display: flex; align-items: center; gap: 10px;">
+                    <div style="flex: 1; border-top: 2px dashed var(--border);"></div>
+                    <div style="color: var(--text-sec); font-size: 20px;">📦</div>
+                    <div style="flex: 1; border-top: 2px dashed var(--border);"></div>
+                </div>`;
+            }
+            html += `<div style="grid-column: 1 / -1; margin-bottom: 10px; display: flex; align-items: center; gap: 12px;">
+                <div style="background: var(--text-sec); color: var(--card); padding: 6px 16px; border-radius: 20px; font-weight: 700; font-size: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+                    📦 Без треккинга (${withoutLink.length})
+                </div>
+                <div style="flex: 1; height: 2px; background: linear-gradient(90deg, var(--border), transparent); border-radius: 2px;"></div>
+            </div>`;
+            html += withoutLink.map(o => renderCard(o)).join('');
+        }
+
+        grid.innerHTML = html;
+
+        document.querySelectorAll('.gps-loading').forEach(icon => {
+            const key = icon.getAttribute('data-key');
+            if (!key) return;
+            fetch(`/api/check_gps/${encodeURIComponent(key)}`)
+                .then(res => res.json())
+                .then(data => {
+                    if (data.valid === true) {
+                        icon.innerHTML = '🌍';
+                        icon.title = 'GPS доступен';
+                    } else if (data.valid === false) {
+                        icon.style.display = 'none';
+                    } else {
+                        icon.innerHTML = '🌍';
+                    }
+                })
+                .catch(() => { icon.style.display = 'none'; });
+        });
+
+    }catch(e){
+        grid.innerHTML='<div style="text-align:center;width:100%;color:red;">Ошибка загрузки</div>';
+    }
+}
+
+function refreshData(){
+    const b=document.getElementById('refreshBtn');
+    b.innerHTML='⏳ Загрузка...';
+    b.disabled=true;
+    loadOrders(true).finally(()=>{
+        b.innerHTML='🔄 Обновить';
+        b.disabled=false;
+    });
+}
+
+async function openOrder(o){
+    document.getElementById('modal').classList.add('open');
+    const st=(o.status||'').toLowerCase();
+    const isDelivered=(st==='завершено'||st==='выгружено');
+
+    const dates=isDelivered
+        ?`<div><strong>Дата отправки</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div><div><strong>Дата выгрузки (факт)</strong>${o.arrival_date||'нет данных'}</div>`
+        :`<div><strong>Дата отправки</strong>${o.ship_date||'—'}</div><div><strong>Прибытие (план)</strong>${o.plan_arrival||'—'}</div>`;
+
+    const warnings = (o.data_warnings && o.data_warnings.length)
+        ? `<div style="margin-top:12px;padding:8px;background:#fff3cd;color:#856404;border-radius:6px;font-size:12px;">⚠️ ${o.data_warnings.join(', ')}</div>` : '';
+
+    document.getElementById('modalContent').innerHTML=`<h2>📦 ${o.order_id} <small style="color:var(--text-sec)">(${o.year})</small></h2>
+    <div class="modal-info">
+        <div><strong>Адрес</strong>${o.address||'—'}</div>
+        <div><strong>Перевозчик</strong>${o.carrier||'—'}</div>
+        <div><strong>Машина (ТС)</strong>${o.vehicle||'—'}</div>
+        <div><strong>Водитель</strong>${o.driver||'—'}</div>
+        <div><strong>Вес</strong>${o.weight?o.weight+' кг':'—'}</div>
+        <div><strong>Статус</strong>${o.status||'—'}</div>
+        ${dates}
+    </div>
+    ${o.comment?`<div style="margin-top:20px;padding:12px;background:rgba(0,0,0,.05);border-radius:8px;"><strong>Примечание:</strong> ${o.comment}</div>`:''}
+    ${warnings}
+
+    <div id="map"><img src="/static/logo-2.png" class="custom-spinner" alt="Загрузка..."><div>Загрузка координат...</div></div>`;
+
+    if(o.current_lat&&o.current_lng){
+        renderMap(o.current_lat,o.current_lng);
+    }else if(o.gps_link && String(o.gps_link).trim().length > 0){
+        loadCoords(o._key,o.gps_link);
+    }else{
+        document.getElementById('map').innerHTML='<div style="text-align:center;padding:50px;color:#888;">GPS отсутствует или ссылка недействительна.</div>';
+    }
+}
+
+async function loadCoords(key,link){
+    const m=document.getElementById('map');
+    m.innerHTML='<img src="/static/logo-2.png" class="custom-spinner" alt="Загрузка..."><div>Запрос к спутнику...</div>';
+    try{
+        const r=await fetch(`/api/coords/${encodeURIComponent(key)}`);
+        if(r.ok){
+            const d=await r.json();
+            renderMap(d.lat,d.lng);
+        }else{
+            const e=await r.json();
+            m.innerHTML=`<div style="text-align:center;padding:20px;color:#888;">${e.detail||'GPS недоступен'}<br><br><a href="${link}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a></div>`;
+        }
+    }catch(e){
+        m.innerHTML=`<div style="text-align:center;padding:20px;color:#888;">Ошибка сети<br><br><a href="${link}" target="_blank" class="btn-reload">🗺️ Открыть карту BaltGPS</a></div>`;
+    }
+}
+
+function renderMap(lat,lng){
+    const m=document.getElementById('map');
+    m.innerHTML='';
+    if(map)map.remove();
+    map=L.map('map').setView([lat,lng],8);
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png').addTo(map);
+    L.marker([lat,lng]).addTo(map);
+}
+
+function closeModal(){
+    document.getElementById('modal').classList.remove('open');
+    if(map){map.remove();map=null;}
+}
+
+loadTabs().then(loadYears);
+</script>
+</body></html>"""
+
+
+ADMIN_HTML = r"""<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8"><title>Админ-панель</title>
+<style>
+body{font-family:Arial;padding:20px;background:#f0f2f5;margin:0}
+.top-bar{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px}
+.btn{padding:10px 20px;border:none;border-radius:6px;cursor:pointer;font-weight:bold}
+.btn-green{background:#28a745;color:#fff}.btn-blue{background:#007bff;color:#fff}.btn-red{background:#dc3545;color:#fff}
+.panel{background:#fff;padding:20px;border-radius:8px;box-shadow:0 2px 8px rgba(0,0,0,.1);margin-bottom:20px}
+.panel h3{margin-top:0}
+.upload-box{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.settings-grid{display:flex;gap:20px;margin-top:10px;flex-wrap:wrap}
+.settings-grid label{display:flex;align-items:center;gap:6px;cursor:pointer}
+table{border-collapse:collapse;width:100%;background:#fff;font-size:13px;box-shadow:0 2px 8px rgba(0,0,0,.1)}
+th,td{border:1px solid #ddd;padding:8px;text-align:left}
+th{background:#333;color:#fff;position:sticky;top:0}
+tr:hover{background:#f0f8ff}
+#filter{padding:10px;width:300px;margin-bottom:10px;border:1px solid #ccc;border-radius:6px}
+#modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);z-index:1000}
+#modalContent{background:#fff;max-width:640px;margin:60px auto;padding:30px;border-radius:8px;max-height:80vh;overflow-y:auto}
+#modalContent label{display:block;margin-top:10px;font-weight:bold}
+#modalContent input,#modalContent select{width:100%;padding:8px;box-sizing:border-box;margin-top:4px}
+.modal-buttons{margin-top:20px;text-align:right}
+#uploadStatus{font-weight:bold;margin-left:10px;white-space:pre-line}
+.warn-row{background:#fff3cd !important;}
+</style>
+</head>
+<body>
+<div class="top-bar"><h1>🚚 Управление перевозками</h1><button class="btn btn-green" onclick="openAdd()">➕ Добавить заказ</button></div>
+
+<div class="panel">
+<h3>👁️ Видимость вкладок на главной</h3>
+<div class="settings-grid">
+<label><input type="checkbox" id="chk_in_transit" onchange="saveTabs()"> 🚚 В пути</label>
+<label><input type="checkbox" id="chk_delivered" onchange="saveTabs()"> ✅ Прибывшие</label>
+<label><input type="checkbox" id="chk_with_gps" onchange="saveTabs()"> 📍 С GPS</label>
+<label><input type="checkbox" id="chk_planned" onchange="saveTabs()"> 📋 Планируется</label>
+</div>
+</div>
+
+<div class="panel">
+<h3>📥 Загрузка данных из Excel</h3>
+<div class="upload-box">
+<input type="file" id="excelFile" accept=".xlsx, .xls">
+<button class="btn btn-blue" onclick="uploadExcel()" id="uploadBtn">Обновить базу из файла</button>
+<span id="uploadStatus"></span>
+</div>
+<p style="font-size:12px;color:#666;margin-top:10px;">Берётся лист <b>"Исх.логистика"</b>. Фильтры/скрытые строки снимаются автоматически. Записи сливаются по ключу <code>order_id__год</code>; при повторе order_id+год — по стабильному отпечатку содержимого. История сохраняется, прошлые годы уходят в архив (не удаляются).</p>
+</div>
+
+<input id="filter" placeholder="Поиск по номеру, адресу, машине..." oninput="renderTable()"/>
+<table id="shipments">
+<thead><tr><th>Заказ</th><th>Год</th><th>Адрес</th><th>Перевозчик</th><th>Машина</th><th>Статус</th><th>Отгрузка</th><th>Прибытие (план)</th><th>Выгрузка (факт)</th><th>Действия</th></tr></thead>
+<tbody></tbody>
+</table>
+
+<div id="modal"><div id="modalContent">
+<h2 id="modalTitle">Добавить заказ</h2>
+<label>Номер заказа *</label><input id="f_order_id"/>
+<label>Направление</label><input id="f_direction"/>
+<label>Адрес доставки</label><input id="f_address"/>
+<label>Вес</label><input id="f_weight" type="number"/>
+<label>Дата отправки</label><input id="f_ship_date" type="date"/>
+<label>План прибытия</label><input id="f_plan_arrival" type="date"/>
+<label>Дата выгрузки (факт)</label><input id="f_arrival_date" type="date"/>
+<label>Перевозчик</label><input id="f_carrier"/>
+<label>Машина</label><input id="f_vehicle"/>
+<label>Водитель</label><input id="f_driver"/>
+<label>GPS-ссылка (только URL)</label><input id="f_gps_link"/>
+<label>Примечание</label><input id="f_comment"/>
+<label>Статус</label>
+<select id="f_status">
+<option value="планируется">планируется</option>
+<option value="в пути">в пути</option>
+<option value="выгружено">выгружено</option>
+<option value="завершено">завершено</option>
+</select>
+<div class="modal-buttons">
+<button class="btn" onclick="closeModal()">Отмена</button>
+<button class="btn btn-green" onclick="saveOrder()">Сохранить</button>
+</div>
+</div></div>
+
+<script>
+let allData=[];
+async function loadSettings(){
+    const r=await fetch('/api/settings/tabs');
+    const s=await r.json();
+    document.getElementById('chk_in_transit').checked=s.show_in_transit!==false;
+    document.getElementById('chk_delivered').checked=s.show_delivered!==false;
+    document.getElementById('chk_with_gps').checked=s.show_with_gps!==false;
+    document.getElementById('chk_planned').checked=!!s.show_planned;
+}
+async function saveTabs(){
+    const p={
+        show_in_transit:document.getElementById('chk_in_transit').checked,
+        show_delivered:document.getElementById('chk_delivered').checked,
+        show_with_gps:document.getElementById('chk_with_gps').checked,
+        show_planned:document.getElementById('chk_planned').checked
+    };
+    await fetch('/api/admin/settings/tabs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+}
+async function load(){const r=await fetch('/api/admin/shipments');allData=await r.json();renderTable();}
+function renderTable(){
+    const q=document.getElementById('filter').value.toLowerCase();
+    const f=allData.filter(s=>[(s.order_id||''),(s.address||''),(s.vehicle||''),(s.carrier||'')].join(' ').toLowerCase().includes(q));
+    document.querySelector('#shipments tbody').innerHTML=f.map(s=>{
+        const warn = (s.data_warnings && s.data_warnings.length) ? ' warn-row' : '';
+        const noFact = s.arrival_fact_missing ? ' <span title="Нет факт. даты выгрузки" style="color:#dc3545;">⚠️</span>' : '';
+        return `<tr class="${warn}">
+<td><b>${s.order_id}</b>${s.is_service_row?' <small>(служ.)</small>':''}</td>
+<td>${s.year||''}</td>
+<td>${s.address||''}</td>
+<td>${s.carrier||''}</td>
+<td>${s.vehicle||''}</td>
+<td>${s.status||'—'}</td>
+<td>${s.ship_date||''}</td>
+<td>${s.plan_arrival||''}</td>
+<td>${s.arrival_date||'<span style="color:#999;">—</span>'}${noFact}</td>
+<td><button class="btn btn-blue" style="padding:4px 8px;" onclick='openEdit(${JSON.stringify(s).replace(/'/g,"&#39;")})'>✏️</button>
+<button class="btn btn-red" style="padding:4px 8px;" onclick="del('${s._key}')">🗑</button></td></tr>`;
+    }).join('');
+}
+function openAdd(){
+    ['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value='');
+    document.getElementById('f_order_id').disabled=false;
+    document.getElementById('f_status').value='планируется';
+    document.getElementById('modalTitle').innerText='Добавить заказ';
+    document.getElementById('modal').style.display='block';
+}
+function openEdit(s){
+    ['order_id','direction','address','weight','ship_date','plan_arrival','arrival_date','carrier','vehicle','driver','gps_link','comment'].forEach(f=>document.getElementById('f_'+f).value=s[f]||'');
+    document.getElementById('f_order_id').disabled=true;
+    document.getElementById('f_status').value=s.status||'планируется';
+    document.getElementById('modalTitle').innerText='Редактировать: '+s.order_id+' ('+s.year+')';
+    document.getElementById('modal').style.display='block';
+}
+function closeModal(){document.getElementById('modal').style.display='none';}
+async function saveOrder(){
+    const p={
+        order_id:document.getElementById('f_order_id').value,
+        direction:document.getElementById('f_direction').value,
+        address:document.getElementById('f_address').value,
+        weight:parseFloat(document.getElementById('f_weight').value)||null,
+        ship_date:document.getElementById('f_ship_date').value||null,
+        plan_arrival:document.getElementById('f_plan_arrival').value||null,
+        arrival_date:document.getElementById('f_arrival_date').value||null,
+        carrier:document.getElementById('f_carrier').value,
+        vehicle:document.getElementById('f_vehicle').value,
+        driver:document.getElementById('f_driver').value,
+        gps_link:document.getElementById('f_gps_link').value,
+        comment:document.getElementById('f_comment').value,
+        status:document.getElementById('f_status').value
+    };
+    await fetch('/api/admin/shipments',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
+    closeModal();load();
+}
+async function del(key){if(!confirm('Удалить запись '+key+'?'))return;await fetch('/api/admin/shipments/'+encodeURIComponent(key),{method:'DELETE'});load();}
+async function uploadExcel(){
+    const fi=document.getElementById('excelFile');
+    if(!fi.files.length){alert('Выберите файл!');return;}
+    const fd=new FormData();fd.append('file',fi.files[0]);
+    const b=document.getElementById('uploadBtn');const st=document.getElementById('uploadStatus');
+    b.disabled=true;b.innerText='⏳ Обработка...';st.innerText='Пожалуйста, подождите...';st.style.color='blue';
+    try{
+        const r=await fetch('/api/admin/upload',{method:'POST',body:fd});
+        const d=await r.json();
+        if(r.ok){st.innerText='✅ '+d.message;st.style.color='green';load();}
+        else{st.innerText='❌ Ошибка: '+d.detail;st.style.color='red';}
+    }catch(e){st.innerText='❌ Ошибка сети';st.style.color='red';}
+    finally{b.disabled=false;b.innerText='Обновить базу из файла';}
+}
+loadSettings();load();
+</script>
+</body></html>"""
