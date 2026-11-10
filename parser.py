@@ -7,7 +7,9 @@ import requests
 from playwright.async_api import async_playwright
 
 DATABASE_URL = os.environ.get("DATABASE_URL")
-_current_sid = None
+
+# FIX P1: убираем глобальный _current_sid — он небезопасен при gather.
+# Каждая задача получает свой sid локально в process_order.
 
 
 def is_url(s: str) -> bool:
@@ -170,10 +172,8 @@ def get_position_by_sid(sid: str, unit_id: int, base_url: str = "https://maps.ba
 
 
 async def process_order(conn, order_id: str, gps_link: str):
-    global _current_sid
-
+    # FIX P2: sid — локальный, не глобальный. Больше нет гонки между задачами gather.
     if not is_url(gps_link):
-        # это не ссылка, а текст (старый баг загрузки) — не помечаем как завершённое
         return False
 
     if "axenta.cloud" in gps_link:
@@ -198,11 +198,11 @@ async def process_order(conn, order_id: str, gps_link: str):
         if not units:
             await mark_as_done(conn, order_id)
             return False
-        _current_sid = await get_sid_from_maps_baltgps(gps_link)
-        if not _current_sid:
+        sid = await get_sid_from_maps_baltgps(gps_link)
+        if not sid:
             await mark_as_done(conn, order_id)
             return False
-        lat, lng, status = get_position_by_sid(_current_sid, units[0])
+        lat, lng, status = get_position_by_sid(sid, units[0])
         if lat and lng:
             await save_position(conn, order_id, lat, lng)
             return True
@@ -223,8 +223,14 @@ async def main():
     """)
     print(f"Найдено {len(rows)} активных заказов\n")
     updated = 0
-    # создаём корутины и сразу awaited через gather
-    tasks = [process_order(conn, r["order_id"], r["gps_link"]) for r in rows]
+    # FIX P3: явно ограничиваем параллелизм, чтобы не плодить десятки Chromium.
+    sem = asyncio.Semaphore(3)
+
+    async def _limited(oid, link):
+        async with sem:
+            return await process_order(conn, oid, link)
+
+    tasks = [_limited(r["order_id"], r["gps_link"]) for r in rows]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     for r, res in zip(rows, results):
         if isinstance(res, Exception):
