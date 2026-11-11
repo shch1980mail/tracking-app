@@ -6,3 +6,4 @@ pandas
 openpyxl
 python-multipart
 maxapi[fastapi]
+apscheduler
