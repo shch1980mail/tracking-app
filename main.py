@@ -8,6 +8,8 @@ from contextlib import asynccontextmanager
 import os, json, re, requests, asyncio, io, datetime as dt, hashlib
 import pandas as pd
 import openpyxl
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 # ============================================================
 # УНИВЕРСАЛЬНЫЙ АДАПТЕР ДЛЯ MAXAPI
@@ -88,6 +90,7 @@ DEFAULT_SETTINGS = {
     "show_delivered": True,
     "show_with_gps": False,
     "show_planned": False,
+    "last_update_time": None,
 }
 
 if os.path.exists(SETTINGS_FILE):
@@ -110,10 +113,10 @@ def save_settings():
 DB_FILE = "shipments.json"
 DB: dict = {}
 
-# FIX 1: единый лок для DB. Все операции записи/слияния/сохранения — под ним.
+# FIX 1: единый лок для DB.
 DB_LOCK = asyncio.Lock()
 
-# FIX 2: поля, которые «принадлежат» пользователю после ручного редактирования.
+# FIX 2: защищаемые поля.
 MANUAL_PROTECTED_FIELDS = (
     "direction", "address", "weight", "ship_date", "plan_arrival", "arrival_date",
     "carrier", "vehicle", "driver", "gps_link", "comment", "status",
@@ -128,16 +131,18 @@ PUBLIC_URL = os.environ.get("PUBLIC_URL", "").rstrip("/")
 if not PUBLIC_URL:
     raise ValueError("❌ Переменная PUBLIC_URL не задана. Укажите публичный HTTPS-домен Layero (например, https://your-project.layero.app)")
 
-# FIX 14: webhook secret (по желанию, убирает warning)
 WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
 max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
 webhook = FastAPIMaxWebhook(dp=max_dp, bot=max_bot, secret=WEBHOOK_SECRET or None)
 
+# FIX 15: глобальный планировщик
+scheduler: Optional[AsyncIOScheduler] = None
+
 
 # ============================================================
-# ХРАНИЛИЩЕ: ключи, годы, слияние
+# ХРАНИЛИЩЕ
 # ============================================================
 STATUS_CANON = {
     "планируется": "планируется",
@@ -218,13 +223,12 @@ def is_hidden_status(rec: dict) -> bool:
 
 
 def load_db():
-    # FIX 3: load_db больше НЕ вызывает remap_legacy_keys/save_db.
     global DB
     if os.path.exists(DB_FILE):
         with open(DB_FILE, "r", encoding="utf-8") as f:
             raw = json.load(f)
         DB = migrate_raw_db(raw)
-        remap_legacy_keys_in_memory()   # больше не пишет на диск
+        remap_legacy_keys_in_memory()
     else:
         DB = {}
     return DB
@@ -253,7 +257,6 @@ def migrate_raw_db(raw: dict) -> dict:
 
 
 def remap_legacy_keys_in_memory():
-    # FIX 4: только в памяти. Не пишет на диск. Не меняет _key у manual_edit.
     global DB
     new_db = {}
     for key, rec in DB.items():
@@ -280,7 +283,6 @@ def remap_legacy_keys_in_memory():
                     i += 1
                 new_key = f"{new_key}#{i}"
             if new_key != key:
-                # FIX 5: сохраняем старый ключ как алиас, чтобы фронт мог найти по нему.
                 aliases = set(rec.get("_key_aliases") or [])
                 aliases.add(key)
                 rec["_key_aliases"] = sorted(aliases)
@@ -293,19 +295,16 @@ def remap_legacy_keys_in_memory():
 
 
 def save_db_unlocked():
-    # Внутренняя, БЕЗ лока. Вызывать только из-под DB_LOCK.
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(DB, f, ensure_ascii=False, indent=2)
 
 
 async def save_db():
-    # FIX 6: единственная точка сохранения, всегда под локом.
     async with DB_LOCK:
         save_db_unlocked()
 
 
 def merge_into_db_unlocked(new_records: list) -> dict:
-    # FIX 7: логика слияния без лока (лок берётся снаружи).
     global DB
     now = dt.datetime.utcnow().isoformat(timespec="seconds")
     stats = {"added": 0, "updated": 0, "unchanged": 0, "duplicates": 0, "protected": 0}
@@ -319,7 +318,6 @@ def merge_into_db_unlocked(new_records: list) -> dict:
             rec["current_lat"] = old.get("current_lat")
             rec["current_lng"] = old.get("current_lng")
 
-            # FIX 8: если запись редактировали вручную — не затираем поля Excel'ем.
             if old.get("manual_edit"):
                 rec["manual_edit"] = True
                 for f in MANUAL_PROTECTED_FIELDS:
@@ -612,8 +610,21 @@ def parse_excel_to_records(contents: bytes, fallback_year: int = None) -> tuple[
 # ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global DB
+    global DB, scheduler
     load_db()
+
+    # FIX 16: запуск планировщика каждые 2 часа
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
+        update_all_coords,
+        trigger=IntervalTrigger(hours=2),
+        id="gps_update_job",
+        replace_existing=True,
+        max_instances=1,
+    )
+    scheduler.start()
+    print("✅ Планировщик запущен (каждые 2 часа)")
+
     if DB:
         async def _delayed_update():
             await asyncio.sleep(10)
@@ -622,10 +633,14 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 print(f"⚠️ init update_all_coords: {e}")
         asyncio.create_task(_delayed_update())
+
     asyncio.create_task(_register_webhook_once())
     print("✅ MAX-бот запущен (Webhook mode)")
     async with webhook.lifespan(app):
         yield
+
+    scheduler.shutdown(wait=False)
+    print("🛑 Планировщик остановлен")
     print("🛑 Приложение остановлено")
 
 
@@ -727,7 +742,6 @@ async def fetch_single_order_coords(rec: dict):
 
 
 async def update_all_coords():
-    # FIX 10: работаем по снапшоту. Слияние/сохранение — под локом.
     snapshot = list(DB.values())
     for rec in snapshot:
         if rec.get("has_valid_gps") is False:
@@ -747,6 +761,11 @@ async def update_all_coords():
 
     await asyncio.gather(*(_limited(t) for t in tasks))
     await save_db()
+
+    # FIX 17: записываем время последнего обновления
+    global SETTINGS
+    SETTINGS["last_update_time"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    save_settings()
 
 
 # ============================================================
@@ -998,7 +1017,6 @@ async def list_shipments(
 
 
 def _resolve_key(key: str) -> Optional[str]:
-    # FIX 11: умеем находить запись по старому ключу-алиасу.
     if key in DB:
         return key
     for k, r in DB.items():
@@ -1093,7 +1111,6 @@ async def admin_create(s: Shipment, user=Depends(check_admin)):
             rec["_key"] = f"{rec['_key']}#{int(dt.datetime.utcnow().timestamp())}"
     rec["has_valid_gps"] = None
     rec["gps_checked"] = False
-    # FIX 12: помечаем как ручную правку — Excel её не затрёт, а ключ не будет ремапиться.
     rec["manual_edit"] = True
     rec["manual_edit_at"] = dt.datetime.utcnow().isoformat(timespec="seconds")
 
@@ -1123,7 +1140,6 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         fallback_year = int(m.group(1)) if m else None
         records, audit = parse_excel_to_records(contents, fallback_year=fallback_year)
 
-        # FIX 13: merge + save под одним локом → нет гонки с фоновым update_all_coords.
         async with DB_LOCK:
             stats = merge_into_db_unlocked(records)
             new_keys = {r["_key"] for r in records}
@@ -1179,6 +1195,12 @@ async def admin_upload_excel(file: UploadFile = File(...), user=Depends(check_ad
         raise
     except Exception as e:
         raise HTTPException(500, f"Ошибка чтения файла: {str(e)}")
+
+
+@app.post("/api/admin/update_gps")
+async def admin_update_gps(user=Depends(check_admin)):
+    asyncio.create_task(update_all_coords())
+    return {"ok": True, "message": "Обновление GPS запущено в фоне"}
 
 
 # ============================================================
@@ -1605,6 +1627,11 @@ tr:hover{background:#f0f8ff}
 </div>
 
 <div class="panel">
+    <h3>🕒 Статус обновления</h3>
+    <p id="lastUpdate" style="color:#666;margin:0;">Загрузка...</p>
+</div>
+
+<div class="panel">
 <h3>📥 Загрузка данных из Excel</h3>
 <div class="upload-box">
 <input type="file" id="excelFile" accept=".xlsx, .xls">
@@ -1656,6 +1683,9 @@ async function loadSettings(){
     document.getElementById('chk_delivered').checked=s.show_delivered!==false;
     document.getElementById('chk_with_gps').checked=s.show_with_gps!==false;
     document.getElementById('chk_planned').checked=!!s.show_planned;
+    
+    const el = document.getElementById('lastUpdate');
+    if (el) el.innerText = s.last_update_time ? `Последнее обновление GPS: ${s.last_update_time}` : 'Обновление GPS ещё не выполнялось';
 }
 async function saveTabs(){
     const p={
@@ -1666,6 +1696,10 @@ async function saveTabs(){
     };
     await fetch('/api/admin/settings/tabs',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(p)});
 }
+async function triggerUpdate(){
+    await fetch('/api/admin/update_gps', {method:'POST'});
+    alert('Обновление запущено в фоне. Через минуту обновите страницу.');
+}
 async function load(){const r=await fetch('/api/admin/shipments');allData=await r.json();renderTable();}
 function renderTable(){
     const q=document.getElementById('filter').value.toLowerCase();
@@ -1673,8 +1707,9 @@ function renderTable(){
     document.querySelector('#shipments tbody').innerHTML=f.map(s=>{
         const warn = (s.data_warnings && s.data_warnings.length) ? ' warn-row' : '';
         const noFact = s.arrival_fact_missing ? ' <span title="Нет факт. даты выгрузки" style="color:#dc3545;">⚠️</span>' : '';
+        const manual = s.manual_edit ? ' <span title="Ручная правка" style="color:#0d6efd;">✍️</span>' : '';
         return `<tr class="${warn}">
-<td><b>${s.order_id}</b>${s.is_service_row?' <small>(служ.)</small>':''}</td>
+<td><b>${s.order_id}</b>${s.is_service_row?' <small>(служ.)</small>':''}${manual}</td>
 <td>${s.year||''}</td>
 <td>${s.address||''}</td>
 <td>${s.carrier||''}</td>
