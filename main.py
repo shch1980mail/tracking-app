@@ -137,7 +137,6 @@ max_bot = Bot(token=MAX_BOT_TOKEN)
 max_dp = Dispatcher()
 webhook = FastAPIMaxWebhook(dp=max_dp, bot=max_bot, secret=WEBHOOK_SECRET or None)
 
-# FIX 15: глобальный планировщик
 scheduler: Optional[AsyncIOScheduler] = None
 
 
@@ -164,18 +163,26 @@ def norm_status(s: str) -> str:
     return STATUS_CANON.get(s, s or "планируется")
 
 
+# FIX 18: Надежный парсер дат для Excel (отрезает время 00:00:00)
 def parse_iso_date(v):
     if v is None:
         return None
     if isinstance(v, (dt.date, dt.datetime)):
         return v.strftime("%Y-%m-%d")
+    
     s = str(v).strip()
     if not s or s.lower() == "nan":
         return None
+        
+    s = s.split(" ")[0] # отрезаем время, если оно приклеилось
+    
     try:
         return pd.to_datetime(s, dayfirst=False).strftime("%Y-%m-%d")
     except Exception:
-        return s[:10] if re.match(r"\d{4}-\d{2}-\d{2}", s) else None
+        m = re.search(r"(\d{4}-\d{2}-\d{2})", s)
+        if m:
+            return m.group(1)
+        return None
 
 
 def year_of(rec: dict, fallback: int = None) -> int:
@@ -613,7 +620,6 @@ async def lifespan(app: FastAPI):
     global DB, scheduler
     load_db()
 
-    # FIX 16: запуск планировщика каждые 2 часа
     scheduler = AsyncIOScheduler()
     scheduler.add_job(
         update_all_coords,
@@ -762,7 +768,6 @@ async def update_all_coords():
     await asyncio.gather(*(_limited(t) for t in tasks))
     await save_db()
 
-    # FIX 17: записываем время последнего обновления
     global SETTINGS
     SETTINGS["last_update_time"] = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     save_settings()
